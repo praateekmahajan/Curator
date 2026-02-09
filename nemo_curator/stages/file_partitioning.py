@@ -170,7 +170,9 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
         """
         Get the list of files to process.
         """
-        logger.debug(f"Getting file list for {self.file_paths}")
+        logger.debug(
+            f"Getting file list for {self.file_paths if isinstance(self.file_paths, str) else len(self.file_paths)}"
+        )
         if isinstance(self.file_paths, str):
             # Directory: list contents (recursively) and filter extensions
             output_ls = get_all_file_paths_under(

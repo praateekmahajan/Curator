@@ -91,7 +91,7 @@ class RayActorPoolExecutor(BaseExecutor):
             current_tasks = initial_tasks or [EmptyTask]
             # Process through each stage with ActorPool
             for i, stage in enumerate(stages):
-                logger.info(f"\nProcessing stage {i + 1}/{len(stages)}: {stage}")
+                logger.info(f"\nProcessing stage {i + 1}/{len(stages)}: {stage.__class__.__name__}")
                 logger.info(f"  Input tasks: {len(current_tasks)}")
 
                 if not current_tasks:
@@ -110,7 +110,7 @@ class RayActorPoolExecutor(BaseExecutor):
                         ignore_head_node=self.ignore_head_node,
                     )
                     logger.info(
-                        f" {stage} - Creating {num_actors} actors (CPUs: {stage.resources.cpus}, GPUs: {stage.resources.gpus})"
+                        f" {stage.__class__.__name__} - Creating {num_actors} actors (CPUs: {stage.resources.cpus}, GPUs: {stage.resources.gpus})"
                     )
                     # TODO: Clean up branching logic and handling here
                     # Check if this is a RAFT stage and create appropriate actor pool
@@ -343,7 +343,7 @@ class RayActorPoolExecutor(BaseExecutor):
             try:
                 ray.get(actor.teardown.remote())
                 ray.kill(actor)
-            except (ray.exceptions.RayActorError, ray.exceptions.RaySystemError) as e:  # noqa: PERF203
+            except (ray.exceptions.RayActorError, ray.exceptions.RaySystemError) as e:
                 logger.warning(f"      Warning: Error cleaning up actor {i}: {e}")
 
     def _cleanup_actor_pool(self, actor_pool: ActorPool) -> None:
