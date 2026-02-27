@@ -16,7 +16,9 @@
 
 """NeMo Data Designer (NDD) benchmarking script.
 
-Benchmarks synthetic data generation via NDD using the NVIDIA NIM cloud API.
+Benchmarks synthetic data generation via NDD using different model backends:
+  - ray-serve   : vLLM behind Ray Serve via ModelServer (supports multi-replica autoscaling)
+  - nvidia-nim  : NVIDIA Build cloud API
 
 Usage from the benchmarking orchestrator (run.py) -- see ndd.yaml for the
 full configuration.  Can also be run standalone:
@@ -25,20 +27,23 @@ full configuration.  Can also be run standalone:
         --benchmark-results-path /tmp/results \
         --input-path ./data/ndd \
         --output-path /tmp/ndd_output \
-        --model-type nvidia-nim \
+        --model-type ray-serve \
         --model-id openai/gpt-oss-20b \
-        --executor ray_data
+        --executor ray_data \
+        --engine-kwargs '{"tensor_parallel_size": 4}' \
+        --autoscaling-config '{"min_replicas": 1, "max_replicas": 4}'
 """
 
 import argparse
-import os
+import json
 import time
 from pathlib import Path
 from typing import Any
 
 import data_designer.config as dd
+from data_designer.config.models import ModelProvider
 from loguru import logger
-from utils import setup_executor, write_benchmark_results
+from utils import BenchmarkingInferenceServer, setup_executor, start_inference_server, write_benchmark_results
 
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.synthetic.nemo_data_designer.data_designer import DataDesignerStage
@@ -52,16 +57,17 @@ from nemo_curator.utils.file_utils import get_all_file_paths_under
 # ---------------------------------------------------------------------------
 
 
-def _build_config(model_id: str) -> dd.DataDesignerConfigBuilder:
+def _build_config(model_type: str, model_id: str) -> dd.DataDesignerConfigBuilder:
     """Build the DataDesigner config for the medical-notes generation task."""
+    provider_name = "nvidia" if model_type == "nvidia-nim" else "local-vllm"
     model_alias = model_id
 
     model_configs = [
         dd.ModelConfig(
             alias=model_alias,
             model=model_id,
-            provider="nvidia",
-            skip_health_check=False,
+            provider=provider_name,
+            skip_health_check=model_type != "nvidia-nim",
             inference_parameters=dd.ChatCompletionInferenceParams(
                 temperature=1.0,
                 top_p=1.0,
@@ -139,6 +145,18 @@ Respond with only the notes, no other text.
     return config_builder
 
 
+def _get_model_providers(server: BenchmarkingInferenceServer) -> list[ModelProvider]:
+    """Build model providers for DataDesigner pointing at the local inference server."""
+    return [
+        ModelProvider(
+            name="local-vllm",
+            endpoint=server.endpoint,
+            provider_type="openai",
+            api_key=server.api_key,
+        ),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Benchmark runner
 # ---------------------------------------------------------------------------
@@ -150,7 +168,10 @@ def run_ndd_benchmark(
     input_path: str,
     output_path: str,
     executor: str,
+    engine_kwargs: dict[str, Any],
+    autoscaling_config: dict[str, Any],
     num_files: int | None,
+    benchmark_results_path: str = "",
     **kwargs,  # noqa: ARG001
 ) -> dict[str, Any]:
     """Run the NDD benchmark and collect metrics."""
@@ -170,13 +191,16 @@ def run_ndd_benchmark(
         logger.info(f"Using {num_files} of {len(input_files)} input files")
         input_files = input_files[:num_files]
 
-    # -- Environment setup: nvidia-nim requires NVIDIA_API_KEY ----------
-    if not os.environ.get("NVIDIA_API_KEY"):
-        msg = "NVIDIA_API_KEY must be set for nvidia-nim model type"
-        raise OSError(msg)
+    # -- Start inference server ------------------------------------------
+    log_dir = Path(benchmark_results_path) / "logs" if benchmark_results_path else None
+    server = start_inference_server(model_type, model_id, engine_kwargs, autoscaling_config, log_dir=log_dir)
 
     # -- Build config and run pipeline ----------------------------------
-    config_builder = _build_config(model_id)
+    config_builder = _build_config(model_type, model_id)
+
+    stage_kwargs: dict[str, Any] = {"config_builder": config_builder}
+    if model_type != "nvidia-nim":
+        stage_kwargs["model_providers"] = _get_model_providers(server)
 
     executor_obj = setup_executor(executor)
 
@@ -184,21 +208,36 @@ def run_ndd_benchmark(
         name="ndd_benchmark_pipeline",
         stages=[
             JsonlReader(file_paths=input_files, fields=["diagnosis", "patient_summary"]),
-            DataDesignerStage(config_builder=config_builder),
+            DataDesignerStage(**stage_kwargs),
             JsonlWriter(path=str(output_path)),
         ],
     )
 
     logger.info("Starting NDD pipeline...")
     run_start_time = time.perf_counter()
-    output_tasks = pipeline.run(executor_obj)
+    try:
+        output_tasks = pipeline.run(executor_obj)
+    finally:
+        server.stop()
     run_time_taken = time.perf_counter() - run_start_time
 
     # -- Post-run: extract metrics from _stage_perf ----------------------
-    input_row_count = int(TaskPerfUtils.get_aggregated_stage_stat(output_tasks, "DataDesignerStage", "custom.num_input_records"))
-    output_row_count = int(TaskPerfUtils.get_aggregated_stage_stat(output_tasks, "DataDesignerStage", "custom.num_output_records"))
-    input_tokens_median_per_record = float(TaskPerfUtils.get_aggregated_stage_stat(output_tasks, "DataDesignerStage", "custom.input_tokens_median_per_record"))
-    output_tokens_median_per_record = float(TaskPerfUtils.get_aggregated_stage_stat(output_tasks, "DataDesignerStage", "custom.output_tokens_median_per_record"))
+    input_row_count = int(
+        TaskPerfUtils.get_aggregated_stage_stat(output_tasks, "DataDesignerStage", "custom.num_input_records")
+    )
+    output_row_count = int(
+        TaskPerfUtils.get_aggregated_stage_stat(output_tasks, "DataDesignerStage", "custom.num_output_records")
+    )
+    input_tokens_median_per_record = float(
+        TaskPerfUtils.get_aggregated_stage_stat(
+            output_tasks, "DataDesignerStage", "custom.input_tokens_median_per_record"
+        )
+    )
+    output_tokens_median_per_record = float(
+        TaskPerfUtils.get_aggregated_stage_stat(
+            output_tasks, "DataDesignerStage", "custom.output_tokens_median_per_record"
+        )
+    )
     throughput_rows_per_sec = output_row_count / run_time_taken if run_time_taken > 0 else 0
 
     logger.success(f"NDD benchmark completed in {run_time_taken:.2f}s")
@@ -212,6 +251,7 @@ def run_ndd_benchmark(
         "metrics": {
             "is_success": True,
             "time_taken_s": run_time_taken,
+            "serve_startup_s": server.startup_s,
             "model_type": model_type,
             "model_id": model_id,
             "input_row_count": input_row_count,
@@ -238,11 +278,23 @@ def main() -> int:
     parser.add_argument(
         "--model-type",
         required=True,
-        choices=["nvidia-nim"],
+        choices=["ray-serve", "nvidia-nim"],
         help="Model serving backend",
     )
     parser.add_argument("--model-id", default="openai/gpt-oss-20b", help="Model identifier")
     parser.add_argument("--executor", default="ray_data", choices=["ray_data", "xenna"], help="Pipeline executor")
+    parser.add_argument(
+        "--engine-kwargs",
+        type=json.loads,
+        default="{}",
+        help='JSON dict of vLLM engine kwargs (e.g. \'{"tensor_parallel_size": 4, "max_model_len": 4096}\')',
+    )
+    parser.add_argument(
+        "--autoscaling-config",
+        type=json.loads,
+        default='{"min_replicas": 1, "max_replicas": 1}',
+        help='JSON dict for Ray Serve autoscaling (e.g. \'{"min_replicas": 1, "max_replicas": 4}\')',
+    )
     parser.add_argument("--num-files", type=int, default=None, help="Limit number of input files (default: all)")
 
     args = parser.parse_args()

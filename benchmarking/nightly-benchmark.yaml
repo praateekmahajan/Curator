@@ -65,10 +65,10 @@ datasets:
     formats:
     - type: "bin"
       path: "{model_weights_path}/fasttext/model.bin"
-  - name: "gretel_symptoms"
+  - name: "ndd_gretel_symptoms"
     formats:
     - type: "jsonl"
-      path: "{datasets_path}/gretel_symptoms"
+      path: "{datasets_path}/ndd_gretel_symptoms"
 default_timeout_s: 7200
 
 # Optional sinks
