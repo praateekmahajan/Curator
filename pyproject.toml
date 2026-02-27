@@ -64,13 +64,13 @@ dependencies = [
     "pandas>=2.1.0",
     "pyarrow",
     "nixl-cu12>=0.10.0; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
-    "ray[default,data,serve,llm]>=2.54",
+    "ray[default,data]>=2.54",
     "torch",
     "transformers",
 ]
 
 [project.optional-dependencies]
-cuda12 = ["gpustat", "nvidia-ml-py"]
+cuda12 = ["gpustat", "nvidia-ml-py", "ray[serve,llm]"]
 vllm = ["vllm>=0.14.1; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
 
 # Installs CPU + GPU text curation modules
