@@ -65,6 +65,7 @@ dependencies = [
     "pyarrow",
     "nixl-cu12>=0.10.0; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "ray[default,data]>=2.54",
+    "boto3",
     "torch",
     "transformers",
 ]
