@@ -131,12 +131,13 @@ def _engine_kwargs_to_vllm_args(engine_kwargs: dict[str, Any]) -> list[str]:
     return args
 
 
-def start_inference_server(
+def start_inference_server(  # noqa: PLR0913
     model_type: str,
     model_id: str,
     engine_kwargs: dict[str, Any] | None = None,
     autoscaling_config: dict[str, Any] | None = None,
     log_dir: str | Path | None = None,
+    deployment_config_kwargs: dict[str, Any] | None = None,
 ) -> BenchmarkingInferenceServer:
     """Start an inference server and return a handle with endpoint, api_key, and startup time.
 
@@ -159,7 +160,7 @@ def start_inference_server(
 
         model_config = ModelConfig(
             model_identifier=model_id,
-            deployment_config={"autoscaling_config": autoscaling_config},
+            deployment_config={"autoscaling_config": autoscaling_config, **(deployment_config_kwargs or {})},
             engine_kwargs=engine_kwargs,
         )
         server = ModelServer(models=[model_config])

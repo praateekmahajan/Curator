@@ -37,15 +37,15 @@ Usage:
 
 import argparse
 import asyncio
+import concurrent.futures
 import json
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import pandas as pd
 from loguru import logger
-from utils import load_dataset_files, setup_executor, start_inference_server, write_benchmark_results
 
 from nemo_curator.models.client import AsyncOpenAIClient
 from nemo_curator.models.client.llm_client import AsyncLLMClient, GenerationConfig, LLMClient
@@ -54,6 +54,8 @@ from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.text.io.reader.jsonl import JsonlReader
 from nemo_curator.stages.text.io.writer.jsonl import JsonlWriter
 from nemo_curator.tasks.document import DocumentBatch
+
+from .utils import load_dataset_files, setup_executor, start_inference_server, write_benchmark_results
 
 # ---------------------------------------------------------------------------
 # Default prompt - override via --prompt-template or --prompt-template-path
@@ -97,6 +99,20 @@ DECISION_JSON_SCHEMA: dict = {
 # ---------------------------------------------------------------------------
 # LLM filter stage
 # ---------------------------------------------------------------------------
+
+T = TypeVar("T")
+
+
+def _run_async(coro: "asyncio.Coroutine[Any, Any, T]") -> T:
+    """Run a coroutine from sync code. Safe in Jupyter (existing event loop) and in scripts."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    # Already inside an event loop (e.g. Jupyter); run in a new thread to avoid nesting
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(asyncio.run, coro)
+        return future.result()
 
 
 def get_last_assistant_content(row: Any) -> str | None:
@@ -175,7 +191,7 @@ class LLMFilterStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         text_field: str = "text",
         text_extractor: Any | None = None,
         temperature: float = 0.0,
-        max_tokens: int = 128,
+        max_tokens: int = 512,
         use_structured_output: bool = True,
     ):
         self.client = client
@@ -258,7 +274,7 @@ class LLMFilterStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             async def _score_batch() -> list[tuple[str, str, str]]:
                 return await asyncio.gather(*(self._score_one_async(t, gen_config) for t in texts))
 
-            results = asyncio.run(_score_batch())
+            results = _run_async(_score_batch())
         else:
             results = [self._score_one_sync(t, gen_config) for t in texts]
 
@@ -361,8 +377,8 @@ def run_benchmark(
     try:
         output_tasks = pipeline.run(executor_obj)
     finally:
+        run_time = time.perf_counter() - run_start
         server.stop()
-    run_time = time.perf_counter() - run_start
 
     logger.success(f"Completed in {run_time:.2f}s")
     return {
@@ -431,7 +447,12 @@ def main() -> int:
 
     logger.info(f"=== LLM Filtering Benchmark Starting ===\n{vars(args)}")
 
-    result_dict: dict[str, Any] = {"params": vars(args), "metrics": {"is_success": False}, "tasks": []}
+    # Serialize JSON dicts as strings for params.json
+    params = vars(args).copy()
+    params["engine_kwargs"] = json.dumps(params["engine_kwargs"])
+    params["autoscaling_config"] = json.dumps(params["autoscaling_config"])
+
+    result_dict: dict[str, Any] = {"params": params, "metrics": {"is_success": False}, "tasks": []}
     success = 1
     try:
         result_dict.update(run_benchmark(**{**vars(args), "prompt_template": prompt_template}))

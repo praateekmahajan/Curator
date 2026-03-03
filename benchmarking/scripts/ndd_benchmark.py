@@ -218,8 +218,8 @@ def run_ndd_benchmark(
     try:
         output_tasks = pipeline.run(executor_obj)
     finally:
+        run_time_taken = time.perf_counter() - run_start_time
         server.stop()
-    run_time_taken = time.perf_counter() - run_start_time
 
     # -- Post-run: extract metrics from _stage_perf ----------------------
     input_row_count = int(
@@ -302,9 +302,14 @@ def main() -> int:
     logger.info("=== NDD Benchmark Starting ===")
     logger.info(f"Arguments: {vars(args)}")
 
+    # Serialize JSON dicts as strings for params.json
+    params = vars(args).copy()
+    params["engine_kwargs"] = json.dumps(params["engine_kwargs"])
+    params["autoscaling_config"] = json.dumps(params["autoscaling_config"])
+
     success_code = 1
     result_dict: dict[str, Any] = {
-        "params": vars(args),
+        "params": params,
         "metrics": {"is_success": False},
         "tasks": [],
     }
