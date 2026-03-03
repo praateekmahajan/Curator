@@ -42,6 +42,7 @@ sys.path.insert(0, _this_script_dir)
 from runner.datasets import DatasetResolver
 from runner.entry import Entry
 from runner.env_capture import dump_env
+from runner.gpu_monitor import GPUMonitor
 from runner.path_resolver import PathResolver
 from runner.process import run_command_with_timeout
 from runner.ray_cluster import (
@@ -194,6 +195,8 @@ def run_entry(
 
         # Execute command with timeout
         logger.info(f"\tRunning command {' '.join(cmd) if isinstance(cmd, list) else cmd}")
+        gpu_monitor = GPUMonitor(interval_s=2.0)
+        gpu_monitor.start()
         started_exec = time.time()
         ray_cluster_data = get_ray_cluster_data()
         run_data = run_command_with_timeout(
@@ -205,6 +208,7 @@ def run_entry(
         )
         ended_exec = time.time()
         duration = ended_exec - started_exec
+        gpu_monitor.stop(output_path=session_entry_path / "gpu_utilization.csv")
 
         # Update result_data
         result_data.update(
