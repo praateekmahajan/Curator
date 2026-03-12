@@ -191,15 +191,16 @@ class Pipeline:
 
             executor = XennaExecutor()
 
-        from nemo_curator.core.serve import is_ray_serve_active
+        from nemo_curator.core.serve import get_active_backend
 
-        if is_ray_serve_active():
+        backend = get_active_backend()
+        if backend is not None:
             gpu_stages = [s for s in self.stages if s.resources.requires_gpu]
             if gpu_stages:
                 names = ", ".join(s.name for s in gpu_stages)
                 from nemo_curator.backends.xenna import XennaExecutor
 
-                if isinstance(executor, XennaExecutor):
+                if backend == "ray_serve" and isinstance(executor, XennaExecutor):
                     msg = (
                         f"Cannot run XennaExecutor with GPU stages [{names}] while Ray Serve is active. "
                         "Xenna manages GPU assignment independently of Ray's resource scheduler, "
@@ -207,9 +208,17 @@ class Pipeline:
                         "Use RayDataExecutor instead."
                     )
                     raise RuntimeError(msg)
-                logger.info(
-                    f"Ray Serve is active and pipeline has GPU stages: [{names}]. "
-                    "The executor will schedule GPU stages on GPUs not held by Serve."
-                )
+                elif backend == "ray_serve":
+                    logger.info(
+                        f"Ray Serve is active and pipeline has GPU stages: [{names}]. "
+                        "The executor will schedule GPU stages on GPUs not held by Serve."
+                    )
+                elif backend == "dynamo":
+                    msg = (
+                        f"Cannot run pipeline with GPU stages [{names}] while Dynamo inference "
+                        "server is active. Dynamo runs outside Ray and does not participate in "
+                        "GPU scheduling."
+                    )
+                    raise RuntimeError(msg)
 
         return executor.execute(self.stages, initial_tasks)
