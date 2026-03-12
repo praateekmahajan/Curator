@@ -54,7 +54,9 @@ class TestInferenceModelConfig:
                 "env_vars": {"MY_VAR": "1", "VLLM_LOGGING_LEVEL": "DEBUG"},
             },
         )
-        quiet_env = InferenceServer._quiet_runtime_env()
+        from nemo_curator.core.serve.internal.ray_serve import RayServeBackend
+
+        quiet_env = RayServeBackend._quiet_runtime_env()
         result = config.to_llm_config(quiet_runtime_env=quiet_env)
 
         assert result.runtime_env["pip"] == ["my-package"]
@@ -96,12 +98,12 @@ class TestInferenceServer:
 
         server = InferenceServer(models=[InferenceModelConfig(model_identifier="some-model")])
 
-        _active_servers.add("other-app")
+        _active_servers["other-app"] = "ray_serve"
         try:
             with pytest.raises(RuntimeError, match="already active"):
                 server.start()
         finally:
-            _active_servers.discard("other-app")
+            _active_servers.pop("other-app", None)
 
     def test_stop_calls_shutdown(self) -> None:
         """stop() calls serve.shutdown() when the server was started."""
@@ -111,14 +113,14 @@ class TestInferenceServer:
 
         server = InferenceServer(models=[InferenceModelConfig(model_identifier="m")])
         server._started = True
-        _active_servers.add(server.name)
+        _active_servers[server.name] = "ray_serve"
         try:
             with patch.object(serve, "shutdown"):
                 server.stop()
             assert server._started is False
             assert server.name not in _active_servers
         finally:
-            _active_servers.discard(server.name)
+            _active_servers.pop(server.name, None)
 
     def test_stop_skips_shutdown_when_not_started(self) -> None:
         """stop() on a not-started server is a no-op — serve.shutdown() is not called."""
