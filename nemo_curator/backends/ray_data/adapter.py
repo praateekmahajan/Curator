@@ -101,6 +101,12 @@ class RayDataStageAdapter(BaseStageAdapter):
         if self.stage.resources.gpus > 0:
             concurrency_kwargs["num_gpus"] = self.stage.resources.gpus  # type: ignore[reportArgumentType]
 
+        # Per-stage runtime environment (e.g. different pip/conda versions per stage).
+        # map_batches collects extra kwargs into ray_remote_args internally,
+        # so runtime_env is passed directly as a top-level kwarg.
+        if self.stage.runtime_env:
+            concurrency_kwargs["runtime_env"] = self.stage.runtime_env
+
         # Calculate concurrency based on available resources
         logger.info(f"{self.stage.__class__.__name__} {is_actor_stage_=} with {concurrency_kwargs=}")
 
