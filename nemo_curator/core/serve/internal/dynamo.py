@@ -39,26 +39,70 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class WorkerPlacement:
-    """Describes where a single Dynamo vLLM worker should run."""
+class NodeAllocation:
+    """A single node's contribution to a replica's TP group.
+
+    Attributes:
+        node_id: Ray node ID.
+        node_ip: Routable IP address of the node.
+        num_gpus: Number of GPUs allocated on this node.
+        node_rank: Rank within the TP group (0 = leader, 1+ = headless).
+    """
 
     node_id: str
     node_ip: str
-    gpu_ids: list[int]
-    worker_index: int
+    num_gpus: int
+    node_rank: int
 
 
-def _get_gpu_inventory(head_node_id: str | None = None) -> list[dict[str, Any]]:
+@dataclass
+class ReplicaPlan:
+    """Placement plan for one model replica (may span multiple nodes).
+
+    For single-node TP, ``ranks`` contains a single entry.  For multi-node
+    TP (TP size > GPUs on any single node), ``ranks`` contains one entry
+    per participating node.  Rank 0 is always the leader that runs the full
+    Dynamo worker; rank 1+ run headless vLLM workers coordinated via
+    ``torch.distributed``.
+    """
+
+    replica_index: int
+    ranks: list[NodeAllocation]
+
+    @property
+    def is_multi_node(self) -> bool:
+        return len(self.ranks) > 1
+
+    @property
+    def nnodes(self) -> int:
+        return len(self.ranks)
+
+    @property
+    def master_addr(self) -> str:
+        """IP of the rank-0 (leader) node."""
+        return self.ranks[0].node_ip
+
+    @property
+    def total_gpus(self) -> int:
+        return sum(r.num_gpus for r in self.ranks)
+
+
+def _get_gpu_inventory(
+    head_node_id: str | None = None,
+    nodes: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Return per-node GPU information from the Ray cluster.
 
     Each entry: ``{"node_id": str, "node_ip": str, "num_gpus": int, "is_head": bool}``.
-    Must be called from within an active Ray context.
+
+    Args:
+        head_node_id: Optional node ID to tag as head in inventory.
+        nodes: Pre-fetched ``ray.nodes()`` result to avoid a redundant API call.
     """
     import ray
 
-    nodes = ray.nodes()
     inventory = []
-    for node in nodes:
+    for node in nodes or ray.nodes():
         if not node.get("Alive", False):
             continue
         resources = node.get("Resources", {})
@@ -77,61 +121,101 @@ def _get_gpu_inventory(head_node_id: str | None = None) -> list[dict[str, Any]]:
     return inventory
 
 
-def build_gpu_placement(
-    num_replicas: int,
-    gpus_per_replica: int,
-    head_node_id: str | None = None,
-) -> list[WorkerPlacement]:
-    """Assign GPU slots to workers across the Ray cluster.
+def _resolve_node_ip(node_id: str, nodes: list[dict[str, Any]] | None = None) -> str:
+    """Get the routable IP address for a Ray node by its ID.
 
-    Greedily fills nodes in inventory order. Raises if insufficient GPUs.
-    Must be called from within an active Ray context.
+    Args:
+        node_id: The Ray node ID to resolve.
+        nodes: Pre-fetched ``ray.nodes()`` result to avoid a redundant API call.
     """
-    inventory = _get_gpu_inventory(head_node_id)
+    import ray
+
+    for node in nodes or ray.nodes():
+        if node["NodeID"] == node_id and node.get("Alive", False):
+            return node["NodeManagerAddress"]
+    msg = f"Could not resolve IP for Ray node {node_id}"
+    raise RuntimeError(msg)
+
+
+def plan_replica_placement(
+    num_replicas: int,
+    tp_size: int,
+    head_node_id: str | None = None,
+    _inventory: list[dict[str, Any]] | None = None,
+    _nodes: list[dict[str, Any]] | None = None,
+) -> list[ReplicaPlan]:
+    """Plan GPU allocation for replicas, supporting multi-node TP.
+
+    For each replica, GPUs are allocated greedily across nodes:
+    - If ``tp_size`` fits on a single node, the replica gets one rank (rank 0).
+    - If ``tp_size`` exceeds any single node, the replica spans multiple nodes.
+      Rank 0 runs the full Dynamo worker; rank 1+ run headless vLLM workers.
+
+    Args:
+        num_replicas: Number of independent model replicas.
+        tp_size: Tensor parallel degree (GPUs per replica).
+        head_node_id: Optional node ID to tag as head in inventory.
+        _inventory: Pre-built inventory for testing (bypasses Ray call).
+        _nodes: Pre-fetched ``ray.nodes()`` result passed to ``_get_gpu_inventory``.
+
+    Returns:
+        List of ``ReplicaPlan``, one per replica.
+    """
+    inventory = _inventory if _inventory is not None else _get_gpu_inventory(head_node_id, nodes=_nodes)
     if not inventory:
         msg = "No GPU nodes found in the Ray cluster."
         raise RuntimeError(msg)
 
     total_gpus = sum(n["num_gpus"] for n in inventory)
-    needed = num_replicas * gpus_per_replica
+    needed = num_replicas * tp_size
     if needed > total_gpus:
         msg = (
-            f"Need {needed} GPUs ({num_replicas} replicas x {gpus_per_replica} GPUs/replica) "
+            f"Need {needed} GPUs ({num_replicas} replicas x {tp_size} TP) "
             f"but only {total_gpus} available across {len(inventory)} node(s)."
         )
         raise RuntimeError(msg)
 
-    placements: list[WorkerPlacement] = []
-    worker_idx = 0
-    node_next_gpu: dict[str, int] = {n["node_id"]: 0 for n in inventory}
+    available = {n["node_id"]: n["num_gpus"] for n in inventory}
 
-    for _ in range(num_replicas):
-        placed = False
+    plans: list[ReplicaPlan] = []
+    for replica_idx in range(num_replicas):
+        ranks: list[NodeAllocation] = []
+        remaining = tp_size
+        node_rank = 0
+
         for node in inventory:
             nid = node["node_id"]
-            start = node_next_gpu[nid]
-            if start + gpus_per_replica <= node["num_gpus"]:
-                gpu_ids = list(range(start, start + gpus_per_replica))
-                placements.append(
-                    WorkerPlacement(
-                        node_id=nid,
-                        node_ip=node["node_ip"],
-                        gpu_ids=gpu_ids,
-                        worker_index=worker_idx,
-                    )
+            avail = available[nid]
+            if avail <= 0:
+                continue
+
+            take = min(avail, remaining)
+            ranks.append(
+                NodeAllocation(
+                    node_id=nid,
+                    node_ip=node["node_ip"],
+                    num_gpus=take,
+                    node_rank=node_rank,
                 )
-                node_next_gpu[nid] = start + gpus_per_replica
-                worker_idx += 1
-                placed = True
+            )
+            available[nid] -= take
+            remaining -= take
+            node_rank += 1
+
+            if remaining == 0:
                 break
-        if not placed:
+
+        if remaining > 0:
+            placed = tp_size - remaining
             msg = (
-                f"Cannot place worker {worker_idx}: no node has {gpus_per_replica} "
-                f"contiguous free GPUs. Allocated {worker_idx}/{num_replicas} so far."
+                f"Cannot place replica {replica_idx}: need {tp_size} GPUs but only "
+                f"{placed} available. Allocated {replica_idx}/{num_replicas} replicas."
             )
             raise RuntimeError(msg)
 
-    return placements
+        plans.append(ReplicaPlan(replica_index=replica_idx, ranks=ranks))
+
+    return plans
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +227,7 @@ _SIGKILL_WAIT_S = 5
 
 
 def _stop_subprocess(proc: Any, sigterm_wait: float = _SIGTERM_WAIT_S) -> int | None:  # noqa: ANN401
-    """SIGTERM → wait → SIGKILL a subprocess.  Used inside Ray actors."""
+    """SIGTERM -> wait -> SIGKILL a subprocess.  Used inside Ray actors."""
     if proc.poll() is not None:
         return proc.returncode
     proc.terminate()
@@ -155,12 +239,12 @@ def _stop_subprocess(proc: Any, sigterm_wait: float = _SIGTERM_WAIT_S) -> int | 
     return proc.returncode
 
 
-def _define_subprocess_actor() -> type:
+def _define_subprocess_actor() -> type:  # noqa: C901
     """Return the ``_SubprocessActor`` Ray remote class.
 
     A single actor class used for all Dynamo subprocesses (etcd, NATS,
     frontend, vLLM workers).  GPU resources are configured per-instance
-    via ``.options(num_gpus=...)`` at creation time.
+    via ``.options(num_gpus=...)``.
     """
     import ray
 
@@ -172,6 +256,7 @@ def _define_subprocess_actor() -> type:
             import subprocess as _sp
 
             if log_file:
+                os.makedirs(os.path.dirname(log_file), exist_ok=True)
                 self._log_fh = open(log_file, "w")  # noqa: SIM115
                 self._proc = _sp.Popen(command, env=env, stdout=self._log_fh, stderr=_sp.STDOUT)  # noqa: S603
             else:
@@ -186,6 +271,25 @@ def _define_subprocess_actor() -> type:
 
         def log_file(self) -> str | None:
             return self._log_file
+
+        def read_log_tail(self, num_bytes: int = 8192) -> str:
+            """Read the last *num_bytes* of the log file.
+
+            Flushes the write handle first so buffered output is visible.
+            Called remotely by the driver for crash diagnosis.
+            """
+            if not self._log_file:
+                return ""
+            try:
+                if hasattr(self, "_log_fh") and not self._log_fh.closed:
+                    self._log_fh.flush()
+                with open(self._log_file, "rb") as f:
+                    f.seek(0, 2)
+                    size = f.tell()
+                    f.seek(max(0, size - num_bytes))
+                    return f.read().decode(errors="replace")
+            except Exception:  # noqa: BLE001
+                return ""
 
         def stop(self, sigterm_wait: float = _SIGTERM_WAIT_S) -> int | None:
             rc = _stop_subprocess(self._proc, sigterm_wait)
@@ -261,9 +365,18 @@ class DynamoBackend(InferenceBackend):
 
     Launches Dynamo infrastructure (etcd + NATS), vLLM workers, and an
     OpenAI-compatible frontend as subprocesses managed by detached Ray actors.
-    Workers are placed on cluster nodes via ``NodeAffinitySchedulingStrategy``.
 
-    This backend does NOT participate in Ray's GPU scheduling — pipelines
+    Supports both single-node and multi-node tensor parallelism:
+
+    - **Single-node TP**: Each replica runs on one node.  One Ray actor per
+      replica with ``num_gpus=tp_size``.
+    - **Multi-node TP** (TP > GPUs on any single node): Each replica spans
+      multiple nodes.  Rank 0 runs the full Dynamo worker (model registration
+      in etcd); rank 1+ run headless vLLM workers coordinated via
+      ``torch.distributed``.  Each rank is pinned to its planned node via
+      ``NodeAffinitySchedulingStrategy``.
+
+    This backend does NOT participate in Ray's GPU scheduling -- pipelines
     with GPU stages will fail-fast with a ``RuntimeError`` (enforced by
     ``Pipeline.run()``).
     """
@@ -271,9 +384,10 @@ class DynamoBackend(InferenceBackend):
     def __init__(self, server: InferenceServer) -> None:
         self._server = server
         self._runtime_dir: str | None = None
+        self._head_ip: str | None = None
         self._etcd_actor: Any = None
         self._nats_actor: Any = None
-        self._worker_actors: list[Any] = []
+        self._worker_actors: list[tuple[str, Any]] = []
         self._frontend_actor: Any = None
         self._etcd_port: int | None = None
         self._nats_port: int | None = None
@@ -293,7 +407,6 @@ class DynamoBackend(InferenceBackend):
             msg = "At least one InferenceModelConfig is required."
             raise ValueError(msg)
 
-        # Validate required binaries before doing anything else
         if not server.etcd_endpoint:
             _check_binary("etcd")
         if not server.nats_url:
@@ -312,9 +425,10 @@ class DynamoBackend(InferenceBackend):
         self._runtime_dir = tempfile.mkdtemp(prefix=f"nemo_curator_dynamo_{short_id}_")
         logger.info(f"Dynamo runtime dir: {self._runtime_dir}")
 
-        # Detached actors survive the ``with ray.init()`` disconnect.
         with ray.init(ignore_reinit_error=True):
             head_node_id = ray.get_runtime_context().get_node_id()
+            cluster_nodes = ray.nodes()
+            self._head_ip = _resolve_node_ip(head_node_id, nodes=cluster_nodes)
 
             self._etcd_port = (
                 int(server.etcd_endpoint.rsplit(":", 1)[-1])
@@ -328,36 +442,34 @@ class DynamoBackend(InferenceBackend):
 
             actor_cls = _define_subprocess_actor()
 
-            # Infrastructure
+            # Infrastructure -- always on head node
             if not server.etcd_endpoint:
                 self._etcd_actor = self._start_etcd(actor_cls, head_node_id, self._etcd_port)
             if not server.nats_url:
                 self._nats_actor = self._start_nats(actor_cls, head_node_id, self._nats_port)
 
-            etcd_endpoint = server.etcd_endpoint or f"http://localhost:{self._etcd_port}"
-            nats_url = server.nats_url or f"nats://localhost:{self._nats_port}"
+            etcd_endpoint = server.etcd_endpoint or f"http://{self._head_ip}:{self._etcd_port}"
+            nats_url = server.nats_url or f"nats://{self._head_ip}:{self._nats_port}"
 
-            # Workers — let Ray handle GPU placement via num_gpus on the actor
+            # Plan GPU placement across cluster
+            replica_plans = plan_replica_placement(num_replicas, tp_size, head_node_id, _nodes=cluster_nodes)
+
             namespace = dynamo_cfg.get("namespace", "curator")
             request_plane = dynamo_cfg.get("request_plane", "nats")
             event_plane = dynamo_cfg.get("event_plane", "nats")
-            worker_env = self._build_env(etcd_endpoint, nats_url)
-            logger.info(f"Launching {num_replicas} Dynamo worker(s) with TP={tp_size}")
+            base_env = self._build_env(etcd_endpoint, nats_url)
 
-            for i in range(num_replicas):
-                actor = self._launch_worker(
-                    actor_cls,
-                    worker_index=i,
-                    model_config=model_config,
-                    base_env=worker_env,
-                    gpus_per_worker=tp_size,
-                    namespace=namespace,
-                    request_plane=request_plane,
-                    event_plane=event_plane,
-                )
-                self._worker_actors.append(actor)
+            self._launch_replicas(
+                actor_cls,
+                replica_plans,
+                model_config,
+                base_env,
+                namespace=namespace,
+                request_plane=request_plane,
+                event_plane=event_plane,
+            )
 
-            # Frontend
+            # Frontend -- always on head node
             model_name = model_config.model_name or model_config.model_identifier
             self._frontend_actor = self._launch_frontend(
                 actor_cls,
@@ -371,17 +483,15 @@ class DynamoBackend(InferenceBackend):
                 event_plane=event_plane,
             )
 
-        # Health check — outside ray.init context, pure HTTP.
-        # For Dynamo the frontend starts before workers register, so we need
-        # to wait for both the HTTP endpoint AND the model to appear.
+        # Health check -- outside ray.init context, pure HTTP.
         expected_model = model_config.model_name or model_config.model_identifier
         self._wait_for_model(server, expected_model)
 
     def _wait_for_model(self, server: InferenceServer, model_name: str) -> None:
         """Poll ``/v1/models`` until *model_name* appears in the response.
 
-        Also checks that worker/frontend subprocesses are still alive. If any
-        crash, reads their log file and raises immediately with the output.
+        Also checks subprocess liveness via Ray actors periodically.  If any
+        crash, reads their log tail and raises immediately with the output.
         """
         import json
         import urllib.request
@@ -410,49 +520,49 @@ class DynamoBackend(InferenceBackend):
                     logger.debug(f"Health check attempt {attempt} failed, retrying...")
             time.sleep(2)
 
-        # Final liveness check before giving up — surface crash info if available
+        # Final liveness check before giving up -- surface crash info if available
         self._check_subprocess_health()
         msg = f"Model '{model_name}' did not appear at {models_url} within {server.health_check_timeout_s}s"
         raise TimeoutError(msg)
 
     def _check_subprocess_health(self) -> None:
-        """Check log file tails for signs of subprocess crashes.
+        """Check subprocess liveness via Ray actors.
 
-        Reads only the last ~8 KB of each log file to avoid full reads on
-        large files.  Raises immediately with the log tail if a crash is found.
+        Reconnects briefly to Ray to call ``is_alive()`` on each managed
+        actor.  If a subprocess has exited, reads its log tail via
+        ``read_log_tail()`` and raises with the output.  Works for both
+        local and remote (multi-node) actors.
         """
-        if not self._runtime_dir:
+        import ray
+
+        actors_to_check = self._get_actors_for_health_check()
+        if not actors_to_check:
             return
 
-        crash_patterns = ("Traceback (most recent call last)", '"level":"fatal"')
-        for label in self._log_labels():
-            log_path = os.path.join(self._runtime_dir, f"{label}.log")
-            try:
-                with open(log_path, "rb") as f:
-                    f.seek(0, 2)
-                    size = f.tell()
-                    f.seek(max(0, size - 8192))
-                    tail_bytes = f.read()
-                content = tail_bytes.decode(errors="replace")
-            except Exception:  # noqa: BLE001, S112
-                continue
-            if not content:
-                continue
-            if any(pat in content for pat in crash_patterns):
-                tail = "\n".join(content.splitlines()[-50:])
-                msg = (
-                    f"Dynamo {label} subprocess crashed during startup.\n\n--- {label} log (last 50 lines) ---\n{tail}"
-                )
-                raise RuntimeError(msg)
+        with ray.init(ignore_reinit_error=True):
+            for label, actor in actors_to_check:
+                try:
+                    alive = ray.get(actor.is_alive.remote(), timeout=5)
+                except Exception:  # noqa: BLE001, S112
+                    continue
+                if not alive:
+                    log_tail = ""
+                    with contextlib.suppress(Exception):
+                        log_tail = ray.get(actor.read_log_tail.remote(), timeout=5)
+                    tail = "\n".join(log_tail.splitlines()[-50:]) if log_tail else "(no log output)"
+                    msg = (
+                        f"Dynamo {label} subprocess crashed during startup.\n\n"
+                        f"--- {label} log (last 50 lines) ---\n{tail}"
+                    )
+                    raise RuntimeError(msg)
 
-    def _log_labels(self) -> list[str]:
-        """Return labels for all managed subprocess log files."""
-        labels = []
+    def _get_actors_for_health_check(self) -> list[tuple[str, Any]]:
+        """Return (label, actor) pairs for all subprocess actors to health-check."""
+        actors: list[tuple[str, Any]] = []
         if self._frontend_actor is not None:
-            labels.append("frontend")
-        for i in range(len(self._worker_actors)):
-            labels.append(f"worker_{i}")
-        return labels
+            actors.append(("frontend", self._frontend_actor))
+        actors.extend(self._worker_actors)
+        return actors
 
     @staticmethod
     def _resolve_num_replicas(model_config: InferenceModelConfig) -> int:
@@ -475,16 +585,13 @@ class DynamoBackend(InferenceBackend):
         data_dir = os.path.join(self._runtime_dir, "etcd_data")
         os.makedirs(data_dir, exist_ok=True)
 
-        # etcd also needs a peer port — default 2380 may conflict with other instances.
-        # Use 127.0.0.1 (not localhost) to avoid DNS resolution mismatches between
-        # --initial-advertise-peer-urls and --initial-cluster.
         peer_port = get_free_port(2380)
         command = [
             "etcd",
             "--listen-client-urls",
             f"http://0.0.0.0:{port}",
             "--advertise-client-urls",
-            f"http://0.0.0.0:{port}",
+            f"http://{self._head_ip}:{port}",
             "--listen-peer-urls",
             f"http://127.0.0.1:{peer_port}",
             "--initial-advertise-peer-urls",
@@ -534,18 +641,98 @@ class DynamoBackend(InferenceBackend):
     # Worker / frontend actors
     # ------------------------------------------------------------------
 
-    def _launch_worker(  # noqa: PLR0913
+    def _launch_replicas(  # noqa: PLR0913
         self,
         actor_cls: type,
-        worker_index: int,
+        replica_plans: list[ReplicaPlan],
         model_config: InferenceModelConfig,
         base_env: dict[str, str],
         *,
-        gpus_per_worker: int,
         namespace: str,
         request_plane: str,
         event_plane: str,
+    ) -> None:
+        """Launch all worker actors for the given replica plans."""
+        for plan in replica_plans:
+            if plan.is_multi_node:
+                logger.info(
+                    f"Replica {plan.replica_index}: multi-node TP across {plan.nnodes} nodes "
+                    f"(total {plan.total_gpus} GPUs, master={plan.master_addr})"
+                )
+            else:
+                logger.info(f"Replica {plan.replica_index}: single-node, {plan.total_gpus} GPU(s)")
+
+            for rank in plan.ranks:
+                if rank.node_rank == 0:
+                    actor = self._launch_worker(
+                        actor_cls,
+                        replica_index=plan.replica_index,
+                        model_config=model_config,
+                        base_env=base_env,
+                        node_alloc=rank,
+                        namespace=namespace,
+                        request_plane=request_plane,
+                        event_plane=event_plane,
+                        multi_node_plan=plan if plan.is_multi_node else None,
+                    )
+                else:
+                    actor = self._launch_headless_worker(
+                        actor_cls,
+                        replica_index=plan.replica_index,
+                        model_config=model_config,
+                        base_env=base_env,
+                        node_alloc=rank,
+                        plan=plan,
+                    )
+                label = f"replica_{plan.replica_index}_rank_{rank.node_rank}"
+                self._worker_actors.append((label, actor))
+
+    def _spawn_actor(
+        self,
+        actor_cls: type,
+        label: str,
+        command: list[str],
+        env: dict[str, str],
+        node_alloc: NodeAllocation,
     ) -> Any:  # noqa: ANN401
+        """Create a detached Ray actor that runs *command* as a subprocess.
+
+        Handles log file setup, actor naming, GPU reservation, and node
+        pinning via ``NodeAffinitySchedulingStrategy``.
+        """
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        log_file = os.path.join(self._runtime_dir, f"{label}.log") if self._runtime_dir else None
+        actor_name = f"{self._actor_name_prefix}_{label}"
+        actor = actor_cls.options(
+            name=actor_name,
+            lifetime="detached",
+            num_gpus=node_alloc.num_gpus,
+            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_alloc.node_id, soft=False),
+        ).remote(command=command, env=env, log_file=log_file)
+
+        logger.info(f"Launching {label} on {node_alloc.node_ip} (actor: {actor_name}, gpus={node_alloc.num_gpus})")
+        return actor
+
+    def _launch_worker(  # noqa: PLR0913
+        self,
+        actor_cls: type,
+        *,
+        replica_index: int,
+        model_config: InferenceModelConfig,
+        base_env: dict[str, str],
+        node_alloc: NodeAllocation,
+        namespace: str,
+        request_plane: str,
+        event_plane: str,
+        multi_node_plan: ReplicaPlan | None = None,
+    ) -> Any:  # noqa: ANN401
+        """Launch a full Dynamo vLLM worker (rank 0).
+
+        This worker creates a ``DistributedRuntime``, registers the model in
+        etcd, and serves inference requests.  For multi-node TP, it also
+        coordinates with headless workers via ``torch.distributed``.
+        """
         model_name = model_config.model_name or model_config.model_identifier
         command = [
             sys.executable,
@@ -566,16 +753,55 @@ class DynamoBackend(InferenceBackend):
             *_engine_kwargs_to_cli_flags(model_config.engine_kwargs),
         ]
 
-        log_file = os.path.join(self._runtime_dir, f"worker_{worker_index}.log") if self._runtime_dir else None
-        actor_name = f"{self._actor_name_prefix}_worker_{worker_index}"
-        actor = actor_cls.options(
-            name=actor_name,
-            lifetime="detached",
-            num_gpus=gpus_per_worker,
-        ).remote(command=command, env=base_env, log_file=log_file)
+        if multi_node_plan is not None:
+            command.extend(
+                [
+                    "--nnodes",
+                    str(multi_node_plan.nnodes),
+                    "--node-rank",
+                    "0",
+                    "--master-addr",
+                    multi_node_plan.master_addr,
+                ]
+            )
 
-        logger.info(f"Starting Dynamo worker {worker_index} (actor: {actor_name}, gpus={gpus_per_worker})")
-        return actor
+        label = f"replica_{replica_index}_rank_0"
+        return self._spawn_actor(actor_cls, label, command, base_env, node_alloc)
+
+    def _launch_headless_worker(  # noqa: PLR0913
+        self,
+        actor_cls: type,
+        *,
+        replica_index: int,
+        model_config: InferenceModelConfig,
+        base_env: dict[str, str],
+        node_alloc: NodeAllocation,
+        plan: ReplicaPlan,
+    ) -> Any:  # noqa: ANN401
+        """Launch a headless vLLM worker (rank > 0, multi-node TP).
+
+        Headless workers bypass Dynamo's ``DistributedRuntime`` entirely --
+        they run only vLLM workers coordinated with rank 0 via
+        ``torch.distributed`` (NCCL).  No model registration, no etcd/NATS.
+        """
+        command = [
+            sys.executable,
+            "-m",
+            "dynamo.vllm",
+            "--model",
+            model_config.model_identifier,
+            "--headless",
+            "--nnodes",
+            str(plan.nnodes),
+            "--node-rank",
+            str(node_alloc.node_rank),
+            "--master-addr",
+            plan.master_addr,
+            *_engine_kwargs_to_cli_flags(model_config.engine_kwargs),
+        ]
+
+        label = f"replica_{replica_index}_rank_{node_alloc.node_rank}"
+        return self._spawn_actor(actor_cls, label, command, base_env, node_alloc)
 
     def _launch_frontend(  # noqa: PLR0913
         self,
@@ -635,7 +861,6 @@ class DynamoBackend(InferenceBackend):
     # ------------------------------------------------------------------
 
     def stop(self) -> None:
-        # Collect actors in reverse-start order: frontend → workers → nats → etcd
         actors_to_kill = self._collect_actors_for_shutdown()
 
         if actors_to_kill:
@@ -645,14 +870,14 @@ class DynamoBackend(InferenceBackend):
         logger.info("Dynamo backend stopped")
 
     def _collect_actors_for_shutdown(self) -> list[tuple[str, Any]]:
+        """Collect all actors in reverse-start order: frontend -> workers -> nats -> etcd."""
         actors: list[tuple[str, Any]] = []
 
         if self._frontend_actor is not None:
             actors.append(("frontend", self._frontend_actor))
             self._frontend_actor = None
 
-        for actor in self._worker_actors:
-            actors.append(("worker", actor))
+        actors.extend(self._worker_actors)
         self._worker_actors.clear()
 
         if self._nats_actor is not None:

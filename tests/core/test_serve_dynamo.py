@@ -17,9 +17,10 @@ import pytest
 from nemo_curator.core.serve import InferenceModelConfig, InferenceServer
 from nemo_curator.core.serve.internal.dynamo import (
     DynamoBackend,
-    WorkerPlacement,
+    NodeAllocation,
+    ReplicaPlan,
     _engine_kwargs_to_cli_flags,
-    build_gpu_placement,
+    plan_replica_placement,
 )
 
 # ---------------------------------------------------------------------------
@@ -86,6 +87,129 @@ class TestEngineKwargsToCliFlags:
 
 
 # ---------------------------------------------------------------------------
+# NodeAllocation / ReplicaPlan dataclasses
+# ---------------------------------------------------------------------------
+
+
+class TestNodeAllocation:
+    def test_fields(self):
+        a = NodeAllocation(node_id="n1", node_ip="10.0.0.1", num_gpus=2, node_rank=0)
+        assert a.node_id == "n1"
+        assert a.node_ip == "10.0.0.1"
+        assert a.num_gpus == 2
+        assert a.node_rank == 0
+
+
+class TestReplicaPlan:
+    def test_single_node(self):
+        plan = ReplicaPlan(
+            replica_index=0,
+            ranks=[NodeAllocation(node_id="n1", node_ip="10.0.0.1", num_gpus=4, node_rank=0)],
+        )
+        assert not plan.is_multi_node
+        assert plan.nnodes == 1
+        assert plan.total_gpus == 4
+        assert plan.master_addr == "10.0.0.1"
+
+    def test_multi_node(self):
+        plan = ReplicaPlan(
+            replica_index=0,
+            ranks=[
+                NodeAllocation(node_id="n1", node_ip="10.0.0.1", num_gpus=4, node_rank=0),
+                NodeAllocation(node_id="n2", node_ip="10.0.0.2", num_gpus=4, node_rank=1),
+            ],
+        )
+        assert plan.is_multi_node
+        assert plan.nnodes == 2
+        assert plan.total_gpus == 8
+        assert plan.master_addr == "10.0.0.1"
+
+
+# ---------------------------------------------------------------------------
+# GPU placement planner — mocked inventory (no Ray needed)
+# ---------------------------------------------------------------------------
+
+
+class TestPlanReplicaPlacementMocked:
+    """Tests with pre-built inventory (no Ray cluster required)."""
+
+    def _inventory_1x8(self) -> list[dict]:
+        return [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 8, "is_head": False}]
+
+    def _inventory_2x4(self) -> list[dict]:
+        return [
+            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False},
+            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 4, "is_head": False},
+        ]
+
+    def _inventory_3x4(self) -> list[dict]:
+        return [
+            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False},
+            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 4, "is_head": False},
+            {"node_id": "n3", "node_ip": "10.0.0.3", "num_gpus": 4, "is_head": False},
+        ]
+
+    def test_single_node_single_replica(self):
+        plans = plan_replica_placement(num_replicas=1, tp_size=4, _inventory=self._inventory_1x8())
+        assert len(plans) == 1
+        assert not plans[0].is_multi_node
+        assert plans[0].ranks[0].num_gpus == 4
+
+    def test_single_node_multiple_replicas(self):
+        plans = plan_replica_placement(num_replicas=2, tp_size=4, _inventory=self._inventory_1x8())
+        assert len(plans) == 2
+        for plan in plans:
+            assert not plan.is_multi_node
+            assert plan.ranks[0].num_gpus == 4
+
+    def test_multi_node_tp(self):
+        """TP=8 across 2 nodes with 4 GPUs each."""
+        plans = plan_replica_placement(num_replicas=1, tp_size=8, _inventory=self._inventory_2x4())
+        assert len(plans) == 1
+        plan = plans[0]
+        assert plan.is_multi_node
+        assert plan.nnodes == 2
+        assert plan.ranks[0].node_rank == 0
+        assert plan.ranks[0].num_gpus == 4
+        assert plan.ranks[0].node_ip == "10.0.0.1"
+        assert plan.ranks[1].node_rank == 1
+        assert plan.ranks[1].num_gpus == 4
+        assert plan.ranks[1].node_ip == "10.0.0.2"
+        assert plan.master_addr == "10.0.0.1"
+
+    def test_multi_node_tp_three_nodes(self):
+        """TP=12 across 3 nodes with 4 GPUs each."""
+        plans = plan_replica_placement(num_replicas=1, tp_size=12, _inventory=self._inventory_3x4())
+        assert len(plans) == 1
+        plan = plans[0]
+        assert plan.nnodes == 3
+        assert plan.total_gpus == 12
+
+    def test_multiple_replicas_across_nodes(self):
+        """2 replicas x TP=4 on 2 nodes with 4 GPUs each."""
+        plans = plan_replica_placement(num_replicas=2, tp_size=4, _inventory=self._inventory_2x4())
+        assert len(plans) == 2
+        # Each replica fits on one node
+        assert not plans[0].is_multi_node
+        assert not plans[1].is_multi_node
+        # Different nodes
+        assert plans[0].ranks[0].node_id != plans[1].ranks[0].node_id
+
+    def test_insufficient_gpus_raises(self):
+        with pytest.raises(RuntimeError, match="Need"):
+            plan_replica_placement(num_replicas=1, tp_size=16, _inventory=self._inventory_2x4())
+
+    def test_empty_inventory_raises(self):
+        with pytest.raises(RuntimeError, match="No GPU nodes"):
+            plan_replica_placement(num_replicas=1, tp_size=1, _inventory=[])
+
+    def test_partial_placement_raises(self):
+        """Not enough GPUs for all replicas."""
+        with pytest.raises(RuntimeError):
+            plan_replica_placement(num_replicas=3, tp_size=4, _inventory=self._inventory_2x4())
+
+
+# ---------------------------------------------------------------------------
 # GPU placement planner — real Ray cluster
 # ---------------------------------------------------------------------------
 
@@ -96,28 +220,26 @@ class TestGpuPlacement:
     """Tests against the real shared Ray cluster (session fixture provides 2 GPUs)."""
 
     def test_placement_uses_available_gpus(self):
-        """Placement succeeds with the real cluster's GPU inventory."""
-        placements = build_gpu_placement(num_replicas=2, gpus_per_replica=1)
-        assert len(placements) == 2
-        assert placements[0].gpu_ids == [0]
-        assert placements[1].gpu_ids == [1]
+        plans = plan_replica_placement(num_replicas=2, tp_size=1)
+        assert len(plans) == 2
+        assert plans[0].ranks[0].num_gpus == 1
+        assert plans[1].ranks[0].num_gpus == 1
 
     def test_placement_tp2(self):
-        """TP=2 on 2 GPUs → 1 worker with GPUs [0,1]."""
-        placements = build_gpu_placement(num_replicas=1, gpus_per_replica=2)
-        assert len(placements) == 1
-        assert placements[0].gpu_ids == [0, 1]
+        """TP=2 on 2 GPUs → 1 replica, 1 rank, 2 GPUs."""
+        plans = plan_replica_placement(num_replicas=1, tp_size=2)
+        assert len(plans) == 1
+        assert plans[0].ranks[0].num_gpus == 2
+        assert not plans[0].is_multi_node
 
     def test_insufficient_gpus_raises(self):
-        """Requesting more GPUs than available raises RuntimeError."""
         with pytest.raises(RuntimeError, match="Need"):
-            build_gpu_placement(num_replicas=10, gpus_per_replica=4)
+            plan_replica_placement(num_replicas=10, tp_size=4)
 
     def test_placement_has_valid_node_info(self):
-        """Each placement has non-empty node_id and node_ip."""
-        placements = build_gpu_placement(num_replicas=1, gpus_per_replica=1)
-        assert placements[0].node_id
-        assert placements[0].node_ip
+        plans = plan_replica_placement(num_replicas=1, tp_size=1)
+        assert plans[0].ranks[0].node_id
+        assert plans[0].ranks[0].node_ip
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +273,6 @@ class TestResolveNumReplicas:
 
 class TestPipelineDynamoFailFast:
     def test_active_backend_tracking(self):
-        """Verify _active_servers tracks dynamo backend correctly."""
         from nemo_curator.core.serve import _active_servers, get_active_backend
 
         _active_servers["test-dynamo"] = "dynamo"
@@ -174,23 +295,9 @@ class TestDynamoBackendValidation:
             backend.start()
 
     def test_stop_before_start_is_safe(self):
-        """stop() on a never-started backend is a no-op."""
         server = InferenceServer(
             models=[InferenceModelConfig(model_identifier="m")],
             backend="dynamo",
         )
         backend = DynamoBackend(server)
         backend.stop()  # should not raise
-
-
-# ---------------------------------------------------------------------------
-# WorkerPlacement dataclass
-# ---------------------------------------------------------------------------
-
-
-class TestWorkerPlacement:
-    def test_fields(self):
-        p = WorkerPlacement(node_id="n1", node_ip="10.0.0.1", gpu_ids=[0, 1], worker_index=0)
-        assert p.node_id == "n1"
-        assert p.gpu_ids == [0, 1]
-        assert p.worker_index == 0
