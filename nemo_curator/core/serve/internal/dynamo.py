@@ -155,18 +155,22 @@ def _stop_subprocess(proc: Any, sigterm_wait: float = _SIGTERM_WAIT_S) -> int | 
     return proc.returncode
 
 
-def _define_infra_actor() -> type:
-    """Return the ``_InfraActor`` Ray remote class."""
+def _define_subprocess_actor() -> type:
+    """Return the ``_SubprocessActor`` Ray remote class.
+
+    A single actor class used for all Dynamo subprocesses (etcd, NATS,
+    frontend, vLLM workers).  GPU resources are configured per-instance
+    via ``.options(num_gpus=...)`` at creation time.
+    """
     import ray
 
     @ray.remote(num_cpus=1, num_gpus=0)
-    class _InfraActor:
-        """Manages an etcd, nats-server, or frontend subprocess on a Ray node."""
+    class _SubprocessActor:
+        """Manages a subprocess on a Ray node with optional file-based logging."""
 
-        def __init__(self, command: list[str], env: dict[str, str], label: str, log_file: str | None = None) -> None:
+        def __init__(self, command: list[str], env: dict[str, str], log_file: str | None = None) -> None:
             import subprocess as _sp
 
-            self._label = label
             if log_file:
                 self._log_fh = open(log_file, "w")  # noqa: SIM115
                 self._proc = _sp.Popen(command, env=env, stdout=self._log_fh, stderr=_sp.STDOUT)  # noqa: S603
@@ -189,49 +193,7 @@ def _define_infra_actor() -> type:
                 self._log_fh.close()
             return rc
 
-    return _InfraActor
-
-
-def _define_worker_actor() -> type:
-    """Return the ``_WorkerActor`` Ray remote class."""
-    import ray
-
-    @ray.remote(num_cpus=1, num_gpus=0)
-    class _WorkerActor:
-        """Manages a ``python -m dynamo.vllm`` subprocess on a Ray node."""
-
-        def __init__(
-            self, command: list[str], env: dict[str, str], worker_index: int, log_file: str | None = None
-        ) -> None:
-            import subprocess as _sp
-
-            self._worker_index = worker_index
-            if log_file:
-                self._log_fh = open(log_file, "w")  # noqa: SIM115
-                self._proc = _sp.Popen(command, env=env, stdout=self._log_fh, stderr=_sp.STDOUT)  # noqa: S603
-            else:
-                self._proc = _sp.Popen(command, env=env, stdout=_sp.DEVNULL, stderr=_sp.STDOUT)  # noqa: S603
-            self._log_file = log_file
-
-        def pid(self) -> int:
-            return self._proc.pid
-
-        def worker_index(self) -> int:
-            return self._worker_index
-
-        def is_alive(self) -> bool:
-            return self._proc.poll() is None
-
-        def log_file(self) -> str | None:
-            return self._log_file
-
-        def stop(self, sigterm_wait: float = _SIGTERM_WAIT_S) -> int | None:
-            rc = _stop_subprocess(self._proc, sigterm_wait)
-            if hasattr(self, "_log_fh"):
-                self._log_fh.close()
-            return rc
-
-    return _WorkerActor
+    return _SubprocessActor
 
 
 # ---------------------------------------------------------------------------
@@ -308,8 +270,6 @@ class DynamoBackend(InferenceBackend):
 
     def __init__(self, server: InferenceServer) -> None:
         self._server = server
-
-        # Populated during start()
         self._runtime_dir: str | None = None
         self._etcd_actor: Any = None
         self._nats_actor: Any = None
@@ -366,14 +326,13 @@ class DynamoBackend(InferenceBackend):
             )
             server.port = get_free_port(server.port)
 
-            infra_cls = _define_infra_actor()
-            worker_cls = _define_worker_actor()
+            actor_cls = _define_subprocess_actor()
 
             # Infrastructure
             if not server.etcd_endpoint:
-                self._etcd_actor = self._start_etcd(infra_cls, head_node_id, self._etcd_port)
+                self._etcd_actor = self._start_etcd(actor_cls, head_node_id, self._etcd_port)
             if not server.nats_url:
-                self._nats_actor = self._start_nats(infra_cls, head_node_id, self._nats_port)
+                self._nats_actor = self._start_nats(actor_cls, head_node_id, self._nats_port)
 
             etcd_endpoint = server.etcd_endpoint or f"http://localhost:{self._etcd_port}"
             nats_url = server.nats_url or f"nats://localhost:{self._nats_port}"
@@ -387,7 +346,7 @@ class DynamoBackend(InferenceBackend):
 
             for i in range(num_replicas):
                 actor = self._launch_worker(
-                    worker_cls,
+                    actor_cls,
                     worker_index=i,
                     model_config=model_config,
                     base_env=worker_env,
@@ -401,7 +360,7 @@ class DynamoBackend(InferenceBackend):
             # Frontend
             model_name = model_config.model_name or model_config.model_identifier
             self._frontend_actor = self._launch_frontend(
-                infra_cls,
+                actor_cls,
                 head_node_id,
                 server.port,
                 etcd_endpoint,
@@ -433,7 +392,6 @@ class DynamoBackend(InferenceBackend):
         while time.monotonic() < deadline:
             attempt += 1
 
-            # Check subprocess liveness every few attempts
             if attempt % 3 == 0:
                 self._check_subprocess_health()
 
@@ -458,10 +416,10 @@ class DynamoBackend(InferenceBackend):
         raise TimeoutError(msg)
 
     def _check_subprocess_health(self) -> None:
-        """Check log files for signs of subprocess crashes.
+        """Check log file tails for signs of subprocess crashes.
 
-        Scans all log files in the runtime directory for Python tracebacks
-        or fatal-level log lines. Raises immediately with the log tail if found.
+        Reads only the last ~8 KB of each log file to avoid full reads on
+        large files.  Raises immediately with the log tail if a crash is found.
         """
         if not self._runtime_dir:
             return
@@ -470,8 +428,12 @@ class DynamoBackend(InferenceBackend):
         for label in self._log_labels():
             log_path = os.path.join(self._runtime_dir, f"{label}.log")
             try:
-                with open(log_path) as f:
-                    content = f.read()
+                with open(log_path, "rb") as f:
+                    f.seek(0, 2)
+                    size = f.tell()
+                    f.seek(max(0, size - 8192))
+                    tail_bytes = f.read()
+                content = tail_bytes.decode(errors="replace")
             except Exception:  # noqa: BLE001, S112
                 continue
             if not content:
@@ -491,18 +453,6 @@ class DynamoBackend(InferenceBackend):
         for i in range(len(self._worker_actors)):
             labels.append(f"worker_{i}")
         return labels
-
-    def _read_log_tail(self, label: str, lines: int = 50) -> str:
-        """Read the last *lines* from a subprocess log file."""
-        if not self._runtime_dir:
-            return ""
-        log_path = os.path.join(self._runtime_dir, f"{label}.log")
-        try:
-            with open(log_path) as f:
-                all_lines = f.readlines()
-                return "".join(all_lines[-lines:])
-        except Exception:  # noqa: BLE001
-            return ""
 
     @staticmethod
     def _resolve_num_replicas(model_config: InferenceModelConfig) -> int:
@@ -552,7 +502,7 @@ class DynamoBackend(InferenceBackend):
             name=actor_name,
             lifetime="detached",
             scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=head_node_id, soft=False),
-        ).remote(command=command, env=env, label="etcd", log_file=log_file)
+        ).remote(command=command, env=env, log_file=log_file)
 
         logger.info(f"Starting etcd on port {port} (actor: {actor_name})")
         _wait_for_port("localhost", port, timeout_s=30, label="etcd")
@@ -573,7 +523,7 @@ class DynamoBackend(InferenceBackend):
             name=actor_name,
             lifetime="detached",
             scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=head_node_id, soft=False),
-        ).remote(command=command, env=dict(os.environ), label="nats", log_file=log_file)
+        ).remote(command=command, env=dict(os.environ), log_file=log_file)
 
         logger.info(f"Starting NATS on port {port} (actor: {actor_name})")
         _wait_for_port("localhost", port, timeout_s=30, label="nats")
@@ -618,13 +568,11 @@ class DynamoBackend(InferenceBackend):
 
         log_file = os.path.join(self._runtime_dir, f"worker_{worker_index}.log") if self._runtime_dir else None
         actor_name = f"{self._actor_name_prefix}_worker_{worker_index}"
-        # Let Ray handle GPU placement — the actor gets num_gpus GPUs, and the
-        # subprocess inherits the actor's CUDA_VISIBLE_DEVICES automatically.
         actor = actor_cls.options(
             name=actor_name,
             lifetime="detached",
             num_gpus=gpus_per_worker,
-        ).remote(command=command, env=base_env, worker_index=worker_index, log_file=log_file)
+        ).remote(command=command, env=base_env, log_file=log_file)
 
         logger.info(f"Starting Dynamo worker {worker_index} (actor: {actor_name}, gpus={gpus_per_worker})")
         return actor
@@ -669,7 +617,7 @@ class DynamoBackend(InferenceBackend):
             name=actor_name,
             lifetime="detached",
             scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=head_node_id, soft=False),
-        ).remote(command=command, env=env, label="frontend", log_file=log_file)
+        ).remote(command=command, env=env, log_file=log_file)
 
         logger.info(f"Starting Dynamo frontend on port {port} (actor: {actor_name})")
         return actor
@@ -729,10 +677,12 @@ class DynamoBackend(InferenceBackend):
             logger.debug("Could not connect to Ray during Dynamo shutdown (cluster may be gone)")
 
     def _cleanup_runtime_dir(self) -> None:
-        if self._runtime_dir and os.path.isdir(self._runtime_dir):
+        if self._runtime_dir:
             try:
                 shutil.rmtree(self._runtime_dir)
                 logger.debug(f"Cleaned up runtime dir: {self._runtime_dir}")
+            except FileNotFoundError:
+                pass
             except Exception:  # noqa: BLE001
                 logger.debug(f"Failed to clean up runtime dir: {self._runtime_dir}")
             self._runtime_dir = None
