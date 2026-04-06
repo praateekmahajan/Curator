@@ -328,12 +328,16 @@ def _engine_kwargs_to_cli_flags(engine_kwargs: dict[str, Any]) -> list[str]:
     Example: ``{"tensor_parallel_size": 4, "enforce_eager": True}``
     becomes ``["--tensor-parallel-size", "4", "--enforce-eager"]``
     """
+    import json
+
     flags: list[str] = []
     for key, value in engine_kwargs.items():
         flag = "--" + key.replace("_", "-")
         if isinstance(value, bool):
             if value:
                 flags.append(flag)
+        elif isinstance(value, (dict, list)):
+            flags.extend([flag, json.dumps(value)])
         else:
             flags.extend([flag, str(value)])
     return flags
@@ -437,6 +441,11 @@ class DynamoBackend(InferenceBackend):
             head_node_id = ray.get_runtime_context().get_node_id()
             cluster_nodes = ray.nodes()
             self._head_ip = _resolve_node_ip(head_node_id, nodes=cluster_nodes)
+            server._host = self._head_ip
+
+            # Kill any orphaned actors from a previous run with the same server name
+            # (e.g. after a Jupyter kernel restart that bypassed atexit cleanup).
+            self._kill_orphaned_actors(ray, server.name)
 
             self._etcd_port = (
                 int(server.etcd_endpoint.rsplit(":", 1)[-1])
@@ -450,51 +459,58 @@ class DynamoBackend(InferenceBackend):
 
             actor_cls = _define_subprocess_actor()
 
-            # Infrastructure -- always on head node
-            if not server.etcd_endpoint:
-                self._etcd_actor = self._start_etcd(actor_cls, head_node_id, self._etcd_port)
-            if not server.nats_url:
-                self._nats_actor = self._start_nats(actor_cls, head_node_id, self._nats_port)
+            try:
+                # Infrastructure -- always on head node
+                if not server.etcd_endpoint:
+                    self._etcd_actor = self._start_etcd(actor_cls, head_node_id, self._etcd_port)
+                if not server.nats_url:
+                    self._nats_actor = self._start_nats(actor_cls, head_node_id, self._nats_port)
 
-            etcd_endpoint = server.etcd_endpoint or f"http://{self._head_ip}:{self._etcd_port}"
-            nats_url = server.nats_url or f"nats://{self._head_ip}:{self._nats_port}"
+                etcd_endpoint = server.etcd_endpoint or f"http://{self._head_ip}:{self._etcd_port}"
+                nats_url = server.nats_url or f"nats://{self._head_ip}:{self._nats_port}"
 
-            # Plan GPU placement across cluster
-            replica_plans = plan_replica_placement(num_replicas, tp_size, head_node_id, _nodes=cluster_nodes)
+                # Plan GPU placement across cluster
+                replica_plans = plan_replica_placement(num_replicas, tp_size, head_node_id, _nodes=cluster_nodes)
 
-            namespace = dynamo_cfg.get("namespace", "curator")
-            request_plane = dynamo_cfg.get("request_plane", "nats")
-            event_plane = dynamo_cfg.get("event_plane", "nats")
-            base_env = self._build_env(etcd_endpoint, nats_url)
+                namespace = dynamo_cfg.get("namespace", "curator")
+                request_plane = dynamo_cfg.get("request_plane", "nats")
+                event_plane = dynamo_cfg.get("event_plane", "nats")
+                base_env = self._build_env(etcd_endpoint, nats_url)
 
-            self._launch_replicas(
-                actor_cls,
-                replica_plans,
-                model_config,
-                base_env,
-                namespace=namespace,
-                request_plane=request_plane,
-                event_plane=event_plane,
-            )
+                self._launch_replicas(
+                    actor_cls,
+                    replica_plans,
+                    model_config,
+                    base_env,
+                    namespace=namespace,
+                    request_plane=request_plane,
+                    event_plane=event_plane,
+                )
 
-            # Frontend -- always on head node
-            model_name = model_config.model_name or model_config.model_identifier
-            self._frontend_actor = self._launch_frontend(
-                actor_cls,
-                head_node_id,
-                server.port,
-                etcd_endpoint,
-                nats_url,
-                namespace=namespace,
-                model_name=model_name,
-                request_plane=request_plane,
-                event_plane=event_plane,
-            )
+                # Frontend -- always on head node
+                model_name = model_config.model_name or model_config.model_identifier
+                self._frontend_actor = self._launch_frontend(
+                    actor_cls,
+                    head_node_id,
+                    server.port,
+                    etcd_endpoint,
+                    nats_url,
+                    namespace=namespace,
+                    model_name=model_name,
+                    request_plane=request_plane,
+                    event_plane=event_plane,
+                )
 
-            # Health check — must stay inside ray.init context so actor handles
-            # (is_alive, read_log_tail) remain valid for subprocess liveness checks.
-            expected_model = model_config.model_name or model_config.model_identifier
-            self._wait_for_model(server, expected_model)
+                # Health check — must stay inside ray.init context so actor handles
+                # (is_alive, read_log_tail) remain valid for subprocess liveness checks.
+                expected_model = model_config.model_name or model_config.model_identifier
+                self._wait_for_model(server, expected_model)
+            except Exception:
+                # Still connected to Ray here — kill directly without opening another context.
+                for label, actor in self._collect_actors_for_shutdown():
+                    _kill_actor(ray, label, actor)
+                self._cleanup_runtime_dir()
+                raise
 
     def _wait_for_model(self, server: InferenceServer, model_name: str) -> None:
         """Poll ``/v1/models`` until *model_name* appears in the response.
@@ -611,7 +627,7 @@ class DynamoBackend(InferenceBackend):
         data_dir = os.path.join(self._runtime_dir, "etcd_data")
         os.makedirs(data_dir, exist_ok=True)
 
-        peer_port = get_free_port(2380)
+        peer_port = get_free_port(port + 1)
         command = [
             "etcd",
             "--listen-client-urls",
@@ -892,12 +908,22 @@ class DynamoBackend(InferenceBackend):
     # ------------------------------------------------------------------
 
     def stop(self) -> None:
+        import ray
+
         actors_to_kill = self._collect_actors_for_shutdown()
 
-        if actors_to_kill:
-            self._kill_all_actors(actors_to_kill)
+        try:
+            with ray.init(ignore_reinit_error=True):
+                for label, actor in actors_to_kill:
+                    _kill_actor(ray, label, actor)
+                # atexit is unreliable in Jupyter — sweep by name to catch actors
+                # orphaned when the kernel was restarted without calling stop().
+                self._kill_orphaned_actors(ray, self._server.name)
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not connect to Ray during Dynamo shutdown (cluster may be gone)")
 
         self._cleanup_runtime_dir()
+        self._server._host = "localhost"
         logger.info("Dynamo backend stopped")
 
     def _collect_actors_for_shutdown(self) -> list[tuple[str, Any]]:
@@ -922,15 +948,33 @@ class DynamoBackend(InferenceBackend):
         return actors
 
     @staticmethod
-    def _kill_all_actors(actors: list[tuple[str, Any]]) -> None:
-        import ray
+    def _kill_orphaned_actors(ray_mod: Any, server_name: str) -> None:  # noqa: ANN401
+        """Kill any live actors whose name starts with ``dynamo_{server_name}_``.
 
+        Searches across all Ray namespaces so it finds actors created in
+        anonymous namespaces (e.g. after a Jupyter kernel restart).
+        """
+        from ray.util.state import list_actors
+
+        prefix = f"dynamo_{server_name}_"
         try:
-            with ray.init(ignore_reinit_error=True):
-                for label, actor in actors:
-                    _kill_actor(ray, label, actor)
+            all_actors = list_actors(filters=[("state", "=", "ALIVE")], limit=500, timeout=10)
         except Exception:  # noqa: BLE001
-            logger.debug("Could not connect to Ray during Dynamo shutdown (cluster may be gone)")
+            logger.debug("Could not list Ray actors for orphan cleanup")
+            return
+
+        orphans = [a for a in all_actors if a.get("name", "").startswith(prefix)]
+        if not orphans:
+            return
+
+        logger.info(f"Found {len(orphans)} orphaned Dynamo actor(s) — cleaning up")
+        for actor_info in orphans:
+            name = actor_info["name"]
+            ns = actor_info.get("ray_namespace")
+            with contextlib.suppress(Exception):
+                handle = ray_mod.get_actor(name, namespace=ns)
+                _kill_actor(ray_mod, name, handle)
+                logger.debug(f"Killed orphaned actor: {name}")
 
     def _cleanup_runtime_dir(self) -> None:
         if self._runtime_dir:

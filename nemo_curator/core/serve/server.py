@@ -187,6 +187,7 @@ class InferenceServer:
 
     _started: bool = field(init=False, default=False, repr=False)
     _backend_impl: InferenceBackend | None = field(init=False, default=None, repr=False)
+    _host: str = field(init=False, default="localhost", repr=False)
 
     def __post_init__(self) -> None:
         if not self.verbose:
@@ -244,7 +245,7 @@ class InferenceServer:
     @property
     def endpoint(self) -> str:
         """OpenAI-compatible base URL for the served models."""
-        return f"http://localhost:{self.port}/v1"
+        return f"http://{self._host}:{self.port}/v1"
 
     def _wait_for_healthy(self) -> None:
         """Poll the /v1/models endpoint until all models are ready."""
