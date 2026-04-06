@@ -255,6 +255,14 @@ def _define_subprocess_actor() -> type:  # noqa: C901
         def __init__(self, command: list[str], env: dict[str, str], log_file: str | None = None) -> None:
             import subprocess as _sp
 
+            # Start from the actor's own os.environ (which has Ray-assigned
+            # CUDA_VISIBLE_DEVICES), then overlay the caller-provided env vars.
+            # The caller's env originates from the *driver* process and must not
+            # replace the actor's CUDA_VISIBLE_DEVICES.
+            merged_env = dict(os.environ)
+            merged_env.update(env)
+            env = merged_env
+
             if log_file:
                 os.makedirs(os.path.dirname(log_file), exist_ok=True)
                 self._log_fh = open(log_file, "w")  # noqa: SIM115
@@ -483,9 +491,10 @@ class DynamoBackend(InferenceBackend):
                 event_plane=event_plane,
             )
 
-        # Health check -- outside ray.init context, pure HTTP.
-        expected_model = model_config.model_name or model_config.model_identifier
-        self._wait_for_model(server, expected_model)
+            # Health check — must stay inside ray.init context so actor handles
+            # (is_alive, read_log_tail) remain valid for subprocess liveness checks.
+            expected_model = model_config.model_name or model_config.model_identifier
+            self._wait_for_model(server, expected_model)
 
     def _wait_for_model(self, server: InferenceServer, model_name: str) -> None:
         """Poll ``/v1/models`` until *model_name* appears in the response.
@@ -502,8 +511,7 @@ class DynamoBackend(InferenceBackend):
         while time.monotonic() < deadline:
             attempt += 1
 
-            if attempt % 3 == 0:
-                self._check_subprocess_health()
+            self._check_subprocess_health()
 
             try:
                 resp = urllib.request.urlopen(models_url, timeout=5)  # noqa: S310
@@ -528,10 +536,14 @@ class DynamoBackend(InferenceBackend):
     def _check_subprocess_health(self) -> None:
         """Check subprocess liveness via Ray actors.
 
-        Reconnects briefly to Ray to call ``is_alive()`` on each managed
-        actor.  If a subprocess has exited, reads its log tail via
-        ``read_log_tail()`` and raises with the output.  Works for both
-        local and remote (multi-node) actors.
+        Calls ``is_alive()`` on each managed actor.  If a subprocess has
+        exited, reads its log tail via ``read_log_tail()`` and raises with
+        the output.  Works for both local and remote (multi-node) actors.
+
+        Note: does NOT use ``with ray.init()`` — the driver must already be
+        connected.  Using a context manager here would disconnect Ray on
+        exit, invalidating actor handles and causing silent failures on the
+        next health check.
         """
         import ray
 
@@ -539,22 +551,20 @@ class DynamoBackend(InferenceBackend):
         if not actors_to_check:
             return
 
-        with ray.init(ignore_reinit_error=True):
-            for label, actor in actors_to_check:
-                try:
-                    alive = ray.get(actor.is_alive.remote(), timeout=5)
-                except Exception:  # noqa: BLE001, S112
-                    continue
-                if not alive:
-                    log_tail = ""
-                    with contextlib.suppress(Exception):
-                        log_tail = ray.get(actor.read_log_tail.remote(), timeout=5)
-                    tail = "\n".join(log_tail.splitlines()[-50:]) if log_tail else "(no log output)"
-                    msg = (
-                        f"Dynamo {label} subprocess crashed during startup.\n\n"
-                        f"--- {label} log (last 50 lines) ---\n{tail}"
+        for label, actor in actors_to_check:
+            try:
+                alive = ray.get(actor.is_alive.remote(), timeout=10)
+            except Exception:  # noqa: BLE001
+                # Actor unreachable — try reading its log for crash info
+                log_tail = self._read_actor_log_tail(actor)
+                if log_tail:
+                    self._raise_subprocess_error(
+                        label, log_tail, reason="actor unreachable and has log output — likely crashed"
                     )
-                    raise RuntimeError(msg)
+                continue
+            if not alive:
+                log_tail = self._read_actor_log_tail(actor)
+                self._raise_subprocess_error(label, log_tail, reason="subprocess crashed during startup")
 
     def _get_actors_for_health_check(self) -> list[tuple[str, Any]]:
         """Return (label, actor) pairs for all subprocess actors to health-check."""
@@ -563,6 +573,22 @@ class DynamoBackend(InferenceBackend):
             actors.append(("frontend", self._frontend_actor))
         actors.extend(self._worker_actors)
         return actors
+
+    @staticmethod
+    def _read_actor_log_tail(actor: Any) -> str:  # noqa: ANN401
+        """Read log tail from a subprocess actor, returning empty string on failure."""
+        import ray
+
+        with contextlib.suppress(Exception):
+            return ray.get(actor.read_log_tail.remote(), timeout=5)
+        return ""
+
+    @staticmethod
+    def _raise_subprocess_error(label: str, log_tail: str, *, reason: str) -> None:
+        """Raise ``RuntimeError`` with formatted subprocess crash info."""
+        tail = "\n".join(log_tail.splitlines()[-50:]) if log_tail else "(no log output)"
+        msg = f"Dynamo {label} {reason}.\n\n--- {label} log (last 50 lines) ---\n{tail}"
+        raise RuntimeError(msg)
 
     @staticmethod
     def _resolve_num_replicas(model_config: InferenceModelConfig) -> int:
@@ -850,11 +876,16 @@ class DynamoBackend(InferenceBackend):
 
     @staticmethod
     def _build_env(etcd_endpoint: str, nats_url: str) -> dict[str, str]:
-        """Base environment dict for all Dynamo subprocesses."""
-        env = dict(os.environ)
-        env["ETCD_ENDPOINTS"] = etcd_endpoint
-        env["NATS_SERVER"] = nats_url
-        return env
+        """Extra environment vars for Dynamo subprocesses.
+
+        Returns only the Dynamo-specific vars.  The actor merges these on top
+        of its own ``os.environ`` (which carries Ray-assigned
+        ``CUDA_VISIBLE_DEVICES``) so GPU isolation is preserved.
+        """
+        return {
+            "ETCD_ENDPOINTS": etcd_endpoint,
+            "NATS_SERVER": nats_url,
+        }
 
     # ------------------------------------------------------------------
     # Stop

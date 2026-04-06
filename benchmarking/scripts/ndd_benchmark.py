@@ -17,7 +17,7 @@
 """NeMo Data Designer (NDD) benchmarking script.
 
 Key args:
-  --inference-server-type  ray-serve | nvidia-nim
+  --inference-server-type  ray-serve | dynamo | nvidia-nim
   --engine-kwargs          JSON vLLM kwargs, e.g. '{"tensor_parallel_size": 4}'
   --autoscaling-config     JSON Ray Serve autoscaling, e.g. '{"min_replicas": 1, "max_replicas": 1}'
 """
@@ -143,6 +143,7 @@ Respond with only the notes, no other text.
 
 def _start_inference_server(
     model_id: str,
+    backend: str = "ray_serve",
     engine_kwargs: dict[str, Any] | None = None,
     autoscaling_config: dict[str, Any] | None = None,
 ) -> "InferenceServer":
@@ -158,7 +159,7 @@ def _start_inference_server(
         engine_kwargs=engine_kwargs,
     )
 
-    server = InferenceServer(models=[server_config])
+    server = InferenceServer(models=[server_config], backend=backend)
     server.start()
     return server
 
@@ -200,10 +201,11 @@ def run_ndd_benchmark(  # noqa: PLR0915
     model_providers = None
     serve_startup_s = 0.0
 
-    if inference_server_type == "ray-serve":
-        logger.info(f"Starting local InferenceServer with engine_kwargs={engine_kwargs}")
+    if inference_server_type in ("ray-serve", "dynamo"):
+        backend = "ray_serve" if inference_server_type == "ray-serve" else "dynamo"
+        logger.info(f"Starting local InferenceServer (backend={backend}) with engine_kwargs={engine_kwargs}")
         serve_start = time.perf_counter()
-        inference_server = _start_inference_server(model_id, engine_kwargs, autoscaling_config)
+        inference_server = _start_inference_server(model_id, backend, engine_kwargs, autoscaling_config)
         serve_startup_s = time.perf_counter() - serve_start
         logger.info(f"InferenceServer ready at {inference_server.endpoint} (startup: {serve_startup_s:.1f}s)")
 
@@ -305,7 +307,7 @@ def main() -> int:
     parser.add_argument(
         "--inference-server-type",
         required=True,
-        choices=["ray-serve", "nvidia-nim"],
+        choices=["ray-serve", "dynamo", "nvidia-nim"],
         help="Model serving backend",
     )
     parser.add_argument("--model-id", default="openai/gpt-oss-20b", help="Model identifier")
