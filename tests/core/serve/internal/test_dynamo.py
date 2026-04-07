@@ -309,3 +309,113 @@ class TestDynamoLiveness:
         finally:
             with contextlib.suppress(Exception):
                 ray.kill(actor, no_restart=True)
+
+
+# ---------------------------------------------------------------------------
+# Multi-model support
+# ---------------------------------------------------------------------------
+
+
+class TestMultiModel:
+    """Tests for multi-model deployment with GPU isolation."""
+
+    def test_multi_model_plans_use_separate_gpus(self):
+        """Two models each TP=1 replicas=1 on a 2-GPU node get different GPUs."""
+        inventory = [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 2, "is_head": False}]
+
+        # Model A takes 1 GPU
+        plans_a = plan_replica_placement(num_replicas=1, tp_size=1, _inventory=inventory)
+        assert len(plans_a) == 1
+        assert plans_a[0].ranks[0].num_gpus == 1
+
+        # Shrink inventory (same logic as _deploy_and_healthcheck)
+        used: dict[str, int] = {}
+        for plan in plans_a:
+            for rank in plan.ranks:
+                used[rank.node_id] = used.get(rank.node_id, 0) + rank.num_gpus
+        remaining = [
+            {**n, "num_gpus": n["num_gpus"] - used.get(n["node_id"], 0)}
+            for n in inventory
+            if n["num_gpus"] - used.get(n["node_id"], 0) > 0
+        ]
+
+        # Model B gets remaining GPU
+        plans_b = plan_replica_placement(num_replicas=1, tp_size=1, _inventory=remaining)
+        assert len(plans_b) == 1
+        assert plans_b[0].ranks[0].num_gpus == 1
+
+        # After both, no GPUs left
+        used_b: dict[str, int] = {}
+        for plan in plans_b:
+            for rank in plan.ranks:
+                used_b[rank.node_id] = used_b.get(rank.node_id, 0) + rank.num_gpus
+        final = [
+            {**n, "num_gpus": n["num_gpus"] - used_b.get(n["node_id"], 0)}
+            for n in remaining
+            if n["num_gpus"] - used_b.get(n["node_id"], 0) > 0
+        ]
+        assert len(final) == 0, "Both GPUs should be consumed"
+
+    def test_multi_model_insufficient_gpus_raises(self):
+        """Two models on a 1-GPU node fails on the second model."""
+        inventory = [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 1, "is_head": False}]
+
+        # First model succeeds
+        plans_a = plan_replica_placement(num_replicas=1, tp_size=1, _inventory=inventory)
+        used: dict[str, int] = {}
+        for plan in plans_a:
+            for rank in plan.ranks:
+                used[rank.node_id] = used.get(rank.node_id, 0) + rank.num_gpus
+        remaining = [
+            {**n, "num_gpus": n["num_gpus"] - used.get(n["node_id"], 0)}
+            for n in inventory
+            if n["num_gpus"] - used.get(n["node_id"], 0) > 0
+        ]
+
+        # Second model fails — no GPUs left
+        with pytest.raises(RuntimeError, match="No GPU nodes"):
+            plan_replica_placement(num_replicas=1, tp_size=1, _inventory=remaining)
+
+    def test_multi_model_across_nodes(self):
+        """Two TP=4 models across two 4-GPU nodes get one node each."""
+        inventory = [
+            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False},
+            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 4, "is_head": False},
+        ]
+
+        plans_a = plan_replica_placement(num_replicas=1, tp_size=4, _inventory=inventory)
+        assert plans_a[0].ranks[0].node_id == "n1"
+
+        used: dict[str, int] = {}
+        for plan in plans_a:
+            for rank in plan.ranks:
+                used[rank.node_id] = used.get(rank.node_id, 0) + rank.num_gpus
+        remaining = [
+            {**n, "num_gpus": n["num_gpus"] - used.get(n["node_id"], 0)}
+            for n in inventory
+            if n["num_gpus"] - used.get(n["node_id"], 0) > 0
+        ]
+
+        plans_b = plan_replica_placement(num_replicas=1, tp_size=4, _inventory=remaining)
+        assert plans_b[0].ranks[0].node_id == "n2"
+
+    def test_frontend_command_omits_model_name(self):
+        """Frontend should auto-discover models, not filter by --model-name."""
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(model_identifier="model-a"),
+                InferenceModelConfig(model_identifier="model-b"),
+            ],
+            backend="dynamo",
+        )
+        backend = DynamoBackend(server)
+
+        # Capture the command that _launch_frontend would build by inspecting
+        # the method's CLI assembly (we can't call it without Ray, but we can
+        # verify the parameter signature no longer accepts model_name).
+        import inspect
+
+        sig = inspect.signature(backend._launch_frontend)
+        assert "model_name" not in sig.parameters, (
+            "_launch_frontend should not accept model_name — frontend auto-discovers models"
+        )

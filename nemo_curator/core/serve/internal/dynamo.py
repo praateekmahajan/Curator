@@ -36,6 +36,7 @@ from nemo_curator.core.serve.internal.subprocess_mgr import (
     _define_subprocess_actor,
     _engine_kwargs_to_cli_flags,
     _get_driver_env_vars,
+    _get_gpu_inventory,
     _ignore_head_node,
     _kill_actor,
     _resolve_node_ip,
@@ -102,14 +103,6 @@ class DynamoBackend(InferenceBackend):
         if not server.nats_url:
             _check_binary("nats-server")
 
-        model_config = server.models[0]
-        if len(server.models) > 1:
-            logger.warning("Dynamo backend currently supports a single model; using the first one.")
-
-        tp_size = model_config.engine_kwargs.get("tensor_parallel_size", 1)
-        dynamo_cfg = model_config.dynamo_config
-        num_replicas = self._resolve_num_replicas(model_config)
-
         short_id = uuid.uuid4().hex[:8]
         self._actor_name_prefix = f"dynamo_{server.name}_{short_id}"
         self._runtime_dir = tempfile.mkdtemp(prefix=f"nemo_curator_dynamo_{short_id}_")
@@ -148,12 +141,8 @@ class DynamoBackend(InferenceBackend):
                 self._deploy_and_healthcheck(
                     server,
                     actor_cls,
-                    model_config,
-                    dynamo_cfg,
                     head_node_id=head_node_id,
                     cluster_nodes=cluster_nodes,
-                    num_replicas=num_replicas,
-                    tp_size=tp_size,
                 )
             except Exception:
                 # Still connected to Ray here — kill directly without opening another context.
@@ -162,19 +151,15 @@ class DynamoBackend(InferenceBackend):
                 self._cleanup_runtime_dir()
                 raise
 
-    def _deploy_and_healthcheck(  # noqa: PLR0913
+    def _deploy_and_healthcheck(
         self,
         server: InferenceServer,
         actor_cls: type,
-        model_config: InferenceModelConfig,
-        dynamo_cfg: dict[str, Any],
         *,
         head_node_id: str,
         cluster_nodes: list[dict[str, Any]],
-        num_replicas: int,
-        tp_size: int,
     ) -> None:
-        """Launch infra, workers, frontend and wait for health."""
+        """Launch infra, workers for all models, frontend and wait for health."""
         infra_node_id = self._infra_node_id
 
         # Infrastructure -- on infra node (head or first non-head when excluded)
@@ -185,39 +170,68 @@ class DynamoBackend(InferenceBackend):
 
         etcd_endpoint = server.etcd_endpoint or f"http://{self._infra_ip}:{self._etcd_port}"
         nats_url = server.nats_url or f"nats://{self._infra_ip}:{self._nats_port}"
-
-        namespace = dynamo_cfg.get("namespace", "curator")
-        request_plane = dynamo_cfg.get("request_plane", "nats")
-        event_plane = dynamo_cfg.get("event_plane", "nats")
         base_env = {"ETCD_ENDPOINTS": etcd_endpoint, "NATS_SERVER": nats_url}
-        is_disagg = dynamo_cfg.get("mode") == "disagg"
 
-        if is_disagg:
-            self._launch_disagg_workers(
-                actor_cls,
-                model_config,
-                base_env,
-                head_node_id=head_node_id,
-                cluster_nodes=cluster_nodes,
-                namespace=namespace,
-                request_plane=request_plane,
-                event_plane=event_plane,
-            )
-        else:
-            replica_plans = plan_replica_placement(num_replicas, tp_size, head_node_id, _nodes=cluster_nodes)
-            self._launch_replicas(
-                actor_cls,
-                replica_plans,
-                model_config,
-                base_env,
-                namespace=namespace,
-                request_plane=request_plane,
-                event_plane=event_plane,
-            )
+        # Build GPU inventory once; each model's placement shrinks it so
+        # subsequent models are assigned to different GPUs.
+        inventory = _get_gpu_inventory(head_node_id, nodes=cluster_nodes)
+        expected_models: set[str] = set()
+        has_disagg = False
 
-        # Frontend -- co-located with infra
-        model_name = model_config.model_name or model_config.model_identifier
-        router_mode = dynamo_cfg.get("router_mode", "kv") if is_disagg else None
+        for model_config in server.models:
+            dynamo_cfg = model_config.dynamo_config
+            tp_size = model_config.engine_kwargs.get("tensor_parallel_size", 1)
+            num_replicas = self._resolve_num_replicas(model_config)
+            namespace = dynamo_cfg.get("namespace", "curator")
+            request_plane = dynamo_cfg.get("request_plane", "nats")
+            event_plane = dynamo_cfg.get("event_plane", "nats")
+            is_disagg = dynamo_cfg.get("mode") == "disagg"
+            if is_disagg:
+                has_disagg = True
+
+            model_name = model_config.model_name or model_config.model_identifier
+            expected_models.add(model_name)
+            logger.info(f"Deploying model '{model_name}' (TP={tp_size}, replicas={num_replicas})")
+
+            if is_disagg:
+                self._launch_disagg_workers(
+                    actor_cls,
+                    model_config,
+                    base_env,
+                    head_node_id=head_node_id,
+                    cluster_nodes=cluster_nodes,
+                    namespace=namespace,
+                    request_plane=request_plane,
+                    event_plane=event_plane,
+                )
+            else:
+                plans = plan_replica_placement(num_replicas, tp_size, _inventory=inventory)
+                self._launch_replicas(
+                    actor_cls,
+                    plans,
+                    model_config,
+                    base_env,
+                    namespace=namespace,
+                    request_plane=request_plane,
+                    event_plane=event_plane,
+                )
+                # Shrink inventory so the next model gets different GPUs.
+                used: dict[str, int] = {}
+                for plan in plans:
+                    for rank in plan.ranks:
+                        used[rank.node_id] = used.get(rank.node_id, 0) + rank.num_gpus
+                inventory = [
+                    {**n, "num_gpus": n["num_gpus"] - used.get(n["node_id"], 0)}
+                    for n in inventory
+                    if n["num_gpus"] - used.get(n["node_id"], 0) > 0
+                ]
+
+        # Frontend -- co-located with infra, auto-discovers all registered models
+        first_cfg = server.models[0].dynamo_config
+        namespace = first_cfg.get("namespace", "curator")
+        request_plane = first_cfg.get("request_plane", "nats")
+        event_plane = first_cfg.get("event_plane", "nats")
+        router_mode = first_cfg.get("router_mode", "kv") if has_disagg else None
         frontend_driver_env = _get_driver_env_vars(base_env)
         self._frontend_actor = self._launch_frontend(
             actor_cls,
@@ -225,7 +239,6 @@ class DynamoBackend(InferenceBackend):
             server.port,
             frontend_driver_env,
             namespace=namespace,
-            model_name=model_name,
             request_plane=request_plane,
             event_plane=event_plane,
             router_mode=router_mode,
@@ -233,11 +246,10 @@ class DynamoBackend(InferenceBackend):
 
         # Health check — must stay inside ray.init context so actor handles
         # (is_alive, read_log_tail) remain valid for subprocess liveness checks.
-        expected_model = model_config.model_name or model_config.model_identifier
-        self._wait_for_model(server, expected_model)
+        self._wait_for_models(server, expected_models)
 
-    def _wait_for_model(self, server: InferenceServer, model_name: str) -> None:
-        """Poll ``/v1/models`` until *model_name* appears in the response.
+    def _wait_for_models(self, server: InferenceServer, expected_models: set[str]) -> None:
+        """Poll ``/v1/models`` until all *expected_models* appear in the response.
 
         Also checks subprocess liveness via Ray actors periodically.  If any
         crash, reads their log tail and raises immediately with the output.
@@ -257,12 +269,15 @@ class DynamoBackend(InferenceBackend):
                 resp = urllib.request.urlopen(models_url, timeout=5)  # noqa: S310
                 if resp.status == http.HTTPStatus.OK:
                     body = json.loads(resp.read())
-                    ids = [m["id"] for m in body.get("data", [])]
-                    if model_name in ids:
-                        logger.info(f"Dynamo model '{model_name}' registered after {attempt} health check(s)")
+                    ids = {m["id"] for m in body.get("data", [])}
+                    if expected_models.issubset(ids):
+                        logger.info(
+                            f"All Dynamo models registered after {attempt} health check(s): {sorted(expected_models)}"
+                        )
                         return
                     if server.verbose:
-                        logger.debug(f"Models so far: {ids}, waiting for '{model_name}'...")
+                        missing = sorted(expected_models - ids)
+                        logger.debug(f"Models so far: {sorted(ids)}, waiting for: {missing}")
             except Exception:  # noqa: BLE001
                 if server.verbose:
                     logger.debug(f"Health check attempt {attempt} failed, retrying...")
@@ -270,7 +285,10 @@ class DynamoBackend(InferenceBackend):
 
         # Final liveness check before giving up -- surface crash info if available
         self._check_subprocess_health()
-        msg = f"Model '{model_name}' did not appear at {models_url} within {server.health_check_timeout_s}s"
+        msg = (
+            f"Models {sorted(expected_models)} did not all appear at {models_url} "
+            f"within {server.health_check_timeout_s}s"
+        )
         raise TimeoutError(msg)
 
     def _check_subprocess_health(self) -> None:
@@ -772,7 +790,6 @@ class DynamoBackend(InferenceBackend):
         driver_env: dict[str, str],
         *,
         namespace: str,
-        model_name: str,
         request_plane: str,
         event_plane: str,
         router_mode: str | None = None,
@@ -788,8 +805,6 @@ class DynamoBackend(InferenceBackend):
             str(port),
             "--namespace",
             namespace,
-            "--model-name",
-            model_name,
             "--discovery-backend",
             "etcd",
             "--request-plane",
