@@ -137,6 +137,11 @@ def _resolve_node_ip(node_id: str, nodes: list[dict[str, Any]] | None = None) ->
     raise RuntimeError(msg)
 
 
+def _ignore_head_node() -> bool:
+    """Return True if ``CURATOR_IGNORE_RAY_HEAD_NODE`` is set."""
+    return os.environ.get("CURATOR_IGNORE_RAY_HEAD_NODE", "").strip().lower() in ("1", "true", "yes")
+
+
 def plan_replica_placement(
     num_replicas: int,
     tp_size: int,
@@ -150,6 +155,10 @@ def plan_replica_placement(
     - If ``tp_size`` fits on a single node, the replica gets one rank (rank 0).
     - If ``tp_size`` exceeds any single node, the replica spans multiple nodes.
       Rank 0 runs the full Dynamo worker; rank 1+ run headless vLLM workers.
+
+    When ``CURATOR_IGNORE_RAY_HEAD_NODE`` is set, the head node is excluded
+    from worker placement entirely.  Otherwise the head node is preferred
+    for rank 0 and the remaining nodes are sorted stably by ``node_id``.
 
     Args:
         num_replicas: Number of independent model replicas.
@@ -165,6 +174,16 @@ def plan_replica_placement(
     if not inventory:
         msg = "No GPU nodes found in the Ray cluster."
         raise RuntimeError(msg)
+
+    ignore_head = _ignore_head_node()
+    if ignore_head:
+        inventory = [n for n in inventory if not n["is_head"]]
+        if not inventory:
+            msg = "CURATOR_IGNORE_RAY_HEAD_NODE is set but no non-head GPU nodes are available."
+            raise RuntimeError(msg)
+    else:
+        # Head node first for deterministic rank-0, then stable by node_id
+        inventory.sort(key=lambda n: (not n["is_head"], n["node_id"]))
 
     total_gpus = sum(n["num_gpus"] for n in inventory)
     needed = num_replicas * tp_size
@@ -226,6 +245,16 @@ _SIGTERM_WAIT_S = 10
 _SIGKILL_WAIT_S = 5
 
 
+@dataclass
+class ManagedSubprocess:
+    """Track a detached Ray actor and the subprocess it owns."""
+
+    label: str
+    actor: Any
+    run_ref: Any | None = None
+    log_file: str | None = None
+
+
 def _stop_subprocess(proc: Any, sigterm_wait: float = _SIGTERM_WAIT_S) -> int | None:  # noqa: ANN401
     """SIGTERM -> wait -> SIGKILL a subprocess.  Used inside Ray actors."""
     if proc.poll() is not None:
@@ -239,43 +268,135 @@ def _stop_subprocess(proc: Any, sigterm_wait: float = _SIGTERM_WAIT_S) -> int | 
     return proc.returncode
 
 
+WORKER_SPECIFIC_ENV_VARS: set[str] = {
+    "CUDA_VISIBLE_DEVICES",
+    "HIP_VISIBLE_DEVICES",
+    "ROCR_VISIBLE_DEVICES",
+    "LOCAL_RANK",
+    "VLLM_NIXL_SIDE_CHANNEL_PORT",
+}
+
+_NOSET_CUDA_RUNTIME_ENV: dict[str, Any] = {"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}}
+
+
+def _merge_subprocess_env(
+    actor_env: dict[str, str],
+    driver_env: dict[str, str],
+    worker_env: dict[str, str],
+) -> dict[str, str]:
+    """Merge driver and worker env vars using the vLLM-style two-tier policy.
+
+    *driver_env* is applied with ``setdefault`` (node-local values win).
+    *worker_env* is applied with direct overwrite (explicit GPU assignment, etc.).
+    """
+    merged = dict(actor_env)
+    for k, v in driver_env.items():
+        merged.setdefault(k, v)
+    merged.update(worker_env)
+    return merged
+
+
+def _get_driver_env_vars(extra_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Return driver-tier environment: ``os.environ`` minus worker-specific vars.
+
+    These are applied with ``setdefault`` on the actor so node-local values win.
+    Optional *extra_env* is merged on top (e.g. ``ALLOW_NONE_AUTHENTICATION``).
+    """
+    driver = {k: v for k, v in os.environ.items() if k not in WORKER_SPECIFIC_ENV_VARS}
+    if extra_env:
+        driver.update(extra_env)
+    return driver
+
+
 def _define_subprocess_actor() -> type:  # noqa: C901
     """Return the ``_SubprocessActor`` Ray remote class.
 
     A single actor class used for all Dynamo subprocesses (etcd, NATS,
     frontend, vLLM workers).  GPU resources are configured per-instance
     via ``.options(num_gpus=...)``.
+
+    Two-phase initialization:
+
+    1. **Create** the actor (lightweight ``__init__``).
+    2. **Discover GPUs** via ``get_assigned_gpus()`` — returns Ray-assigned
+       accelerator IDs.
+    3. **Launch subprocess** via ``initialize(command, driver_env, worker_env,
+       log_file)`` — applies driver env with ``setdefault`` (node-local wins),
+       worker env with overwrite (explicit GPU assignment), then starts the
+       process.
+
+    The ``run()`` method blocks until the subprocess exits and is intended
+    to be called as ``actor.run.remote()`` — the returned ``ObjectRef``
+    resolves on exit, enabling ``ray.wait()``-based liveness detection.
     """
     import ray
 
-    @ray.remote(num_cpus=1, num_gpus=0)
+    @ray.remote(num_cpus=1, num_gpus=0, max_concurrency=2)
     class _SubprocessActor:
-        """Manages a subprocess on a Ray node with optional file-based logging."""
+        """Manages a subprocess on a Ray node with optional file-based logging.
 
-        def __init__(self, command: list[str], env: dict[str, str], log_file: str | None = None) -> None:
+        ``max_concurrency=2`` allows ``run()`` to block waiting for the
+        subprocess while other methods (``is_alive``, ``read_log_tail``,
+        ``stop``) remain responsive.
+        """
+
+        def __init__(self) -> None:
+            self._proc = None
+            self._log_fh = None
+            self._log_file = None
+
+        def get_assigned_gpus(self) -> list[str]:
+            """Return Ray-assigned accelerator IDs for this actor."""
+            import ray as _ray
+
+            return _ray.get_runtime_context().get_accelerator_ids().get("GPU", [])
+
+        def initialize(
+            self,
+            command: list[str],
+            driver_env: dict[str, str],
+            worker_env: dict[str, str],
+            log_file: str | None = None,
+        ) -> dict:
+            """Apply env tiers and launch the subprocess.
+
+            *driver_env* is applied with ``setdefault`` (node-local wins).
+            *worker_env* is applied with direct overwrite (explicit GPU
+            assignment, per-worker ports, etc.).
+
+            Returns:
+                ``{"pid": int, "log_file": str | None}``
+            """
             import subprocess as _sp
 
-            # Start from the actor's own os.environ (which has Ray-assigned
-            # CUDA_VISIBLE_DEVICES), then overlay the caller-provided env vars.
-            # The caller's env originates from the *driver* process and must not
-            # replace the actor's CUDA_VISIBLE_DEVICES.
-            merged_env = dict(os.environ)
-            merged_env.update(env)
-            env = merged_env
+            merged_env = _merge_subprocess_env(dict(os.environ), driver_env, worker_env)
 
+            self._log_file = log_file
             if log_file:
                 os.makedirs(os.path.dirname(log_file), exist_ok=True)
                 self._log_fh = open(log_file, "w")  # noqa: SIM115
-                self._proc = _sp.Popen(command, env=env, stdout=self._log_fh, stderr=_sp.STDOUT)  # noqa: S603
+                self._proc = _sp.Popen(command, env=merged_env, stdout=self._log_fh, stderr=_sp.STDOUT)  # noqa: S603
             else:
-                self._proc = _sp.Popen(command, env=env, stdout=_sp.DEVNULL, stderr=_sp.STDOUT)  # noqa: S603
-            self._log_file = log_file
+                self._proc = _sp.Popen(command, env=merged_env, stdout=_sp.DEVNULL, stderr=_sp.STDOUT)  # noqa: S603
+
+            return {"pid": self._proc.pid, "log_file": log_file}
+
+        def run(self) -> int:
+            """Block until the subprocess exits.  Returns the exit code.
+
+            Intended to be called as ``actor.run.remote()`` — the returned
+            ``ObjectRef`` resolves when the process terminates, enabling
+            ``ray.wait()``-based liveness detection.
+            """
+            if self._proc is None:
+                return -1
+            return self._proc.wait()
 
         def pid(self) -> int:
-            return self._proc.pid
+            return self._proc.pid if self._proc else -1
 
         def is_alive(self) -> bool:
-            return self._proc.poll() is None
+            return self._proc is not None and self._proc.poll() is None
 
         def log_file(self) -> str | None:
             return self._log_file
@@ -289,7 +410,7 @@ def _define_subprocess_actor() -> type:  # noqa: C901
             if not self._log_file:
                 return ""
             try:
-                if hasattr(self, "_log_fh") and not self._log_fh.closed:
+                if self._log_fh and not self._log_fh.closed:
                     self._log_fh.flush()
                 with open(self._log_file, "rb") as f:
                     f.seek(0, 2)
@@ -300,8 +421,10 @@ def _define_subprocess_actor() -> type:  # noqa: C901
                 return ""
 
         def stop(self, sigterm_wait: float = _SIGTERM_WAIT_S) -> int | None:
+            if self._proc is None:
+                return None
             rc = _stop_subprocess(self._proc, sigterm_wait)
-            if hasattr(self, "_log_fh"):
+            if self._log_fh:
                 self._log_fh.close()
             return rc
 
@@ -397,10 +520,12 @@ class DynamoBackend(InferenceBackend):
         self._server = server
         self._runtime_dir: str | None = None
         self._head_ip: str | None = None
-        self._etcd_actor: Any = None
-        self._nats_actor: Any = None
-        self._worker_actors: list[tuple[str, Any]] = []
-        self._frontend_actor: Any = None
+        self._infra_node_id: str | None = None
+        self._infra_ip: str | None = None
+        self._etcd_actor: ManagedSubprocess | None = None
+        self._nats_actor: ManagedSubprocess | None = None
+        self._worker_actors: list[ManagedSubprocess] = []
+        self._frontend_actor: ManagedSubprocess | None = None
         self._etcd_port: int | None = None
         self._nats_port: int | None = None
         self._actor_name_prefix: str = ""
@@ -441,7 +566,9 @@ class DynamoBackend(InferenceBackend):
             head_node_id = ray.get_runtime_context().get_node_id()
             cluster_nodes = ray.nodes()
             self._head_ip = _resolve_node_ip(head_node_id, nodes=cluster_nodes)
-            server._host = self._head_ip
+
+            self._infra_node_id, self._infra_ip = self._resolve_infra_node(cluster_nodes, head_node_id)
+            server._host = self._infra_ip
 
             # Kill any orphaned actors from a previous run with the same server name
             # (e.g. after a Jupyter kernel restart that bypassed atexit cleanup).
@@ -490,19 +617,21 @@ class DynamoBackend(InferenceBackend):
         tp_size: int,
     ) -> None:
         """Launch infra, workers, frontend and wait for health."""
-        # Infrastructure -- always on head node
-        if not server.etcd_endpoint:
-            self._etcd_actor = self._start_etcd(actor_cls, head_node_id, self._etcd_port)
-        if not server.nats_url:
-            self._nats_actor = self._start_nats(actor_cls, head_node_id, self._nats_port)
+        infra_node_id = self._infra_node_id
 
-        etcd_endpoint = server.etcd_endpoint or f"http://{self._head_ip}:{self._etcd_port}"
-        nats_url = server.nats_url or f"nats://{self._head_ip}:{self._nats_port}"
+        # Infrastructure -- on infra node (head or first non-head when excluded)
+        if not server.etcd_endpoint:
+            self._etcd_actor = self._start_etcd(actor_cls, infra_node_id, self._etcd_port)
+        if not server.nats_url:
+            self._nats_actor = self._start_nats(actor_cls, infra_node_id, self._nats_port)
+
+        etcd_endpoint = server.etcd_endpoint or f"http://{self._infra_ip}:{self._etcd_port}"
+        nats_url = server.nats_url or f"nats://{self._infra_ip}:{self._nats_port}"
 
         namespace = dynamo_cfg.get("namespace", "curator")
         request_plane = dynamo_cfg.get("request_plane", "nats")
         event_plane = dynamo_cfg.get("event_plane", "nats")
-        base_env = self._build_env(etcd_endpoint, nats_url)
+        base_env = {"ETCD_ENDPOINTS": etcd_endpoint, "NATS_SERVER": nats_url}
         is_disagg = dynamo_cfg.get("mode") == "disagg"
 
         if is_disagg:
@@ -528,15 +657,15 @@ class DynamoBackend(InferenceBackend):
                 event_plane=event_plane,
             )
 
-        # Frontend -- always on head node
+        # Frontend -- co-located with infra
         model_name = model_config.model_name or model_config.model_identifier
         router_mode = dynamo_cfg.get("router_mode", "kv") if is_disagg else None
+        frontend_driver_env = _get_driver_env_vars(base_env)
         self._frontend_actor = self._launch_frontend(
             actor_cls,
-            head_node_id,
+            infra_node_id,
             server.port,
-            etcd_endpoint,
-            nats_url,
+            frontend_driver_env,
             namespace=namespace,
             model_name=model_name,
             request_plane=request_plane,
@@ -587,45 +716,69 @@ class DynamoBackend(InferenceBackend):
         raise TimeoutError(msg)
 
     def _check_subprocess_health(self) -> None:
-        """Check subprocess liveness via Ray actors.
+        """Check subprocess liveness via run refs and ``is_alive()`` fallback.
 
-        Calls ``is_alive()`` on each managed actor.  If a subprocess has
-        exited, reads its log tail via ``read_log_tail()`` and raises with
-        the output.  Works for both local and remote (multi-node) actors.
+        First checks ``ray.wait()`` on all run refs (fast, no per-actor RPC).
+        If any ref has resolved, the subprocess exited — reads the log tail
+        and raises.  Then falls back to ``is_alive()`` for actors without
+        run refs.
 
         Note: does NOT use ``with ray.init()`` — the driver must already be
-        connected.  Using a context manager here would disconnect Ray on
-        exit, invalidating actor handles and causing silent failures on the
-        next health check.
+        connected.
+        """
+        self._check_liveness_via_refs()
+        self._check_liveness_via_polling()
+
+    def _get_all_managed_processes(self) -> list[ManagedSubprocess]:
+        """Collect all managed processes for health checking."""
+        procs: list[ManagedSubprocess] = []
+        if self._frontend_actor is not None:
+            procs.append(self._frontend_actor)
+        procs.extend(self._worker_actors)
+        if self._etcd_actor is not None:
+            procs.append(self._etcd_actor)
+        if self._nats_actor is not None:
+            procs.append(self._nats_actor)
+        return procs
+
+    def _check_liveness_via_refs(self) -> None:
+        """Detect subprocess exits via ``ray.wait()`` on run refs.
+
+        Run refs resolve when the subprocess exits (or the actor dies).
+        ``ray.wait()`` with ``timeout=0`` is non-blocking and requires no
+        per-actor RPC, making it much faster than ``is_alive()`` polling.
         """
         import ray
 
-        actors_to_check = self._get_actors_for_health_check()
-        if not actors_to_check:
+        procs = self._get_all_managed_processes()
+        ref_to_proc = {p.run_ref: p for p in procs if p.run_ref is not None}
+        if not ref_to_proc:
             return
 
-        for label, actor in actors_to_check:
+        ready, _ = ray.wait(list(ref_to_proc.keys()), num_returns=len(ref_to_proc), timeout=0)
+        for ref in ready:
+            proc = ref_to_proc[ref]
+            log_tail = self._read_actor_log_tail(proc.actor)
+            self._raise_subprocess_error(proc.label, log_tail, reason="subprocess exited unexpectedly")
+
+    def _check_liveness_via_polling(self) -> None:
+        """Fallback liveness check via ``is_alive()`` RPC for processes without run refs."""
+        import ray
+
+        procs = [p for p in self._get_all_managed_processes() if p.run_ref is None]
+        for proc in procs:
             try:
-                alive = ray.get(actor.is_alive.remote(), timeout=10)
+                alive = ray.get(proc.actor.is_alive.remote(), timeout=10)
             except Exception:  # noqa: BLE001
-                # Actor unreachable — try reading its log for crash info
-                log_tail = self._read_actor_log_tail(actor)
+                log_tail = self._read_actor_log_tail(proc.actor)
                 if log_tail:
                     self._raise_subprocess_error(
-                        label, log_tail, reason="actor unreachable and has log output — likely crashed"
+                        proc.label, log_tail, reason="actor unreachable and has log output — likely crashed"
                     )
                 continue
             if not alive:
-                log_tail = self._read_actor_log_tail(actor)
-                self._raise_subprocess_error(label, log_tail, reason="subprocess crashed during startup")
-
-    def _get_actors_for_health_check(self) -> list[tuple[str, Any]]:
-        """Return (label, actor) pairs for all subprocess actors to health-check."""
-        actors: list[tuple[str, Any]] = []
-        if self._frontend_actor is not None:
-            actors.append(("frontend", self._frontend_actor))
-        actors.extend(self._worker_actors)
-        return actors
+                log_tail = self._read_actor_log_tail(proc.actor)
+                self._raise_subprocess_error(proc.label, log_tail, reason="subprocess crashed during startup")
 
     @staticmethod
     def _read_actor_log_tail(actor: Any) -> str:  # noqa: ANN401
@@ -643,6 +796,27 @@ class DynamoBackend(InferenceBackend):
         msg = f"Dynamo {label} {reason}.\n\n--- {label} log (last 50 lines) ---\n{tail}"
         raise RuntimeError(msg)
 
+    def _resolve_infra_node(self, cluster_nodes: list[dict[str, Any]], head_node_id: str) -> tuple[str, str]:
+        """Pick the node that should host etcd, NATS, and the frontend.
+
+        Returns ``(node_id, node_ip)``.  When ``CURATOR_IGNORE_RAY_HEAD_NODE``
+        is set, selects the first non-head node (sorted by CPU count, then
+        node ID for stability).  Otherwise returns the head node.
+        """
+        if not _ignore_head_node():
+            return head_node_id, self._head_ip
+
+        non_head = [n for n in cluster_nodes if n["NodeID"] != head_node_id and n.get("Alive", False)]
+        if not non_head:
+            msg = "CURATOR_IGNORE_RAY_HEAD_NODE is set but no non-head nodes are available."
+            raise RuntimeError(msg)
+        non_head.sort(key=lambda n: (-n.get("Resources", {}).get("CPU", 0), n["NodeID"]))
+        infra = non_head[0]
+        logger.info(
+            f"Head-node exclusion active: infra will run on {infra['NodeManagerAddress']} (node {infra['NodeID'][:8]})"
+        )
+        return infra["NodeID"], infra["NodeManagerAddress"]
+
     @staticmethod
     def _resolve_num_replicas(model_config: InferenceModelConfig) -> int:
         num = model_config.deployment_config.get("num_replicas", 0)
@@ -656,9 +830,7 @@ class DynamoBackend(InferenceBackend):
     # Infrastructure actors
     # ------------------------------------------------------------------
 
-    def _start_etcd(self, actor_cls: type, head_node_id: str, port: int) -> Any:  # noqa: ANN401
-        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
+    def _start_etcd(self, actor_cls: type, infra_node_id: str, port: int) -> ManagedSubprocess:
         from nemo_curator.core.utils import get_free_port
 
         data_dir = os.path.join(self._runtime_dir, "etcd_data")
@@ -670,7 +842,7 @@ class DynamoBackend(InferenceBackend):
             "--listen-client-urls",
             f"http://0.0.0.0:{port}",
             "--advertise-client-urls",
-            f"http://{self._head_ip}:{port}",
+            f"http://{self._infra_ip}:{port}",
             "--listen-peer-urls",
             f"http://127.0.0.1:{peer_port}",
             "--initial-advertise-peer-urls",
@@ -680,41 +852,32 @@ class DynamoBackend(InferenceBackend):
             "--data-dir",
             data_dir,
         ]
-        env = {**os.environ, "ALLOW_NONE_AUTHENTICATION": "yes"}
+        node_alloc = NodeAllocation(node_id=infra_node_id, node_ip=self._infra_ip, num_gpus=0, node_rank=0)
+        proc = self._spawn_actor(
+            actor_cls,
+            "etcd",
+            command,
+            node_alloc,
+            driver_env=_get_driver_env_vars({"ALLOW_NONE_AUTHENTICATION": "yes"}),
+        )
 
-        log_file = os.path.join(self._runtime_dir, "etcd.log") if self._runtime_dir else None
-        actor_name = f"{self._actor_name_prefix}_etcd"
-        actor = actor_cls.options(
-            name=actor_name,
-            lifetime="detached",
-            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=head_node_id, soft=False),
-        ).remote(command=command, env=env, log_file=log_file)
-
-        logger.info(f"Starting etcd on port {port} (actor: {actor_name})")
-        _wait_for_port("localhost", port, timeout_s=30, label="etcd")
+        logger.info(f"Starting etcd on port {port} via {self._infra_ip}")
+        _wait_for_port(self._infra_ip, port, timeout_s=30, label="etcd")
         logger.info("etcd is ready")
-        return actor
+        return proc
 
-    def _start_nats(self, actor_cls: type, head_node_id: str, port: int) -> Any:  # noqa: ANN401
-        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
+    def _start_nats(self, actor_cls: type, infra_node_id: str, port: int) -> ManagedSubprocess:
         store_dir = os.path.join(self._runtime_dir, "nats_data")
         os.makedirs(store_dir, exist_ok=True)
 
         command = ["nats-server", "-p", str(port), "-js", "--store_dir", store_dir]
+        node_alloc = NodeAllocation(node_id=infra_node_id, node_ip=self._infra_ip, num_gpus=0, node_rank=0)
+        proc = self._spawn_actor(actor_cls, "nats", command, node_alloc)
 
-        log_file = os.path.join(self._runtime_dir, "nats.log") if self._runtime_dir else None
-        actor_name = f"{self._actor_name_prefix}_nats"
-        actor = actor_cls.options(
-            name=actor_name,
-            lifetime="detached",
-            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=head_node_id, soft=False),
-        ).remote(command=command, env=dict(os.environ), log_file=log_file)
-
-        logger.info(f"Starting NATS on port {port} (actor: {actor_name})")
-        _wait_for_port("localhost", port, timeout_s=30, label="nats")
+        logger.info(f"Starting NATS on port {port} via {self._infra_ip}")
+        _wait_for_port(self._infra_ip, port, timeout_s=30, label="nats")
         logger.info("NATS is ready")
-        return actor
+        return proc
 
     # ------------------------------------------------------------------
     # Worker / frontend actors
@@ -743,7 +906,7 @@ class DynamoBackend(InferenceBackend):
 
             for rank in plan.ranks:
                 if rank.node_rank == 0:
-                    actor = self._launch_worker(
+                    proc = self._launch_worker(
                         actor_cls,
                         replica_index=plan.replica_index,
                         model_config=model_config,
@@ -755,7 +918,7 @@ class DynamoBackend(InferenceBackend):
                         multi_node_plan=plan if plan.is_multi_node else None,
                     )
                 else:
-                    actor = self._launch_headless_worker(
+                    proc = self._launch_headless_worker(
                         actor_cls,
                         replica_index=plan.replica_index,
                         model_config=model_config,
@@ -763,8 +926,7 @@ class DynamoBackend(InferenceBackend):
                         node_alloc=rank,
                         plan=plan,
                     )
-                label = f"replica_{plan.replica_index}_rank_{rank.node_rank}"
-                self._worker_actors.append((label, actor))
+                self._worker_actors.append(proc)
 
     def _launch_disagg_workers(  # noqa: PLR0913
         self,
@@ -780,9 +942,12 @@ class DynamoBackend(InferenceBackend):
     ) -> None:
         """Launch separate prefill and decode worker pools for disaggregated serving.
 
-        Each worker gets 1 GPU (TP=1 within each disagg worker).  Workers are
-        placed greedily on available GPUs.  Prefill workers additionally get
+        Each worker gets ``tp_size`` GPUs on a single node.  Workers are placed
+        greedily on available GPUs.  Prefill workers additionally get
         ``--kv-events-config`` for ZMQ event publishing.
+
+        Multi-node tensor parallelism *within* a single disagg worker is not
+        yet supported — each worker's TP group must fit on one node.
 
         The ``dynamo_config`` dict on *model_config* controls pool sizes:
         - ``prefill_replicas`` (default 1): number of prefill workers
@@ -801,6 +966,15 @@ class DynamoBackend(InferenceBackend):
         # Plan placement: one allocation per worker
         plans = plan_replica_placement(total_workers, tp_size, head_node_id, _nodes=cluster_nodes)
 
+        for plan in plans:
+            if plan.is_multi_node:
+                msg = (
+                    f"Disaggregated serving does not yet support multi-node tensor parallelism. "
+                    f"Worker {plan.replica_index} requires {plan.total_gpus} GPUs across "
+                    f"{plan.nnodes} nodes. Reduce tensor_parallel_size to fit on a single node."
+                )
+                raise ValueError(msg)
+
         kv_transfer_config = json.dumps(
             dynamo_cfg.get(
                 "kv_transfer_config",
@@ -817,11 +991,6 @@ class DynamoBackend(InferenceBackend):
             rank0 = plan.ranks[0]
             nixl_port = get_free_port(20097 + worker_index)
 
-            worker_env = {
-                **base_env,
-                "VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port),
-                "PYTHONHASHSEED": "0",
-            }
             command = [
                 sys.executable,
                 "-m",
@@ -846,9 +1015,16 @@ class DynamoBackend(InferenceBackend):
             ]
 
             label = f"decode_{i}"
-            logger.info(f"Disagg decode worker {i}: GPU on {rank0.node_ip}, nixl_port={nixl_port}")
-            actor = self._spawn_actor(actor_cls, label, command, worker_env, rank0)
-            self._worker_actors.append((label, actor))
+            logger.info(f"Disagg decode worker {i}: {rank0.num_gpus} GPU(s) on {rank0.node_ip}, nixl_port={nixl_port}")
+            proc = self._spawn_actor(
+                actor_cls,
+                label,
+                command,
+                rank0,
+                driver_env=_get_driver_env_vars(base_env),
+                worker_env={"VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port), "PYTHONHASHSEED": "0"},
+            )
+            self._worker_actors.append(proc)
             worker_index += 1
 
         # Launch prefill workers
@@ -870,11 +1046,6 @@ class DynamoBackend(InferenceBackend):
                 )
             )
 
-            worker_env = {
-                **base_env,
-                "VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port),
-                "PYTHONHASHSEED": "0",
-            }
             command = [
                 sys.executable,
                 "-m",
@@ -902,44 +1073,82 @@ class DynamoBackend(InferenceBackend):
 
             label = f"prefill_{i}"
             logger.info(
-                f"Disagg prefill worker {i}: GPU on {rank0.node_ip}, "
+                f"Disagg prefill worker {i}: {rank0.num_gpus} GPU(s) on {rank0.node_ip}, "
                 f"nixl_port={nixl_port}, kv_events_port={kv_events_port}"
             )
-            actor = self._spawn_actor(actor_cls, label, command, worker_env, rank0)
-            self._worker_actors.append((label, actor))
+            proc = self._spawn_actor(
+                actor_cls,
+                label,
+                command,
+                rank0,
+                driver_env=_get_driver_env_vars(base_env),
+                worker_env={"VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port), "PYTHONHASHSEED": "0"},
+            )
+            self._worker_actors.append(proc)
             worker_index += 1
 
         logger.info(
             f"Disaggregated serving: {num_decode} decode + {num_prefill} prefill "
-            f"workers launched ({total_workers} GPUs total)"
+            f"workers launched ({total_workers * tp_size} GPUs total, TP={tp_size})"
         )
 
-    def _spawn_actor(
+    def _spawn_actor(  # noqa: PLR0913
         self,
         actor_cls: type,
         label: str,
         command: list[str],
-        env: dict[str, str],
         node_alloc: NodeAllocation,
-    ) -> Any:  # noqa: ANN401
+        *,
+        driver_env: dict[str, str] | None = None,
+        worker_env: dict[str, str] | None = None,
+    ) -> ManagedSubprocess:
         """Create a detached Ray actor that runs *command* as a subprocess.
 
-        Handles log file setup, actor naming, GPU reservation, and node
-        pinning via ``NodeAffinitySchedulingStrategy``.
+        Handles both GPU workers and non-GPU infra actors (etcd, NATS,
+        frontend).  For GPU actors, discovers Ray-assigned GPU IDs and sets
+        ``CUDA_VISIBLE_DEVICES`` explicitly in the worker-tier env.
+
+        Args:
+            actor_cls: The ``_SubprocessActor`` Ray remote class.
+            label: Human-readable label (used for actor naming and logs).
+            command: Subprocess command to run.
+            node_alloc: Node + GPU allocation for this actor.
+            driver_env: Driver-tier env (applied with ``setdefault``).
+                Defaults to ``_get_driver_env_vars()``.
+            worker_env: Worker-tier env (applied with overwrite).
         """
+        import ray
         from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
         log_file = os.path.join(self._runtime_dir, f"{label}.log") if self._runtime_dir else None
         actor_name = f"{self._actor_name_prefix}_{label}"
+
+        # Phase 1: create actor — lightweight __init__, no subprocess yet
         actor = actor_cls.options(
             name=actor_name,
             lifetime="detached",
             num_gpus=node_alloc.num_gpus,
+            runtime_env=_NOSET_CUDA_RUNTIME_ENV,
             scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_alloc.node_id, soft=False),
-        ).remote(command=command, env=env, log_file=log_file)
+        ).remote()
+
+        # Phase 2: discover GPUs (if any) and build env tiers
+        actual_worker_env = dict(worker_env or {})
+        if node_alloc.num_gpus > 0:
+            gpu_ids = ray.get(actor.get_assigned_gpus.remote())
+            if gpu_ids:
+                actual_worker_env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
+
+        actual_driver_env = driver_env if driver_env is not None else _get_driver_env_vars()
+
+        # Phase 3: launch subprocess
+        status = ray.get(actor.initialize.remote(command, actual_driver_env, actual_worker_env, log_file))
+
+        # Phase 4: start run() — the ObjectRef resolves when the subprocess exits
+        run_ref = actor.run.remote()
 
         logger.info(f"Launching {label} on {node_alloc.node_ip} (actor: {actor_name}, gpus={node_alloc.num_gpus})")
-        return actor
+        return ManagedSubprocess(label=label, actor=actor, run_ref=run_ref, log_file=status.get("log_file"))
 
     def _launch_worker(  # noqa: PLR0913
         self,
@@ -953,7 +1162,7 @@ class DynamoBackend(InferenceBackend):
         request_plane: str,
         event_plane: str,
         multi_node_plan: ReplicaPlan | None = None,
-    ) -> Any:  # noqa: ANN401
+    ) -> ManagedSubprocess:
         """Launch a full Dynamo vLLM worker (rank 0).
 
         This worker creates a ``DistributedRuntime``, registers the model in
@@ -993,7 +1202,7 @@ class DynamoBackend(InferenceBackend):
             )
 
         label = f"replica_{replica_index}_rank_0"
-        return self._spawn_actor(actor_cls, label, command, base_env, node_alloc)
+        return self._spawn_actor(actor_cls, label, command, node_alloc, driver_env=_get_driver_env_vars(base_env))
 
     def _launch_headless_worker(  # noqa: PLR0913
         self,
@@ -1004,7 +1213,7 @@ class DynamoBackend(InferenceBackend):
         base_env: dict[str, str],
         node_alloc: NodeAllocation,
         plan: ReplicaPlan,
-    ) -> Any:  # noqa: ANN401
+    ) -> ManagedSubprocess:
         """Launch a headless vLLM worker (rank > 0, multi-node TP).
 
         Headless workers bypass Dynamo's ``DistributedRuntime`` entirely --
@@ -1028,27 +1237,24 @@ class DynamoBackend(InferenceBackend):
         ]
 
         label = f"replica_{replica_index}_rank_{node_alloc.node_rank}"
-        return self._spawn_actor(actor_cls, label, command, base_env, node_alloc)
+        return self._spawn_actor(actor_cls, label, command, node_alloc, driver_env=_get_driver_env_vars(base_env))
 
     def _launch_frontend(  # noqa: PLR0913
         self,
         actor_cls: type,
-        head_node_id: str,
+        infra_node_id: str,
         port: int,
-        etcd_endpoint: str,
-        nats_url: str,
+        driver_env: dict[str, str],
         *,
         namespace: str,
         model_name: str,
         request_plane: str,
         event_plane: str,
         router_mode: str | None = None,
-    ) -> Any:  # noqa: ANN401
-        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
-        env = self._build_env(etcd_endpoint, nats_url)
+    ) -> ManagedSubprocess:
+        frontend_env = dict(driver_env)
         if router_mode:
-            env["PYTHONHASHSEED"] = "0"
+            frontend_env["PYTHONHASHSEED"] = "0"
         command = [
             sys.executable,
             "-m",
@@ -1069,29 +1275,9 @@ class DynamoBackend(InferenceBackend):
         if router_mode:
             command.extend(["--router-mode", router_mode, "--router-reset-states"])
 
-        log_file = os.path.join(self._runtime_dir, "frontend.log") if self._runtime_dir else None
-        actor_name = f"{self._actor_name_prefix}_frontend"
-        actor = actor_cls.options(
-            name=actor_name,
-            lifetime="detached",
-            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=head_node_id, soft=False),
-        ).remote(command=command, env=env, log_file=log_file)
-
-        logger.info(f"Starting Dynamo frontend on port {port} (actor: {actor_name})")
-        return actor
-
-    @staticmethod
-    def _build_env(etcd_endpoint: str, nats_url: str) -> dict[str, str]:
-        """Extra environment vars for Dynamo subprocesses.
-
-        Returns only the Dynamo-specific vars.  The actor merges these on top
-        of its own ``os.environ`` (which carries Ray-assigned
-        ``CUDA_VISIBLE_DEVICES``) so GPU isolation is preserved.
-        """
-        return {
-            "ETCD_ENDPOINTS": etcd_endpoint,
-            "NATS_SERVER": nats_url,
-        }
+        node_alloc = NodeAllocation(node_id=infra_node_id, node_ip=self._infra_ip, num_gpus=0, node_rank=0)
+        logger.info(f"Starting Dynamo frontend on port {port}")
+        return self._spawn_actor(actor_cls, "frontend", command, node_alloc, driver_env=frontend_env)
 
     # ------------------------------------------------------------------
     # Stop
@@ -1121,18 +1307,19 @@ class DynamoBackend(InferenceBackend):
         actors: list[tuple[str, Any]] = []
 
         if self._frontend_actor is not None:
-            actors.append(("frontend", self._frontend_actor))
+            actors.append((self._frontend_actor.label, self._frontend_actor.actor))
             self._frontend_actor = None
 
-        actors.extend(self._worker_actors)
+        for proc in self._worker_actors:
+            actors.append((proc.label, proc.actor))
         self._worker_actors.clear()
 
         if self._nats_actor is not None:
-            actors.append(("nats", self._nats_actor))
+            actors.append((self._nats_actor.label, self._nats_actor.actor))
             self._nats_actor = None
 
         if self._etcd_actor is not None:
-            actors.append(("etcd", self._etcd_actor))
+            actors.append((self._etcd_actor.label, self._etcd_actor.actor))
             self._etcd_actor = None
 
         return actors
