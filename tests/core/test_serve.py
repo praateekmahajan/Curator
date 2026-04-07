@@ -19,7 +19,13 @@ from pytest_httpserver import HTTPServer
 
 LLMConfig = pytest.importorskip("ray.serve.llm", reason="ray[serve] not installed").LLMConfig
 
-from nemo_curator.core.serve import InferenceModelConfig, InferenceServer, is_ray_serve_active  # noqa: E402
+from nemo_curator.core.serve import (  # noqa: E402
+    InferenceModelConfig,
+    InferenceServer,
+    _active_servers,
+    get_active_backend,
+    is_ray_serve_active,
+)
 
 INTEGRATION_TEST_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"  # pragma: allowlist secret
 INTEGRATION_TEST_MODEL_2 = "HuggingFaceTB/SmolLM-135M-Instruct"  # pragma: allowlist secret
@@ -69,6 +75,38 @@ class TestInferenceModelConfig:
         result_verbose = config.to_llm_config()
         assert result_verbose.runtime_env["env_vars"]["VLLM_LOGGING_LEVEL"] == "DEBUG"
         assert "RAY_SERVE_LOG_TO_STDERR" not in result_verbose.runtime_env["env_vars"]
+
+
+class TestBackendDispatch:
+    def test_backend_param_creates_dynamo(self):
+        from nemo_curator.core.serve.internal.dynamo import DynamoBackend
+
+        server = InferenceServer(
+            models=[InferenceModelConfig(model_identifier="some-model")],
+            backend="dynamo",
+        )
+        assert isinstance(server._create_backend(), DynamoBackend)
+
+    def test_invalid_backend_raises(self):
+        server = InferenceServer(
+            models=[InferenceModelConfig(model_identifier="m")],
+            backend="foo",
+        )
+        with pytest.raises(ValueError, match="Unknown backend"):
+            server._create_backend()
+
+    def test_default_backend_is_ray_serve(self):
+        server = InferenceServer(models=[InferenceModelConfig(model_identifier="m")])
+        assert server.backend == "ray_serve"
+
+
+class TestActiveBackendTracking:
+    def test_active_backend_tracking(self):
+        _active_servers["test-dynamo"] = "dynamo"
+        try:
+            assert get_active_backend() == "dynamo"
+        finally:
+            _active_servers.pop("test-dynamo", None)
 
 
 class TestInferenceServer:
