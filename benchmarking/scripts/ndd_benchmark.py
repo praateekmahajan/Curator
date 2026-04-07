@@ -146,6 +146,7 @@ def _start_inference_server(
     backend: str = "ray_serve",
     engine_kwargs: dict[str, Any] | None = None,
     autoscaling_config: dict[str, Any] | None = None,
+    dynamo_config: dict[str, Any] | None = None,
 ) -> "InferenceServer":
     """Start a local InferenceServer and return it."""
     from nemo_curator.core.serve import InferenceModelConfig, InferenceServer
@@ -157,6 +158,7 @@ def _start_inference_server(
         model_identifier=model_id,
         deployment_config={"autoscaling_config": autoscaling_config},
         engine_kwargs=engine_kwargs,
+        dynamo_config=dynamo_config or {},
     )
 
     server = InferenceServer(models=[server_config], backend=backend)
@@ -178,6 +180,7 @@ def run_ndd_benchmark(  # noqa: PLR0915
     num_files: int | None,
     engine_kwargs: dict[str, Any] | None = None,
     autoscaling_config: dict[str, Any] | None = None,
+    dynamo_config: dict[str, Any] | None = None,
     **kwargs,  # noqa: ARG001
 ) -> dict[str, Any]:
     """Run the NDD benchmark and collect metrics."""
@@ -205,7 +208,7 @@ def run_ndd_benchmark(  # noqa: PLR0915
         backend = "ray_serve" if inference_server_type == "ray-serve" else "dynamo"
         logger.info(f"Starting local InferenceServer (backend={backend}) with engine_kwargs={engine_kwargs}")
         serve_start = time.perf_counter()
-        inference_server = _start_inference_server(model_id, backend, engine_kwargs, autoscaling_config)
+        inference_server = _start_inference_server(model_id, backend, engine_kwargs, autoscaling_config, dynamo_config)
         serve_startup_s = time.perf_counter() - serve_start
         logger.info(f"InferenceServer ready at {inference_server.endpoint} (startup: {serve_startup_s:.1f}s)")
 
@@ -325,6 +328,15 @@ def main() -> int:
         default=None,
         help='JSON string of Ray Serve autoscaling config (e.g. \'{"min_replicas": 1, "max_replicas": 4}\')',
     )
+    parser.add_argument(
+        "--dynamo-config",
+        type=str,
+        default=None,
+        help=(
+            "JSON string of Dynamo backend config. "
+            'For disagg: \'{"mode": "disagg", "prefill_replicas": 2, "decode_replicas": 2}\''
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -334,6 +346,7 @@ def main() -> int:
     # Parse JSON string args
     engine_kwargs = json.loads(args.engine_kwargs) if args.engine_kwargs else None
     autoscaling_config = json.loads(args.autoscaling_config) if args.autoscaling_config else None
+    dynamo_config = json.loads(args.dynamo_config) if args.dynamo_config else None
 
     success_code = 1
     result_dict: dict[str, Any] = {
@@ -352,6 +365,7 @@ def main() -> int:
                 num_files=args.num_files,
                 engine_kwargs=engine_kwargs,
                 autoscaling_config=autoscaling_config,
+                dynamo_config=dynamo_config,
             )
         )
         success_code = 0 if result_dict["metrics"]["is_success"] else 1

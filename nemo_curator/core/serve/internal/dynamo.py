@@ -460,57 +460,94 @@ class DynamoBackend(InferenceBackend):
             actor_cls = _define_subprocess_actor()
 
             try:
-                # Infrastructure -- always on head node
-                if not server.etcd_endpoint:
-                    self._etcd_actor = self._start_etcd(actor_cls, head_node_id, self._etcd_port)
-                if not server.nats_url:
-                    self._nats_actor = self._start_nats(actor_cls, head_node_id, self._nats_port)
-
-                etcd_endpoint = server.etcd_endpoint or f"http://{self._head_ip}:{self._etcd_port}"
-                nats_url = server.nats_url or f"nats://{self._head_ip}:{self._nats_port}"
-
-                # Plan GPU placement across cluster
-                replica_plans = plan_replica_placement(num_replicas, tp_size, head_node_id, _nodes=cluster_nodes)
-
-                namespace = dynamo_cfg.get("namespace", "curator")
-                request_plane = dynamo_cfg.get("request_plane", "nats")
-                event_plane = dynamo_cfg.get("event_plane", "nats")
-                base_env = self._build_env(etcd_endpoint, nats_url)
-
-                self._launch_replicas(
+                self._deploy_and_healthcheck(
+                    server,
                     actor_cls,
-                    replica_plans,
                     model_config,
-                    base_env,
-                    namespace=namespace,
-                    request_plane=request_plane,
-                    event_plane=event_plane,
+                    dynamo_cfg,
+                    head_node_id=head_node_id,
+                    cluster_nodes=cluster_nodes,
+                    num_replicas=num_replicas,
+                    tp_size=tp_size,
                 )
-
-                # Frontend -- always on head node
-                model_name = model_config.model_name or model_config.model_identifier
-                self._frontend_actor = self._launch_frontend(
-                    actor_cls,
-                    head_node_id,
-                    server.port,
-                    etcd_endpoint,
-                    nats_url,
-                    namespace=namespace,
-                    model_name=model_name,
-                    request_plane=request_plane,
-                    event_plane=event_plane,
-                )
-
-                # Health check — must stay inside ray.init context so actor handles
-                # (is_alive, read_log_tail) remain valid for subprocess liveness checks.
-                expected_model = model_config.model_name or model_config.model_identifier
-                self._wait_for_model(server, expected_model)
             except Exception:
                 # Still connected to Ray here — kill directly without opening another context.
                 for label, actor in self._collect_actors_for_shutdown():
                     _kill_actor(ray, label, actor)
                 self._cleanup_runtime_dir()
                 raise
+
+    def _deploy_and_healthcheck(  # noqa: PLR0913
+        self,
+        server: InferenceServer,
+        actor_cls: type,
+        model_config: InferenceModelConfig,
+        dynamo_cfg: dict[str, Any],
+        *,
+        head_node_id: str,
+        cluster_nodes: list[dict[str, Any]],
+        num_replicas: int,
+        tp_size: int,
+    ) -> None:
+        """Launch infra, workers, frontend and wait for health."""
+        # Infrastructure -- always on head node
+        if not server.etcd_endpoint:
+            self._etcd_actor = self._start_etcd(actor_cls, head_node_id, self._etcd_port)
+        if not server.nats_url:
+            self._nats_actor = self._start_nats(actor_cls, head_node_id, self._nats_port)
+
+        etcd_endpoint = server.etcd_endpoint or f"http://{self._head_ip}:{self._etcd_port}"
+        nats_url = server.nats_url or f"nats://{self._head_ip}:{self._nats_port}"
+
+        namespace = dynamo_cfg.get("namespace", "curator")
+        request_plane = dynamo_cfg.get("request_plane", "nats")
+        event_plane = dynamo_cfg.get("event_plane", "nats")
+        base_env = self._build_env(etcd_endpoint, nats_url)
+        is_disagg = dynamo_cfg.get("mode") == "disagg"
+
+        if is_disagg:
+            self._launch_disagg_workers(
+                actor_cls,
+                model_config,
+                base_env,
+                head_node_id=head_node_id,
+                cluster_nodes=cluster_nodes,
+                namespace=namespace,
+                request_plane=request_plane,
+                event_plane=event_plane,
+            )
+        else:
+            replica_plans = plan_replica_placement(num_replicas, tp_size, head_node_id, _nodes=cluster_nodes)
+            self._launch_replicas(
+                actor_cls,
+                replica_plans,
+                model_config,
+                base_env,
+                namespace=namespace,
+                request_plane=request_plane,
+                event_plane=event_plane,
+            )
+
+        # Frontend -- always on head node
+        model_name = model_config.model_name or model_config.model_identifier
+        router_mode = dynamo_cfg.get("router_mode", "kv") if is_disagg else None
+        self._frontend_actor = self._launch_frontend(
+            actor_cls,
+            head_node_id,
+            server.port,
+            etcd_endpoint,
+            nats_url,
+            namespace=namespace,
+            model_name=model_name,
+            request_plane=request_plane,
+            event_plane=event_plane,
+            router_mode=router_mode,
+        )
+
+        # Health check — must stay inside ray.init context so actor handles
+        # (is_alive, read_log_tail) remain valid for subprocess liveness checks.
+        expected_model = model_config.model_name or model_config.model_identifier
+        self._wait_for_model(server, expected_model)
 
     def _wait_for_model(self, server: InferenceServer, model_name: str) -> None:
         """Poll ``/v1/models`` until *model_name* appears in the response.
@@ -729,6 +766,154 @@ class DynamoBackend(InferenceBackend):
                 label = f"replica_{plan.replica_index}_rank_{rank.node_rank}"
                 self._worker_actors.append((label, actor))
 
+    def _launch_disagg_workers(  # noqa: PLR0913
+        self,
+        actor_cls: type,
+        model_config: InferenceModelConfig,
+        base_env: dict[str, str],
+        *,
+        head_node_id: str,
+        cluster_nodes: list[dict[str, Any]],
+        namespace: str,
+        request_plane: str,
+        event_plane: str,
+    ) -> None:
+        """Launch separate prefill and decode worker pools for disaggregated serving.
+
+        Each worker gets 1 GPU (TP=1 within each disagg worker).  Workers are
+        placed greedily on available GPUs.  Prefill workers additionally get
+        ``--kv-events-config`` for ZMQ event publishing.
+
+        The ``dynamo_config`` dict on *model_config* controls pool sizes:
+        - ``prefill_replicas`` (default 1): number of prefill workers
+        - ``decode_replicas`` (default 1): number of decode workers
+        """
+        import json
+
+        from nemo_curator.core.utils import get_free_port
+
+        dynamo_cfg = model_config.dynamo_config
+        num_prefill = dynamo_cfg.get("prefill_replicas", 1)
+        num_decode = dynamo_cfg.get("decode_replicas", 1)
+        total_workers = num_prefill + num_decode
+        tp_size = model_config.engine_kwargs.get("tensor_parallel_size", 1)
+
+        # Plan placement: one allocation per worker
+        plans = plan_replica_placement(total_workers, tp_size, head_node_id, _nodes=cluster_nodes)
+
+        kv_transfer_config = json.dumps(
+            dynamo_cfg.get(
+                "kv_transfer_config",
+                {"kv_connector": "NixlConnector", "kv_role": "kv_both"},
+            )
+        )
+
+        model_name = model_config.model_name or model_config.model_identifier
+        worker_index = 0
+
+        # Launch decode workers first (matching Dynamo example convention)
+        for i in range(num_decode):
+            plan = plans[worker_index]
+            rank0 = plan.ranks[0]
+            nixl_port = get_free_port(20097 + worker_index)
+
+            worker_env = {
+                **base_env,
+                "VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port),
+                "PYTHONHASHSEED": "0",
+            }
+            command = [
+                sys.executable,
+                "-m",
+                "dynamo.vllm",
+                "--model",
+                model_config.model_identifier,
+                "--served-model-name",
+                model_name,
+                "--namespace",
+                namespace,
+                "--discovery-backend",
+                "etcd",
+                "--request-plane",
+                request_plane,
+                "--event-plane",
+                event_plane,
+                "--disaggregation-mode",
+                "decode",
+                "--kv-transfer-config",
+                kv_transfer_config,
+                *_engine_kwargs_to_cli_flags(model_config.engine_kwargs),
+            ]
+
+            label = f"decode_{i}"
+            logger.info(f"Disagg decode worker {i}: GPU on {rank0.node_ip}, nixl_port={nixl_port}")
+            actor = self._spawn_actor(actor_cls, label, command, worker_env, rank0)
+            self._worker_actors.append((label, actor))
+            worker_index += 1
+
+        # Launch prefill workers
+        for i in range(num_prefill):
+            plan = plans[worker_index]
+            rank0 = plan.ranks[0]
+            nixl_port = get_free_port(20097 + worker_index)
+            kv_events_port = get_free_port(20081 + i)
+
+            kv_events_config = json.dumps(
+                dynamo_cfg.get(
+                    "kv_events_config",
+                    {
+                        "publisher": "zmq",
+                        "topic": "kv-events",
+                        "endpoint": f"tcp://*:{kv_events_port}",
+                        "enable_kv_cache_events": True,
+                    },
+                )
+            )
+
+            worker_env = {
+                **base_env,
+                "VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port),
+                "PYTHONHASHSEED": "0",
+            }
+            command = [
+                sys.executable,
+                "-m",
+                "dynamo.vllm",
+                "--model",
+                model_config.model_identifier,
+                "--served-model-name",
+                model_name,
+                "--namespace",
+                namespace,
+                "--discovery-backend",
+                "etcd",
+                "--request-plane",
+                request_plane,
+                "--event-plane",
+                event_plane,
+                "--disaggregation-mode",
+                "prefill",
+                "--kv-transfer-config",
+                kv_transfer_config,
+                "--kv-events-config",
+                kv_events_config,
+                *_engine_kwargs_to_cli_flags(model_config.engine_kwargs),
+            ]
+
+            label = f"prefill_{i}"
+            logger.info(
+                f"Disagg prefill worker {i}: GPU on {rank0.node_ip}, "
+                f"nixl_port={nixl_port}, kv_events_port={kv_events_port}"
+            )
+            actor = self._spawn_actor(actor_cls, label, command, worker_env, rank0)
+            self._worker_actors.append((label, actor))
+            worker_index += 1
+
+        logger.info(
+            f"Disaggregated serving: {num_decode} decode + {num_prefill} prefill "
+            f"workers launched ({total_workers} GPUs total)"
+        )
+
     def _spawn_actor(
         self,
         actor_cls: type,
@@ -857,10 +1042,13 @@ class DynamoBackend(InferenceBackend):
         model_name: str,
         request_plane: str,
         event_plane: str,
+        router_mode: str | None = None,
     ) -> Any:  # noqa: ANN401
         from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
         env = self._build_env(etcd_endpoint, nats_url)
+        if router_mode:
+            env["PYTHONHASHSEED"] = "0"
         command = [
             sys.executable,
             "-m",
@@ -878,6 +1066,8 @@ class DynamoBackend(InferenceBackend):
             "--event-plane",
             event_plane,
         ]
+        if router_mode:
+            command.extend(["--router-mode", router_mode, "--router-reset-states"])
 
         log_file = os.path.join(self._runtime_dir, "frontend.log") if self._runtime_dir else None
         actor_name = f"{self._actor_name_prefix}_frontend"
