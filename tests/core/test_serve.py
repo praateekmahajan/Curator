@@ -118,17 +118,38 @@ class TestInferenceServer:
         server.stop()
         assert server._started is False
 
-    def test_wait_for_healthy(self, httpserver: HTTPServer) -> None:
-        """Health check succeeds on 200, retries on failure, and times out on unreachable port."""
-        # Immediate success
+    def test_wait_for_healthy_succeeds_when_models_present(self, httpserver: HTTPServer) -> None:
+        """Health check succeeds once all expected model names appear."""
+        model_a = InferenceModelConfig(model_identifier="model-a")
+        model_b = InferenceModelConfig(model_identifier="model-b")
+        httpserver.expect_request("/v1/models").respond_with_json({"data": [{"id": "model-a"}, {"id": "model-b"}]})
+        server = InferenceServer(models=[model_a, model_b], port=httpserver.port, health_check_timeout_s=5)
+        server._wait_for_healthy()
+
+    def test_wait_for_healthy_times_out_on_empty_model_list(self, httpserver: HTTPServer) -> None:
+        """HTTP 200 with an empty model list is not sufficient — models must appear."""
+        httpserver.expect_request("/v1/models").respond_with_json({"data": []})
+        server = InferenceServer(
+            models=[InferenceModelConfig(model_identifier="model-a")],
+            port=httpserver.port,
+            health_check_timeout_s=2,
+        )
+        with pytest.raises(TimeoutError, match="did not become ready within 2s"):
+            server._wait_for_healthy()
+
+    def test_wait_for_healthy_times_out_on_unreachable_port(self) -> None:
+        """Health check times out when the port is unreachable."""
+        server = InferenceServer(
+            models=[InferenceModelConfig(model_identifier="m")], port=19876, health_check_timeout_s=2
+        )
+        with pytest.raises(TimeoutError, match="did not become ready within 2s"):
+            server._wait_for_healthy()
+
+    def test_wait_for_healthy_no_models_succeeds_immediately(self, httpserver: HTTPServer) -> None:
+        """With no models configured, health check passes on any 200 with empty list."""
         httpserver.expect_request("/v1/models").respond_with_json({"data": []})
         server = InferenceServer(models=[], port=httpserver.port, health_check_timeout_s=5)
         server._wait_for_healthy()
-
-        # Timeout on unreachable port
-        server = InferenceServer(models=[], port=19876, health_check_timeout_s=2)
-        with pytest.raises(TimeoutError, match="did not become ready within 2s"):
-            server._wait_for_healthy()
 
     def test_start_raises_when_another_server_active(self) -> None:
         """start() raises RuntimeError if another InferenceServer is already active."""

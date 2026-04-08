@@ -254,11 +254,15 @@ class InferenceServer:
         return f"http://{self._host}:{self.port}/v1"
 
     def _wait_for_healthy(self) -> None:
-        """Poll the /v1/models endpoint until all models are ready.
+        """Poll ``/v1/models`` until all expected models appear in the response.
 
-        TODO: Verify whether Ray Serve can return HTTP 200 with an empty
-        model list before tightening this check to also verify model names.
+        Ray Serve can return HTTP 200 with an empty model list before
+        replicas are ready, so we verify model names — not just the status
+        code.
         """
+        import json
+
+        expected = {m.model_name or m.model_identifier for m in self.models}
         models_url = f"{self.endpoint}/models"
         deadline = time.monotonic() + self.health_check_timeout_s
         attempt = 0
@@ -267,8 +271,11 @@ class InferenceServer:
             try:
                 resp = urllib.request.urlopen(models_url, timeout=5)  # noqa: S310
                 if resp.status == http.HTTPStatus.OK:
-                    logger.info(f"Model server ready after {attempt} health check(s)")
-                    return
+                    body = json.loads(resp.read())
+                    found = {m["id"] for m in body.get("data", [])}
+                    if expected.issubset(found):
+                        logger.info(f"Model server ready after {attempt} health check(s)")
+                        return
             except Exception:  # noqa: BLE001
                 if self.verbose:
                     logger.debug(f"Health check attempt {attempt} failed, retrying...")

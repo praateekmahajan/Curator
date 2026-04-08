@@ -96,7 +96,7 @@ class DynamoBackend(InferenceBackend):
         self._actor_name_prefix: str = ""
 
     @staticmethod
-    def _shrink_inventory(inventory: list[dict[str, Any]], plans: list[ReplicaPlan]) -> list[dict[str, Any]]:
+    def _subtract_placed_gpus(inventory: list[dict[str, Any]], plans: list[ReplicaPlan]) -> list[dict[str, Any]]:
         """Remove GPUs consumed by *plans* from *inventory*, returning what remains."""
         used: dict[str, int] = {}
         for plan in plans:
@@ -315,7 +315,7 @@ class DynamoBackend(InferenceBackend):
         base_env = {"ETCD_ENDPOINTS": etcd_endpoint, "NATS_SERVER": nats_url}
 
         expected_models: set[str] = set()
-        has_disagg = False
+        any_model_disagg = False
         placements: list[dict[str, Any]] = []
 
         for model_config in server.models:
@@ -327,7 +327,7 @@ class DynamoBackend(InferenceBackend):
             event_plane = dynamo_cfg.get("event_plane", DEFAULT_DYNAMO_EVENT_PLANE)
             is_disagg = dynamo_cfg.get("mode") == "disagg"
             if is_disagg:
-                has_disagg = True
+                any_model_disagg = True
 
             model_name = model_config.model_name or model_config.model_identifier
             expected_models.add(model_name)
@@ -343,22 +343,22 @@ class DynamoBackend(InferenceBackend):
                     request_plane=request_plane,
                     event_plane=event_plane,
                 )
-                for plan, role in plans_with_roles:
-                    placements.append(self._plan_to_placement(model_name, plan, mode="disagg", role=role))
             else:
-                plans = plan_replica_placement(num_replicas, tp_size, _inventory=inventory)
-                self._launch_replicas(
+                plans_with_roles, inventory = self._launch_replicas(
                     actor_cls,
-                    plans,
                     model_config,
                     base_env,
+                    inventory=inventory,
+                    num_replicas=num_replicas,
                     namespace=namespace,
                     request_plane=request_plane,
                     event_plane=event_plane,
                 )
-                inventory = self._shrink_inventory(inventory, plans)
-                for plan in plans:
-                    placements.append(self._plan_to_placement(model_name, plan))
+
+            for plan, role in plans_with_roles:
+                placements.append(
+                    self._plan_to_placement(model_name, plan, mode="disagg" if role else None, role=role)
+                )
 
         # Write initial manifest before frontend launch (ready=False).
         manifest_data = {
@@ -376,7 +376,10 @@ class DynamoBackend(InferenceBackend):
         namespace = first_cfg.get("namespace", DEFAULT_DYNAMO_NAMESPACE)
         request_plane = first_cfg.get("request_plane", DEFAULT_DYNAMO_REQUEST_PLANE)
         event_plane = first_cfg.get("event_plane", DEFAULT_DYNAMO_EVENT_PLANE)
-        router_mode = first_cfg.get("router_mode", "kv") if has_disagg else None
+        # KV-aware routing is safe for mixed deployments: the router falls
+        # back to default (round-robin) routing for non-disagg models that
+        # don't publish KV-cache events.
+        router_mode = first_cfg.get("router_mode", "kv") if any_model_disagg else None
         frontend_runtime_env = self._merge_model_runtime_envs(server.models)
         self._frontend_actor = self._launch_frontend(
             actor_cls,
@@ -454,21 +457,18 @@ class DynamoBackend(InferenceBackend):
         )
 
     def _check_subprocess_health(self) -> None:
-        """Check subprocess liveness via run refs and ``is_alive()`` fallback.
+        """Detect subprocess exits via ``ray.wait()`` on run refs.
 
-        First checks ``ray.wait()`` on all run refs (fast, no per-actor RPC).
-        If any ref has resolved, the subprocess exited — reads the log tail
-        and raises.  Then falls back to ``is_alive()`` for actors without
-        run refs.
+        Every actor launched by ``spawn_actor`` has a ``run_ref`` — an
+        ObjectRef that resolves when the subprocess exits (or the actor
+        dies).  ``ray.wait(timeout=0)`` checks all refs in a single
+        non-blocking call with no per-actor RPC overhead.
 
         Note: does NOT use ``with ray.init()`` — the driver must already be
         connected.
         """
-        self._check_liveness_via_refs()
-        self._check_liveness_via_polling()
+        import ray
 
-    def _get_all_managed_processes(self) -> list[ManagedSubprocess]:
-        """Collect all managed processes for health checking."""
         procs: list[ManagedSubprocess] = []
         if self._frontend_actor is not None:
             procs.append(self._frontend_actor)
@@ -477,18 +477,7 @@ class DynamoBackend(InferenceBackend):
             procs.append(self._etcd_actor)
         if self._nats_actor is not None:
             procs.append(self._nats_actor)
-        return procs
 
-    def _check_liveness_via_refs(self) -> None:
-        """Detect subprocess exits via ``ray.wait()`` on run refs.
-
-        Run refs resolve when the subprocess exits (or the actor dies).
-        ``ray.wait()`` with ``timeout=0`` is non-blocking and requires no
-        per-actor RPC, making it much faster than ``is_alive()`` polling.
-        """
-        import ray
-
-        procs = self._get_all_managed_processes()
         ref_to_proc = {p.run_ref: p for p in procs if p.run_ref is not None}
         if not ref_to_proc:
             return
@@ -498,25 +487,6 @@ class DynamoBackend(InferenceBackend):
             proc = ref_to_proc[ref]
             log_tail = self._read_actor_log_tail(proc.actor)
             self._raise_subprocess_error(proc.label, log_tail, reason="subprocess exited unexpectedly")
-
-    def _check_liveness_via_polling(self) -> None:
-        """Fallback liveness check via ``is_alive()`` RPC for processes without run refs."""
-        import ray
-
-        procs = [p for p in self._get_all_managed_processes() if p.run_ref is None]
-        for proc in procs:
-            try:
-                alive = ray.get(proc.actor.is_alive.remote(), timeout=10)
-            except Exception:  # noqa: BLE001
-                log_tail = self._read_actor_log_tail(proc.actor)
-                if log_tail:
-                    self._raise_subprocess_error(
-                        proc.label, log_tail, reason="actor unreachable and has log output — likely crashed"
-                    )
-                continue
-            if not alive:
-                log_tail = self._read_actor_log_tail(proc.actor)
-                self._raise_subprocess_error(proc.label, log_tail, reason="subprocess crashed during startup")
 
     @staticmethod
     def _read_actor_log_tail(actor: Any) -> str:  # noqa: ANN401
@@ -647,15 +617,24 @@ class DynamoBackend(InferenceBackend):
     def _launch_replicas(  # noqa: PLR0913
         self,
         actor_cls: type,
-        replica_plans: list[ReplicaPlan],
         model_config: InferenceModelConfig,
         base_env: dict[str, str],
         *,
+        inventory: list[dict[str, Any]],
+        num_replicas: int,
         namespace: str,
         request_plane: str,
         event_plane: str,
-    ) -> None:
-        """Launch all worker actors for the given replica plans."""
+    ) -> tuple[list[tuple[ReplicaPlan, str | None]], list[dict[str, Any]]]:
+        """Plan placement and launch all worker actors for a non-disagg model.
+
+        Returns:
+            Tuple of (list of (plan, role) pairs, remaining GPU inventory).
+            Role is always ``None`` for non-disaggregated models.
+        """
+        tp_size = model_config.engine_kwargs.get("tensor_parallel_size", 1)
+        replica_plans = plan_replica_placement(num_replicas, tp_size, _inventory=inventory)
+
         for plan in replica_plans:
             if plan.is_multi_node:
                 logger.info(
@@ -688,6 +667,9 @@ class DynamoBackend(InferenceBackend):
                         plan=plan,
                     )
                 self._worker_actors.append(proc)
+
+        remaining = self._subtract_placed_gpus(inventory, replica_plans)
+        return [(plan, None) for plan in replica_plans], remaining
 
     def _launch_disagg_workers(  # noqa: PLR0913
         self,
@@ -856,7 +838,7 @@ class DynamoBackend(InferenceBackend):
             f"workers launched ({total_workers * tp_size} GPUs total, TP={tp_size})"
         )
         plans_with_roles = [(plans[i], "decode" if i < num_decode else "prefill") for i in range(total_workers)]
-        return plans_with_roles, self._shrink_inventory(inventory, plans)
+        return plans_with_roles, self._subtract_placed_gpus(inventory, plans)
 
     def _launch_worker(  # noqa: PLR0913
         self,

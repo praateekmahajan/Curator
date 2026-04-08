@@ -254,7 +254,7 @@ class TestDynamoLiveness:
             backend._worker_actors = [proc]
 
             with pytest.raises(RuntimeError, match="subprocess exited unexpectedly"):
-                backend._check_liveness_via_refs()
+                backend._check_subprocess_health()
         finally:
             with contextlib.suppress(Exception):
                 ray.kill(actor, no_restart=True)
@@ -572,12 +572,12 @@ class TestMixedDisaggInventory:
         # Non-disagg model: 1 replica, TP=4 — takes all 4 GPUs on n1
         plans_a = plan_replica_placement(num_replicas=1, tp_size=4, _inventory=inventory)
         assert plans_a[0].ranks[0].node_id == "n1"
-        inventory = DynamoBackend._shrink_inventory(inventory, plans_a)
+        inventory = DynamoBackend._subtract_placed_gpus(inventory, plans_a)
 
         # Disagg model: 1 decode worker, TP=4 — must land on n2, not n1
         plans_b = plan_replica_placement(num_replicas=1, tp_size=4, _inventory=inventory)
         assert plans_b[0].ranks[0].node_id == "n2"
-        inventory = DynamoBackend._shrink_inventory(inventory, plans_b)
+        inventory = DynamoBackend._subtract_placed_gpus(inventory, plans_b)
 
         # No GPUs left
         assert len(inventory) == 0
@@ -590,7 +590,7 @@ class TestMixedDisaggInventory:
 
         # First model takes all 4 GPUs
         plans_a = plan_replica_placement(num_replicas=1, tp_size=4, _inventory=inventory)
-        inventory = DynamoBackend._shrink_inventory(inventory, plans_a)
+        inventory = DynamoBackend._subtract_placed_gpus(inventory, plans_a)
 
         # Second model has no GPUs left
         with pytest.raises(RuntimeError, match="No GPU nodes"):
