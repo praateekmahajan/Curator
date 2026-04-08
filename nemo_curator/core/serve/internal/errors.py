@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-DEFAULT_SERVE_PORT = 8000
-DEFAULT_SERVE_HEALTH_TIMEOUT_S = 300
+from __future__ import annotations
 
-DEFAULT_ETCD_PORT = 2379
-DEFAULT_NATS_PORT = 4222
 
-DEFAULT_DYNAMO_NAMESPACE = "curator"
-DEFAULT_DYNAMO_REQUEST_PLANE = "nats"
-DEFAULT_DYNAMO_EVENT_PLANE = "nats"
+class SubprocessError(RuntimeError):
+    """Raised when a managed subprocess fails during inference server lifecycle."""
+
+    def __init__(self, message: str, debug_context: dict | None = None):
+        super().__init__(message)
+        self.debug_context = debug_context or {}

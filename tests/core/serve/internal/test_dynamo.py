@@ -19,6 +19,7 @@ import pytest
 
 from nemo_curator.core.serve import InferenceModelConfig, InferenceServer
 from nemo_curator.core.serve.internal.dynamo import DynamoBackend
+from nemo_curator.core.serve.internal.errors import SubprocessError
 from nemo_curator.core.serve.internal.subprocess_mgr import (
     ManagedSubprocess,
     _define_subprocess_actor,
@@ -95,16 +96,16 @@ class TestDynamoBackendValidation:
             backend="dynamo",
         )
         backend = DynamoBackend(server)
+        inventory = [
+            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False},
+            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 4, "is_head": False},
+        ]
         with pytest.raises(ValueError, match="multi-node tensor parallelism"):
             backend._launch_disagg_workers(
                 type(None),  # actor_cls unused — validation fires before actor creation
                 server.models[0],
                 {},
-                head_node_id="n1",
-                cluster_nodes=[
-                    {"NodeID": "n1", "NodeManagerAddress": "10.0.0.1", "Alive": True, "Resources": {"GPU": 4}},
-                    {"NodeID": "n2", "NodeManagerAddress": "10.0.0.2", "Alive": True, "Resources": {"GPU": 4}},
-                ],
+                inventory=inventory,
                 namespace="test",
                 request_plane="nats",
                 event_plane="nats",
@@ -418,3 +419,207 @@ class TestMultiModel:
         assert "model_name" not in sig.parameters, (
             "_launch_frontend should not accept model_name — frontend auto-discovers models"
         )
+
+
+# ---------------------------------------------------------------------------
+# Frontend config validation
+# ---------------------------------------------------------------------------
+
+
+class TestFrontendConfigValidation:
+    """Tests for DynamoBackend._validate_frontend_config."""
+
+    def test_rejects_mismatched_namespace(self):
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(model_identifier="model-a", dynamo_config={"namespace": "ns1"}),
+                InferenceModelConfig(model_identifier="model-b", dynamo_config={"namespace": "ns2"}),
+            ],
+            backend="dynamo",
+        )
+        with pytest.raises(ValueError, match="namespace"):
+            DynamoBackend._validate_frontend_config(server)
+
+    def test_rejects_mismatched_request_plane(self):
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(model_identifier="model-a", dynamo_config={"request_plane": "nats"}),
+                InferenceModelConfig(model_identifier="model-b", dynamo_config={"request_plane": "grpc"}),
+            ],
+            backend="dynamo",
+        )
+        with pytest.raises(ValueError, match="request_plane"):
+            DynamoBackend._validate_frontend_config(server)
+
+    def test_accepts_matching_config(self):
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(model_identifier="model-a", dynamo_config={"namespace": "ns1"}),
+                InferenceModelConfig(model_identifier="model-b", dynamo_config={"namespace": "ns1"}),
+            ],
+            backend="dynamo",
+        )
+        DynamoBackend._validate_frontend_config(server)  # should not raise
+
+    def test_single_model_always_passes(self):
+        server = InferenceServer(
+            models=[InferenceModelConfig(model_identifier="m", dynamo_config={"namespace": "any"})],
+            backend="dynamo",
+        )
+        DynamoBackend._validate_frontend_config(server)  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# Pre-infra GPU validation
+# ---------------------------------------------------------------------------
+
+
+class TestGpuValidation:
+    """Tests for DynamoBackend._validate_gpu_requirements."""
+
+    def test_rejects_disagg_tp_exceeding_max_node_gpus(self):
+        """TP=8 in disagg mode on nodes with max 4 GPUs each should fail."""
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(
+                    model_identifier="big-model",
+                    engine_kwargs={"tensor_parallel_size": 8},
+                    dynamo_config={"mode": "disagg", "prefill_replicas": 1, "decode_replicas": 1},
+                )
+            ],
+            backend="dynamo",
+        )
+        inventory = [
+            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False},
+            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 4, "is_head": False},
+        ]
+        with pytest.raises(ValueError, match="does not support multi-node TP"):
+            DynamoBackend._validate_gpu_requirements(server, inventory)
+
+    def test_rejects_aggregate_gpu_overcommit(self):
+        """Two models needing 4 GPUs each on a 4-GPU cluster should fail."""
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(
+                    model_identifier="model-a",
+                    engine_kwargs={"tensor_parallel_size": 2},
+                    deployment_config={"num_replicas": 2},
+                ),
+                InferenceModelConfig(
+                    model_identifier="model-b",
+                    engine_kwargs={"tensor_parallel_size": 2},
+                    deployment_config={"num_replicas": 2},
+                ),
+            ],
+            backend="dynamo",
+        )
+        inventory = [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False}]
+        with pytest.raises(ValueError, match="require 8 GPUs total but only 4"):
+            DynamoBackend._validate_gpu_requirements(server, inventory)
+
+    def test_accepts_valid_config(self):
+        """Config that fits should not raise."""
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(
+                    model_identifier="m",
+                    engine_kwargs={"tensor_parallel_size": 2},
+                    deployment_config={"num_replicas": 1},
+                )
+            ],
+            backend="dynamo",
+        )
+        inventory = [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False}]
+        DynamoBackend._validate_gpu_requirements(server, inventory)  # should not raise
+
+    def test_disagg_aggregate_check_counts_prefill_and_decode(self):
+        """Disagg model with 2 prefill + 2 decode at TP=2 needs 8 GPUs."""
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(
+                    model_identifier="m",
+                    engine_kwargs={"tensor_parallel_size": 2},
+                    dynamo_config={"mode": "disagg", "prefill_replicas": 2, "decode_replicas": 2},
+                )
+            ],
+            backend="dynamo",
+        )
+        inventory = [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False}]
+        with pytest.raises(ValueError, match="require 8 GPUs total but only 4"):
+            DynamoBackend._validate_gpu_requirements(server, inventory)
+
+
+# ---------------------------------------------------------------------------
+# Mixed disagg + non-disagg multi-model inventory isolation
+# ---------------------------------------------------------------------------
+
+
+class TestMixedDisaggInventory:
+    """Verify that disagg and non-disagg models share the GPU inventory correctly."""
+
+    def test_disagg_and_non_disagg_use_disjoint_gpus(self):
+        """A non-disagg model followed by a disagg model should not double-book GPUs.
+
+        This is a regression test for the bug where _launch_disagg_workers
+        rebuilt inventory from scratch via _nodes= instead of using the
+        shared _inventory= parameter.
+        """
+        inventory = [
+            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False},
+            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 4, "is_head": False},
+        ]
+
+        # Non-disagg model: 1 replica, TP=4 — takes all 4 GPUs on n1
+        plans_a = plan_replica_placement(num_replicas=1, tp_size=4, _inventory=inventory)
+        assert plans_a[0].ranks[0].node_id == "n1"
+        inventory = DynamoBackend._shrink_inventory(inventory, plans_a)
+
+        # Disagg model: 1 decode worker, TP=4 — must land on n2, not n1
+        plans_b = plan_replica_placement(num_replicas=1, tp_size=4, _inventory=inventory)
+        assert plans_b[0].ranks[0].node_id == "n2"
+        inventory = DynamoBackend._shrink_inventory(inventory, plans_b)
+
+        # No GPUs left
+        assert len(inventory) == 0
+
+    def test_mixed_models_overcommit_detected(self):
+        """Non-disagg + disagg models exceeding total GPUs should fail at placement."""
+        inventory = [
+            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False},
+        ]
+
+        # First model takes all 4 GPUs
+        plans_a = plan_replica_placement(num_replicas=1, tp_size=4, _inventory=inventory)
+        inventory = DynamoBackend._shrink_inventory(inventory, plans_a)
+
+        # Second model has no GPUs left
+        with pytest.raises(RuntimeError, match="No GPU nodes"):
+            plan_replica_placement(num_replicas=1, tp_size=1, _inventory=inventory)
+
+
+# ---------------------------------------------------------------------------
+# SubprocessError structured context
+# ---------------------------------------------------------------------------
+
+
+class TestSubprocessErrorContext:
+    """Verify SubprocessError carries debug_context."""
+
+    def test_raise_subprocess_error_includes_debug_context(self):
+        server = InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo")
+        backend = DynamoBackend(server)
+
+        with pytest.raises(SubprocessError) as exc_info:
+            backend._raise_subprocess_error("test_worker", "some log output", reason="crashed")
+
+        err = exc_info.value
+        assert err.debug_context["label"] == "test_worker"
+        assert err.debug_context["reason"] == "crashed"
+        assert "some log output" in err.debug_context["log_tail"]
+        assert "crashed" in str(err)
+
+    def test_subprocess_error_is_runtime_error(self):
+        """SubprocessError should be catchable as RuntimeError for backwards compatibility."""
+        err = SubprocessError("test", debug_context={"key": "val"})
+        assert isinstance(err, RuntimeError)
+        assert err.debug_context == {"key": "val"}

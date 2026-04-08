@@ -77,7 +77,10 @@ class InferenceModelConfig:
             isolated env).
         dynamo_config: Dynamo-specific configuration.
             Only used when ``backend="dynamo"``. Keys: ``namespace`` (default "curator"),
-            ``component`` (default "backend"), ``endpoint`` (default "generate").
+            ``request_plane`` (default "nats"), ``event_plane`` (default "nats"),
+            ``mode`` (set to "disagg" for disaggregated serving),
+            ``prefill_replicas`` / ``decode_replicas`` (disagg worker counts),
+            ``router_mode`` (default "kv", disagg frontend routing).
     """
 
     model_identifier: str
@@ -144,7 +147,8 @@ class InferenceServer:
     - ``"ray_serve"`` (default): Ray Serve + vLLM. Unified GPU scheduling with
       pipeline stages. Requires ``ray[serve,llm]``.
     - ``"dynamo"`` : NVIDIA Dynamo. Subprocess-based workers with KV-cache-aware
-      routing. Runs outside Ray — no unified GPU scheduling with pipeline stages.
+      routing. GPU resources are reserved via Ray actors so pipeline GPU stages
+      can coexist with executors that respect Ray's resource accounting.
       Requires ``ai-dynamo``.
 
     Args:
@@ -250,7 +254,11 @@ class InferenceServer:
         return f"http://{self._host}:{self.port}/v1"
 
     def _wait_for_healthy(self) -> None:
-        """Poll the /v1/models endpoint until all models are ready."""
+        """Poll the /v1/models endpoint until all models are ready.
+
+        TODO: Verify whether Ray Serve can return HTTP 200 with an empty
+        model list before tightening this check to also verify model names.
+        """
         models_url = f"{self.endpoint}/models"
         deadline = time.monotonic() + self.health_check_timeout_s
         attempt = 0

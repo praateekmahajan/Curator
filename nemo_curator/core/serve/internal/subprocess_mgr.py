@@ -15,9 +15,9 @@
 """Generic subprocess management for inference server backends.
 
 Provides Ray-actor-based subprocess lifecycle management, GPU placement
-planning, two-tier environment variable merging, and remote port
-discovery.  Backend implementations (Dynamo, vLLM direct, SGLang, etc.)
-compose these primitives to launch and monitor their specific processes.
+planning, environment variable propagation, and remote port discovery.
+Backend implementations compose these primitives to launch and monitor
+their specific processes.
 """
 
 from __future__ import annotations
@@ -277,7 +277,7 @@ def _define_subprocess_actor() -> type:  # noqa: C901
     frontend, vLLM workers, etc.).  GPU resources are configured per-instance
     via ``.options(num_gpus=...)``.
 
-    Two-phase initialization:
+    Four-phase initialization (orchestrated by ``spawn_actor``):
 
     1. **Create** the actor (lightweight ``__init__``).
     2. **Discover GPUs** via ``get_assigned_gpus()`` -- returns Ray-assigned
@@ -285,6 +285,8 @@ def _define_subprocess_actor() -> type:  # noqa: C901
     3. **Launch subprocess** via ``initialize(command, subprocess_env,
        log_file)`` -- applies *subprocess_env* as overrides on top of
        the actor's inherited ``os.environ``, then starts the process.
+    4. **Start run()** -- the returned ``ObjectRef`` resolves on exit,
+       enabling ``ray.wait()``-based liveness detection.
 
     The ``run()`` method blocks until the subprocess exits and is intended
     to be called as ``actor.run.remote()`` -- the returned ``ObjectRef``

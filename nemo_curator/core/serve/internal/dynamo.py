@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import http
+import json
 import os
 import shutil
 import sys
@@ -27,7 +28,14 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from nemo_curator.core.serve.internal.base import InferenceBackend
-from nemo_curator.core.serve.internal.constants import DEFAULT_ETCD_PORT, DEFAULT_NATS_PORT
+from nemo_curator.core.serve.internal.constants import (
+    DEFAULT_DYNAMO_EVENT_PLANE,
+    DEFAULT_DYNAMO_NAMESPACE,
+    DEFAULT_DYNAMO_REQUEST_PLANE,
+    DEFAULT_ETCD_PORT,
+    DEFAULT_NATS_PORT,
+)
+from nemo_curator.core.serve.internal.errors import SubprocessError
 from nemo_curator.core.serve.internal.subprocess_mgr import (
     ManagedSubprocess,
     NodeAllocation,
@@ -45,9 +53,10 @@ from nemo_curator.core.serve.internal.subprocess_mgr import (
     plan_replica_placement,
     spawn_actor,
 )
+from nemo_curator.core.serve.server import InferenceModelConfig
 
 if TYPE_CHECKING:
-    from nemo_curator.core.serve.server import InferenceModelConfig, InferenceServer
+    from nemo_curator.core.serve.server import InferenceServer
 
 
 class DynamoBackend(InferenceBackend):
@@ -66,9 +75,10 @@ class DynamoBackend(InferenceBackend):
       ``torch.distributed``.  Each rank is pinned to its planned node via
       ``NodeAffinitySchedulingStrategy``.
 
-    This backend does NOT participate in Ray's GPU scheduling -- pipelines
-    with GPU stages will fail-fast with a ``RuntimeError`` (enforced by
-    ``Pipeline.run()``).
+    This backend reserves GPUs via ``num_gpus`` on Ray actors, so
+    Ray's scheduler is aware of Dynamo's GPU usage.  Pipelines with GPU
+    stages can coexist when using executors that respect Ray's resource
+    accounting (e.g. ``RayDataExecutor``).
     """
 
     def __init__(self, server: InferenceServer) -> None:
@@ -84,6 +94,131 @@ class DynamoBackend(InferenceBackend):
         self._etcd_port: int | None = None
         self._nats_port: int | None = None
         self._actor_name_prefix: str = ""
+
+    @staticmethod
+    def _shrink_inventory(inventory: list[dict[str, Any]], plans: list[ReplicaPlan]) -> list[dict[str, Any]]:
+        """Remove GPUs consumed by *plans* from *inventory*, returning what remains."""
+        used: dict[str, int] = {}
+        for plan in plans:
+            for rank in plan.ranks:
+                used[rank.node_id] = used.get(rank.node_id, 0) + rank.num_gpus
+        return [
+            {**n, "num_gpus": n["num_gpus"] - used.get(n["node_id"], 0)}
+            for n in inventory
+            if n["num_gpus"] - used.get(n["node_id"], 0) > 0
+        ]
+
+    @staticmethod
+    def _plan_to_placement(
+        model_name: str, plan: ReplicaPlan, *, mode: str | None = None, role: str | None = None
+    ) -> dict[str, Any]:
+        """Convert a ReplicaPlan to a manifest-friendly dict."""
+        entry: dict[str, Any] = {
+            "model": model_name,
+            "replica": plan.replica_index,
+            "ranks": [{"node": r.node_ip, "gpus": r.num_gpus, "node_rank": r.node_rank} for r in plan.ranks],
+        }
+        if mode:
+            entry["mode"] = mode
+        if role:
+            entry["role"] = role
+        return entry
+
+    def _write_manifest(self, data: dict[str, Any], *, ready: bool) -> None:
+        """Write deployment manifest to ``{runtime_dir}/manifest.json`` and log it."""
+        manifest = {**data, "ready": ready, "timestamp": time.time()}
+
+        # Log manifest to driver logs so it's accessible even in multi-node
+        # clusters where the runtime dir may not be on a shared filesystem.
+        logger.info(f"Deployment manifest (ready={ready}): {json.dumps(manifest, indent=2)}")
+
+        if not self._runtime_dir:
+            return
+        manifest_path = os.path.join(self._runtime_dir, "manifest.json")
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+
+    @staticmethod
+    def _validate_frontend_config(server: InferenceServer) -> None:
+        """Reject mismatched namespace/request_plane/event_plane across models.
+
+        The Dynamo frontend uses a single namespace and plane config, taken
+        from the first model.  If other models specify different values,
+        they would be silently ignored — fail loud instead.
+        """
+        if len(server.models) <= 1:
+            return
+        first = server.models[0].dynamo_config
+        ref_ns = first.get("namespace", DEFAULT_DYNAMO_NAMESPACE)
+        ref_rp = first.get("request_plane", DEFAULT_DYNAMO_REQUEST_PLANE)
+        ref_ep = first.get("event_plane", DEFAULT_DYNAMO_EVENT_PLANE)
+        for i, m in enumerate(server.models[1:], start=1):
+            cfg = m.dynamo_config
+            ns = cfg.get("namespace", DEFAULT_DYNAMO_NAMESPACE)
+            rp = cfg.get("request_plane", DEFAULT_DYNAMO_REQUEST_PLANE)
+            ep = cfg.get("event_plane", DEFAULT_DYNAMO_EVENT_PLANE)
+            mismatches = []
+            if ns != ref_ns:
+                mismatches.append(f"namespace: {ns!r} vs {ref_ns!r}")
+            if rp != ref_rp:
+                mismatches.append(f"request_plane: {rp!r} vs {ref_rp!r}")
+            if ep != ref_ep:
+                mismatches.append(f"event_plane: {ep!r} vs {ref_ep!r}")
+            if mismatches:
+                model_name = m.model_name or m.model_identifier
+                msg = (
+                    f"Model '{model_name}' (index {i}) has frontend config that differs "
+                    f"from model 0: {', '.join(mismatches)}. All models must share the "
+                    f"same namespace, request_plane, and event_plane."
+                )
+                raise ValueError(msg)
+
+    @staticmethod
+    def _validate_gpu_requirements(server: InferenceServer, inventory: list[dict[str, Any]]) -> None:
+        """Coarse fail-fast: reject configs that obviously exceed cluster capacity.
+
+        This is an early rejection check, not proof of valid placement.
+        The authoritative placement is ``plan_replica_placement()`` against
+        the shared inventory.
+
+        Check A: disagg models require TP to fit on a single node.
+        Check B: total GPU demand across all models must not exceed supply.
+        """
+        max_gpus_per_node = max((n["num_gpus"] for n in inventory), default=0)
+        total_available = sum(n["num_gpus"] for n in inventory)
+        total_needed = 0
+
+        for model_config in server.models:
+            dynamo_cfg = model_config.dynamo_config
+            tp_size = model_config.engine_kwargs.get("tensor_parallel_size", 1)
+            is_disagg = dynamo_cfg.get("mode") == "disagg"
+            model_name = model_config.model_name or model_config.model_identifier
+
+            # Check A: disagg TP must fit on a single node
+            if is_disagg and tp_size > max_gpus_per_node:
+                msg = (
+                    f"Model '{model_name}' requests TP={tp_size} in disaggregated mode, "
+                    f"but max GPUs per node is {max_gpus_per_node}. "
+                    f"Disaggregated mode does not support multi-node TP."
+                )
+                raise ValueError(msg)
+
+            # Accumulate total GPU demand
+            if is_disagg:
+                num_prefill = dynamo_cfg.get("prefill_replicas", 1)
+                num_decode = dynamo_cfg.get("decode_replicas", 1)
+                total_needed += (num_prefill + num_decode) * tp_size
+            else:
+                num_replicas = DynamoBackend._resolve_num_replicas(model_config)
+                total_needed += num_replicas * tp_size
+
+        # Check B: aggregate overcommit
+        if total_needed > total_available:
+            msg = (
+                f"Models require {total_needed} GPUs total but only "
+                f"{total_available} available across {len(inventory)} node(s)."
+            )
+            raise ValueError(msg)
 
     # ------------------------------------------------------------------
     # Start
@@ -161,6 +296,14 @@ class DynamoBackend(InferenceBackend):
         """Launch infra, workers for all models, frontend and wait for health."""
         infra_node_id = self._infra_node_id
 
+        # Build GPU inventory once; each model's placement shrinks it so
+        # subsequent models are assigned to different GPUs.
+        inventory = _get_gpu_inventory(head_node_id, nodes=cluster_nodes)
+
+        # Fail-fast validations before starting any infrastructure (etcd/NATS).
+        self._validate_gpu_requirements(server, inventory)
+        self._validate_frontend_config(server)
+
         # Infrastructure -- on infra node (head or first non-head when excluded)
         if not server.etcd_endpoint:
             self._etcd_actor = self._start_etcd(actor_cls, infra_node_id, self._etcd_port)
@@ -171,19 +314,17 @@ class DynamoBackend(InferenceBackend):
         nats_url = server.nats_url or f"nats://{self._infra_ip}:{self._nats_port}"
         base_env = {"ETCD_ENDPOINTS": etcd_endpoint, "NATS_SERVER": nats_url}
 
-        # Build GPU inventory once; each model's placement shrinks it so
-        # subsequent models are assigned to different GPUs.
-        inventory = _get_gpu_inventory(head_node_id, nodes=cluster_nodes)
         expected_models: set[str] = set()
         has_disagg = False
+        placements: list[dict[str, Any]] = []
 
         for model_config in server.models:
             dynamo_cfg = model_config.dynamo_config
             tp_size = model_config.engine_kwargs.get("tensor_parallel_size", 1)
             num_replicas = self._resolve_num_replicas(model_config)
-            namespace = dynamo_cfg.get("namespace", "curator")
-            request_plane = dynamo_cfg.get("request_plane", "nats")
-            event_plane = dynamo_cfg.get("event_plane", "nats")
+            namespace = dynamo_cfg.get("namespace", DEFAULT_DYNAMO_NAMESPACE)
+            request_plane = dynamo_cfg.get("request_plane", DEFAULT_DYNAMO_REQUEST_PLANE)
+            event_plane = dynamo_cfg.get("event_plane", DEFAULT_DYNAMO_EVENT_PLANE)
             is_disagg = dynamo_cfg.get("mode") == "disagg"
             if is_disagg:
                 has_disagg = True
@@ -193,16 +334,17 @@ class DynamoBackend(InferenceBackend):
             logger.info(f"Deploying model '{model_name}' (TP={tp_size}, replicas={num_replicas})")
 
             if is_disagg:
-                self._launch_disagg_workers(
+                plans_with_roles, inventory = self._launch_disagg_workers(
                     actor_cls,
                     model_config,
                     base_env,
-                    head_node_id=head_node_id,
-                    cluster_nodes=cluster_nodes,
+                    inventory=inventory,
                     namespace=namespace,
                     request_plane=request_plane,
                     event_plane=event_plane,
                 )
+                for plan, role in plans_with_roles:
+                    placements.append(self._plan_to_placement(model_name, plan, mode="disagg", role=role))
             else:
                 plans = plan_replica_placement(num_replicas, tp_size, _inventory=inventory)
                 self._launch_replicas(
@@ -214,22 +356,26 @@ class DynamoBackend(InferenceBackend):
                     request_plane=request_plane,
                     event_plane=event_plane,
                 )
-                # Shrink inventory so the next model gets different GPUs.
-                used: dict[str, int] = {}
+                inventory = self._shrink_inventory(inventory, plans)
                 for plan in plans:
-                    for rank in plan.ranks:
-                        used[rank.node_id] = used.get(rank.node_id, 0) + rank.num_gpus
-                inventory = [
-                    {**n, "num_gpus": n["num_gpus"] - used.get(n["node_id"], 0)}
-                    for n in inventory
-                    if n["num_gpus"] - used.get(n["node_id"], 0) > 0
-                ]
+                    placements.append(self._plan_to_placement(model_name, plan))
+
+        # Write initial manifest before frontend launch (ready=False).
+        manifest_data = {
+            "models": sorted(expected_models),
+            "endpoint": server.endpoint,
+            "etcd": etcd_endpoint,
+            "nats": nats_url,
+            "port": server.port,
+            "placements": placements,
+        }
+        self._write_manifest(manifest_data, ready=False)
 
         # Frontend -- co-located with infra, auto-discovers all registered models
         first_cfg = server.models[0].dynamo_config
-        namespace = first_cfg.get("namespace", "curator")
-        request_plane = first_cfg.get("request_plane", "nats")
-        event_plane = first_cfg.get("event_plane", "nats")
+        namespace = first_cfg.get("namespace", DEFAULT_DYNAMO_NAMESPACE)
+        request_plane = first_cfg.get("request_plane", DEFAULT_DYNAMO_REQUEST_PLANE)
+        event_plane = first_cfg.get("event_plane", DEFAULT_DYNAMO_EVENT_PLANE)
         router_mode = first_cfg.get("router_mode", "kv") if has_disagg else None
         frontend_runtime_env = self._merge_model_runtime_envs(server.models)
         self._frontend_actor = self._launch_frontend(
@@ -248,18 +394,23 @@ class DynamoBackend(InferenceBackend):
         # (is_alive, read_log_tail) remain valid for subprocess liveness checks.
         self._wait_for_models(server, expected_models)
 
+        # Update manifest after successful health check (ready=True).
+        self._write_manifest(manifest_data, ready=True)
+
     def _wait_for_models(self, server: InferenceServer, expected_models: set[str]) -> None:
         """Poll ``/v1/models`` until all *expected_models* appear in the response.
 
         Also checks subprocess liveness via Ray actors periodically.  If any
         crash, reads their log tail and raises immediately with the output.
         """
-        import json
         import urllib.request
 
         models_url = f"{server.endpoint}/models"
         deadline = time.monotonic() + server.health_check_timeout_s
+        start_time = time.monotonic()
         attempt = 0
+        last_error: str | None = None
+        models_found: set[str] = set()
         while time.monotonic() < deadline:
             attempt += 1
 
@@ -269,27 +420,38 @@ class DynamoBackend(InferenceBackend):
                 resp = urllib.request.urlopen(models_url, timeout=5)  # noqa: S310
                 if resp.status == http.HTTPStatus.OK:
                     body = json.loads(resp.read())
-                    ids = {m["id"] for m in body.get("data", [])}
-                    if expected_models.issubset(ids):
+                    models_found = {m["id"] for m in body.get("data", [])}
+                    if expected_models.issubset(models_found):
                         logger.info(
                             f"All Dynamo models registered after {attempt} health check(s): {sorted(expected_models)}"
                         )
                         return
                     if server.verbose:
-                        missing = sorted(expected_models - ids)
-                        logger.debug(f"Models so far: {sorted(ids)}, waiting for: {missing}")
-            except Exception:  # noqa: BLE001
+                        missing = sorted(expected_models - models_found)
+                        logger.debug(f"Models so far: {sorted(models_found)}, waiting for: {missing}")
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
                 if server.verbose:
                     logger.debug(f"Health check attempt {attempt} failed, retrying...")
             time.sleep(2)
 
         # Final liveness check before giving up -- surface crash info if available
         self._check_subprocess_health()
+        elapsed_s = round(time.monotonic() - start_time, 1)
         msg = (
             f"Models {sorted(expected_models)} did not all appear at {models_url} "
             f"within {server.health_check_timeout_s}s"
         )
-        raise TimeoutError(msg)
+        raise SubprocessError(
+            msg,
+            debug_context={
+                "backend": "dynamo",
+                "models_expected": sorted(expected_models),
+                "models_found": sorted(models_found),
+                "elapsed_s": elapsed_s,
+                "last_error": last_error,
+            },
+        )
 
     def _check_subprocess_health(self) -> None:
         """Check subprocess liveness via run refs and ``is_alive()`` fallback.
@@ -367,10 +529,13 @@ class DynamoBackend(InferenceBackend):
 
     @staticmethod
     def _raise_subprocess_error(label: str, log_tail: str, *, reason: str) -> None:
-        """Raise ``RuntimeError`` with formatted subprocess crash info."""
+        """Raise ``SubprocessError`` with formatted subprocess crash info."""
         tail = "\n".join(log_tail.splitlines()[-50:]) if log_tail else "(no log output)"
         msg = f"Dynamo {label} {reason}.\n\n--- {label} log (last 50 lines) ---\n{tail}"
-        raise RuntimeError(msg)
+        raise SubprocessError(
+            msg,
+            debug_context={"label": label, "reason": reason, "log_tail": tail},
+        )
 
     def _resolve_infra_node(self, cluster_nodes: list[dict[str, Any]], head_node_id: str) -> tuple[str, str]:
         """Pick the node that should host etcd, NATS, and the frontend.
@@ -399,15 +564,12 @@ class DynamoBackend(InferenceBackend):
 
         Returns ``None`` when no model specifies a ``runtime_env``.
         """
-        merged: dict[str, Any] = {}
-        for m in models:
-            if not m.runtime_env:
-                continue
-            env_vars = {**merged.get("env_vars", {}), **m.runtime_env.get("env_vars", {})}
-            merged.update(m.runtime_env)
-            if env_vars:
-                merged["env_vars"] = env_vars
-        return merged or None
+        from functools import reduce
+
+        envs = [m.runtime_env for m in models if m.runtime_env]
+        if not envs:
+            return None
+        return reduce(InferenceModelConfig._merge_runtime_envs, envs) or None
 
     @staticmethod
     def _resolve_num_replicas(model_config: InferenceModelConfig) -> int:
@@ -533,12 +695,11 @@ class DynamoBackend(InferenceBackend):
         model_config: InferenceModelConfig,
         base_env: dict[str, str],
         *,
-        head_node_id: str,
-        cluster_nodes: list[dict[str, Any]],
+        inventory: list[dict[str, Any]],
         namespace: str,
         request_plane: str,
         event_plane: str,
-    ) -> None:
+    ) -> tuple[list[tuple[ReplicaPlan, str]], list[dict[str, Any]]]:
         """Launch separate prefill and decode worker pools for disaggregated serving.
 
         Each worker gets ``tp_size`` GPUs on a single node.  Workers are placed
@@ -551,17 +712,19 @@ class DynamoBackend(InferenceBackend):
         The ``dynamo_config`` dict on *model_config* controls pool sizes:
         - ``prefill_replicas`` (default 1): number of prefill workers
         - ``decode_replicas`` (default 1): number of decode workers
-        """
-        import json
 
+        Returns:
+            Tuple of (list of (plan, role) pairs, remaining GPU inventory).
+            Role is ``"decode"`` or ``"prefill"``.
+        """
         dynamo_cfg = model_config.dynamo_config
         num_prefill = dynamo_cfg.get("prefill_replicas", 1)
         num_decode = dynamo_cfg.get("decode_replicas", 1)
         total_workers = num_prefill + num_decode
         tp_size = model_config.engine_kwargs.get("tensor_parallel_size", 1)
 
-        # Plan placement: one allocation per worker
-        plans = plan_replica_placement(total_workers, tp_size, head_node_id, _nodes=cluster_nodes)
+        # Plan placement against the shared inventory (same as non-disagg path).
+        plans = plan_replica_placement(total_workers, tp_size, _inventory=inventory)
 
         for plan in plans:
             if plan.is_multi_node:
@@ -692,6 +855,8 @@ class DynamoBackend(InferenceBackend):
             f"Disaggregated serving: {num_decode} decode + {num_prefill} prefill "
             f"workers launched ({total_workers * tp_size} GPUs total, TP={tp_size})"
         )
+        plans_with_roles = [(plans[i], "decode" if i < num_decode else "prefill") for i in range(total_workers)]
+        return plans_with_roles, self._shrink_inventory(inventory, plans)
 
     def _launch_worker(  # noqa: PLR0913
         self,
