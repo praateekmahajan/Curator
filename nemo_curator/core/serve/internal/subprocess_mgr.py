@@ -334,7 +334,6 @@ def _define_subprocess_actor(actor_type: str = "SubprocessActor") -> type:  # no
     """
     import ray
 
-    @ray.remote(num_cpus=1, num_gpus=0, max_concurrency=2)
     class _SubprocessActor:
         """Manages a subprocess on a Ray node with optional file-based logging.
 
@@ -430,9 +429,10 @@ def _define_subprocess_actor(actor_type: str = "SubprocessActor") -> type:  # no
                 self._log_fh.close()
             return rc
 
+    # Set name BEFORE applying @ray.remote so Ray captures the descriptive name.
     _SubprocessActor.__name__ = actor_type
     _SubprocessActor.__qualname__ = actor_type
-    return _SubprocessActor
+    return ray.remote(num_cpus=1, num_gpus=0, max_concurrency=2)(_SubprocessActor)
 
 
 # ---------------------------------------------------------------------------
