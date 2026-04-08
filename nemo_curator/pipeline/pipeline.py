@@ -200,25 +200,20 @@ class Pipeline:
                 names = ", ".join(s.name for s in gpu_stages)
                 from nemo_curator.backends.xenna import XennaExecutor
 
-                if backend == "ray_serve" and isinstance(executor, XennaExecutor):
+                if isinstance(executor, XennaExecutor):
                     msg = (
-                        f"Cannot run XennaExecutor with GPU stages [{names}] while Ray Serve is active. "
-                        "Xenna manages GPU assignment independently of Ray's resource scheduler, "
-                        "which causes GPU contention with served models. "
+                        f"Cannot run XennaExecutor with GPU stages [{names}] while "
+                        f"{backend} inference server is active. Xenna manages GPU "
+                        "assignment independently of Ray's resource scheduler, which "
+                        "causes GPU contention with served models. "
                         "Use RayDataExecutor instead."
                     )
                     raise RuntimeError(msg)
-                elif backend == "ray_serve":
+                else:
                     logger.info(
-                        f"Ray Serve is active and pipeline has GPU stages: [{names}]. "
-                        "The executor will schedule GPU stages on GPUs not held by Serve."
+                        f"{backend} inference server is active and pipeline has GPU "
+                        f"stages: [{names}]. The executor will schedule GPU stages "
+                        "on GPUs not held by the inference server."
                     )
-                elif backend == "dynamo":
-                    msg = (
-                        f"Cannot run pipeline with GPU stages [{names}] while Dynamo inference "
-                        "server is active. Dynamo runs outside Ray and does not participate in "
-                        "GPU scheduling."
-                    )
-                    raise RuntimeError(msg)
 
         return executor.execute(self.stages, initial_tasks)
