@@ -71,8 +71,10 @@ class InferenceModelConfig:
             Only used when ``backend="ray_serve"``.
         engine_kwargs: vLLM engine keyword arguments (tensor_parallel_size, etc.).
             Common to both Ray Serve and Dynamo backends.
-        runtime_env: Ray runtime environment configuration.
-            Only used when ``backend="ray_serve"``.
+        runtime_env: Ray runtime environment configuration (e.g. ``pip`` packages).
+            For Ray Serve, passed to ``LLMConfig``.  For Dynamo, applied to
+            worker and frontend actors (e.g. to install ``ai-dynamo`` in an
+            isolated env).
         dynamo_config: Dynamo-specific configuration.
             Only used when ``backend="dynamo"``. Keys: ``namespace`` (default "curator"),
             ``component`` (default "backend"), ``endpoint`` (default "generate").

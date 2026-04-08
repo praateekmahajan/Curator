@@ -18,21 +18,18 @@ import os
 import pytest
 
 from nemo_curator.core.serve.internal.subprocess_mgr import (
-    WORKER_SPECIFIC_ENV_VARS,
     ManagedSubprocess,
     NodeAllocation,
     ReplicaPlan,
     _define_subprocess_actor,
     _engine_kwargs_to_cli_flags,
-    _get_driver_env_vars,
     _ignore_head_node,
-    _merge_subprocess_env,
     _resolve_node_ip,
     plan_replica_placement,
 )
 
 # ---------------------------------------------------------------------------
-# engine_kwargs → CLI flags
+# engine_kwargs -> CLI flags
 # ---------------------------------------------------------------------------
 
 
@@ -91,7 +88,7 @@ class TestReplicaPlan:
 
 
 # ---------------------------------------------------------------------------
-# GPU placement planner — mocked inventory (no Ray needed)
+# GPU placement planner -- mocked inventory (no Ray needed)
 # ---------------------------------------------------------------------------
 
 
@@ -207,14 +204,14 @@ class TestHeadNodePolicy:
                 assert rank.node_id != "n1", "Worker should not be on head node"
 
     def test_no_eligible_nodes_raises(self, monkeypatch: pytest.MonkeyPatch):
-        """Single head-only node + flag → clear error."""
+        """Single head-only node + flag -> clear error."""
         monkeypatch.setenv("CURATOR_IGNORE_RAY_HEAD_NODE", "1")
         inv = [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 8, "is_head": True}]
         with pytest.raises(RuntimeError, match="CURATOR_IGNORE_RAY_HEAD_NODE"):
             plan_replica_placement(num_replicas=1, tp_size=1, _inventory=inv)
 
     def test_deterministic_ordering(self):
-        """Same inventory → same plan every time, head first."""
+        """Same inventory -> same plan every time, head first."""
         inv = self._inventory_head_and_workers()
         plans_a = plan_replica_placement(num_replicas=3, tp_size=4, _inventory=inv)
         plans_b = plan_replica_placement(num_replicas=3, tp_size=4, _inventory=inv)
@@ -231,7 +228,7 @@ class TestHeadNodePolicy:
         assert plans[2].ranks[0].node_id == "n3"
 
     def test_multi_replica_stable_plans(self, monkeypatch: pytest.MonkeyPatch):
-        """Multiple replicas with head excluded → stable assignment by node_id."""
+        """Multiple replicas with head excluded -> stable assignment by node_id."""
         monkeypatch.setenv("CURATOR_IGNORE_RAY_HEAD_NODE", "true")
         inv = self._inventory_head_and_workers()
         plans = plan_replica_placement(num_replicas=2, tp_size=4, _inventory=inv)
@@ -256,7 +253,7 @@ class TestHeadNodePolicy:
 
 
 # ---------------------------------------------------------------------------
-# GPU placement planner — real Ray cluster
+# GPU placement planner -- real Ray cluster
 # ---------------------------------------------------------------------------
 
 
@@ -272,7 +269,7 @@ class TestGpuPlacement:
         assert plans[1].ranks[0].num_gpus == 1
 
     def test_placement_tp2(self):
-        """TP=2 on 2 GPUs → 1 replica, 1 rank, 2 GPUs."""
+        """TP=2 on 2 GPUs -> 1 replica, 1 rank, 2 GPUs."""
         plans = plan_replica_placement(num_replicas=1, tp_size=2)
         assert len(plans) == 1
         assert plans[0].ranks[0].num_gpus == 2
@@ -289,48 +286,7 @@ class TestGpuPlacement:
 
 
 # ---------------------------------------------------------------------------
-# Two-tier env propagation
-# ---------------------------------------------------------------------------
-
-
-class TestEnvPropagation:
-    def test_driver_env_excludes_worker_specific_vars(self, monkeypatch: pytest.MonkeyPatch):
-        """CUDA_VISIBLE_DEVICES and other worker-specific vars must not appear in driver env."""
-        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
-        monkeypatch.setenv("VLLM_NIXL_SIDE_CHANNEL_PORT", "20097")
-        monkeypatch.setenv("PATH", "/usr/bin")
-        driver = _get_driver_env_vars()
-        for var in WORKER_SPECIFIC_ENV_VARS:
-            assert var not in driver
-        assert "PATH" in driver
-
-    def test_driver_env_includes_etcd_nats(self, monkeypatch: pytest.MonkeyPatch):
-        """ETCD_ENDPOINTS and NATS_SERVER are cluster-wide and belong in driver tier."""
-        monkeypatch.setenv("ETCD_ENDPOINTS", "http://10.0.0.1:2379")
-        monkeypatch.setenv("NATS_SERVER", "nats://10.0.0.1:4222")
-        driver = _get_driver_env_vars()
-        assert driver["ETCD_ENDPOINTS"] == "http://10.0.0.1:2379"
-        assert driver["NATS_SERVER"] == "nats://10.0.0.1:4222"
-
-    def test_worker_env_overwrites_driver(self):
-        """Worker-tier vars overwrite any driver value when merged."""
-        actor_env = {"CUDA_VISIBLE_DEVICES": "0,1,2,3", "PATH": "/usr/bin"}
-        driver = {"CUDA_VISIBLE_DEVICES": "0,1,2,3", "PATH": "/usr/bin"}
-        worker = {"CUDA_VISIBLE_DEVICES": "2,3"}
-        merged = _merge_subprocess_env(actor_env, driver, worker)
-        assert merged["CUDA_VISIBLE_DEVICES"] == "2,3"
-
-    def test_worker_specific_env_vars_complete(self):
-        """Ensure the set contains the expected GPU and per-worker vars."""
-        assert "CUDA_VISIBLE_DEVICES" in WORKER_SPECIFIC_ENV_VARS
-        assert "HIP_VISIBLE_DEVICES" in WORKER_SPECIFIC_ENV_VARS
-        assert "ROCR_VISIBLE_DEVICES" in WORKER_SPECIFIC_ENV_VARS
-        assert "LOCAL_RANK" in WORKER_SPECIFIC_ENV_VARS
-        assert "VLLM_NIXL_SIDE_CHANNEL_PORT" in WORKER_SPECIFIC_ENV_VARS
-
-
-# ---------------------------------------------------------------------------
-# Network addressing — _resolve_node_ip (mocked ray.nodes())
+# Network addressing -- _resolve_node_ip (mocked ray.nodes())
 # ---------------------------------------------------------------------------
 
 _RAY_NODES = [
@@ -391,7 +347,7 @@ class TestSubprocessActorLifecycle:
         actor_cls = _define_subprocess_actor()
         actor_name = f"test_liveness_death_{os.getpid()}"
         actor = actor_cls.options(name=actor_name, lifetime="detached").remote()
-        status = ray.get(actor.initialize.remote(["sleep", "3600"], _get_driver_env_vars(), {}, None), timeout=30)
+        status = ray.get(actor.initialize.remote(["sleep", "3600"], {}, None), timeout=30)
         assert status["pid"] > 0
         run_ref = actor.run.remote()
         proc = ManagedSubprocess(label="death", actor=actor, run_ref=run_ref)
@@ -405,3 +361,96 @@ class TestSubprocessActorLifecycle:
             with contextlib.suppress(Exception):
                 ray.kill(proc.actor, no_restart=True)
             raise
+
+
+# ---------------------------------------------------------------------------
+# Subprocess env propagation (real subprocesses, real Ray cluster)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.gpu
+@pytest.mark.usefixtures("shared_ray_client")
+class TestSubprocessEnvPropagation:
+    """Validate the simplified single-dict subprocess_env model.
+
+    Actors inherit ``os.environ`` from the raylet (which shares the
+    driver's base environment).  Only runtime-computed vars (e.g.
+    ``ETCD_ENDPOINTS``) need explicit passing via ``subprocess_env``.
+    """
+
+    def _run_subprocess(
+        self,
+        command: list[str],
+        subprocess_env: dict[str, str] | None = None,
+        *,
+        tmp_path: os.PathLike,
+        label: str = "env_test",
+    ) -> str:
+        """Spawn a subprocess actor, run *command*, return log output."""
+        import ray
+
+        actor_cls = _define_subprocess_actor()
+        actor_name = f"test_{label}_{os.getpid()}"
+        actor = actor_cls.options(name=actor_name, lifetime="detached").remote()
+        log_file = str(tmp_path / f"{label}.log")
+
+        try:
+            ray.get(
+                actor.initialize.remote(command, subprocess_env or {}, log_file),
+                timeout=30,
+            )
+            run_ref = actor.run.remote()
+            ray.get(run_ref, timeout=10)
+            return ray.get(actor.read_log_tail.remote(), timeout=10)
+        finally:
+            with contextlib.suppress(Exception):
+                ray.kill(actor, no_restart=True)
+
+    def test_pre_existing_env_inherited_without_propagation(self, tmp_path: os.PathLike):
+        """Subprocess sees PATH from the raylet without any explicit propagation."""
+        log = self._run_subprocess(
+            ["bash", "-c", "echo PATH=$PATH"],
+            subprocess_env={},
+            tmp_path=tmp_path,
+            label="inherit",
+        )
+        assert "PATH=/" in log, f"PATH should be inherited from raylet, got: {log!r}"
+
+    def test_post_init_var_not_inherited(self, tmp_path: os.PathLike):
+        """Vars set after ray.init() are NOT in the actor's env -- explicit passing is needed."""
+        sentinel = f"CURATOR_SENTINEL_{os.getpid()}"
+        os.environ[sentinel] = "hello_from_driver"
+
+        try:
+            log = self._run_subprocess(
+                ["bash", "-c", f"echo val=${{{sentinel}:-MISSING}}"],
+                subprocess_env={},
+                tmp_path=tmp_path,
+                label="post_init",
+            )
+            assert "val=MISSING" in log, (
+                f"Post-ray.init var should NOT be in actor env without explicit propagation, got: {log!r}"
+            )
+        finally:
+            os.environ.pop(sentinel, None)
+
+    def test_explicit_overrides_reach_subprocess(self, tmp_path: os.PathLike):
+        """Explicit vars passed via subprocess_env reach the subprocess."""
+        log = self._run_subprocess(
+            ["bash", "-c", "echo etcd=$ETCD_ENDPOINTS"],
+            subprocess_env={"ETCD_ENDPOINTS": "http://10.0.0.1:2379"},
+            tmp_path=tmp_path,
+            label="overwrite",
+        )
+        assert "etcd=http://10.0.0.1:2379" in log
+
+    def test_overrides_do_not_clobber_inherited_vars(self, tmp_path: os.PathLike):
+        """Passing targeted overrides doesn't clobber inherited PATH."""
+        log = self._run_subprocess(
+            ["bash", "-c", "echo PATH=$PATH && echo etcd=$ETCD_ENDPOINTS"],
+            subprocess_env={"ETCD_ENDPOINTS": "http://10.0.0.1:2379"},
+            tmp_path=tmp_path,
+            label="no_clobber",
+        )
+        assert "PATH=/" in log, f"PATH should survive targeted overwrite, got: {log!r}"
+        assert "etcd=http://10.0.0.1:2379" in log

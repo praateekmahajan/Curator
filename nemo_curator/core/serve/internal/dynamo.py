@@ -35,7 +35,6 @@ from nemo_curator.core.serve.internal.subprocess_mgr import (
     _check_binary,
     _define_subprocess_actor,
     _engine_kwargs_to_cli_flags,
-    _get_driver_env_vars,
     _get_gpu_inventory,
     _ignore_head_node,
     _kill_actor,
@@ -232,16 +231,17 @@ class DynamoBackend(InferenceBackend):
         request_plane = first_cfg.get("request_plane", "nats")
         event_plane = first_cfg.get("event_plane", "nats")
         router_mode = first_cfg.get("router_mode", "kv") if has_disagg else None
-        frontend_driver_env = _get_driver_env_vars(base_env)
+        frontend_runtime_env = self._merge_model_runtime_envs(server.models)
         self._frontend_actor = self._launch_frontend(
             actor_cls,
             infra_node_id,
             server.port,
-            frontend_driver_env,
+            base_env,
             namespace=namespace,
             request_plane=request_plane,
             event_plane=event_plane,
             router_mode=router_mode,
+            runtime_env=frontend_runtime_env,
         )
 
         # Health check — must stay inside ray.init context so actor handles
@@ -394,6 +394,22 @@ class DynamoBackend(InferenceBackend):
         return infra["NodeID"], infra["NodeManagerAddress"]
 
     @staticmethod
+    def _merge_model_runtime_envs(models: list[InferenceModelConfig]) -> dict[str, Any] | None:
+        """Merge ``runtime_env`` dicts from all model configs for the frontend.
+
+        Returns ``None`` when no model specifies a ``runtime_env``.
+        """
+        merged: dict[str, Any] = {}
+        for m in models:
+            if not m.runtime_env:
+                continue
+            env_vars = {**merged.get("env_vars", {}), **m.runtime_env.get("env_vars", {})}
+            merged.update(m.runtime_env)
+            if env_vars:
+                merged["env_vars"] = env_vars
+        return merged or None
+
+    @staticmethod
     def _resolve_num_replicas(model_config: InferenceModelConfig) -> int:
         num = model_config.deployment_config.get("num_replicas", 0)
         if num and num > 0:
@@ -434,7 +450,7 @@ class DynamoBackend(InferenceBackend):
             node_alloc,
             runtime_dir=self._runtime_dir,
             actor_name_prefix=self._actor_name_prefix,
-            driver_env=_get_driver_env_vars({"ALLOW_NONE_AUTHENTICATION": "yes"}),
+            subprocess_env={"ALLOW_NONE_AUTHENTICATION": "yes"},
         )
 
         logger.info(f"Starting etcd on port {port} via {self._infra_ip}")
@@ -604,8 +620,8 @@ class DynamoBackend(InferenceBackend):
                 rank0,
                 runtime_dir=self._runtime_dir,
                 actor_name_prefix=self._actor_name_prefix,
-                driver_env=_get_driver_env_vars(base_env),
-                worker_env={"VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port), "PYTHONHASHSEED": "0"},
+                subprocess_env={**base_env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port), "PYTHONHASHSEED": "0"},
+                runtime_env=model_config.runtime_env or None,
             )
             self._worker_actors.append(proc)
             worker_index += 1
@@ -666,8 +682,8 @@ class DynamoBackend(InferenceBackend):
                 rank0,
                 runtime_dir=self._runtime_dir,
                 actor_name_prefix=self._actor_name_prefix,
-                driver_env=_get_driver_env_vars(base_env),
-                worker_env={"VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port), "PYTHONHASHSEED": "0"},
+                subprocess_env={**base_env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port), "PYTHONHASHSEED": "0"},
+                runtime_env=model_config.runtime_env or None,
             )
             self._worker_actors.append(proc)
             worker_index += 1
@@ -736,7 +752,8 @@ class DynamoBackend(InferenceBackend):
             node_alloc,
             runtime_dir=self._runtime_dir,
             actor_name_prefix=self._actor_name_prefix,
-            driver_env=_get_driver_env_vars(base_env),
+            subprocess_env=base_env,
+            runtime_env=model_config.runtime_env or None,
         )
 
     def _launch_headless_worker(  # noqa: PLR0913
@@ -779,7 +796,8 @@ class DynamoBackend(InferenceBackend):
             node_alloc,
             runtime_dir=self._runtime_dir,
             actor_name_prefix=self._actor_name_prefix,
-            driver_env=_get_driver_env_vars(base_env),
+            subprocess_env=base_env,
+            runtime_env=model_config.runtime_env or None,
         )
 
     def _launch_frontend(  # noqa: PLR0913
@@ -787,14 +805,15 @@ class DynamoBackend(InferenceBackend):
         actor_cls: type,
         infra_node_id: str,
         port: int,
-        driver_env: dict[str, str],
+        base_env: dict[str, str],
         *,
         namespace: str,
         request_plane: str,
         event_plane: str,
         router_mode: str | None = None,
+        runtime_env: dict[str, Any] | None = None,
     ) -> ManagedSubprocess:
-        frontend_env = dict(driver_env)
+        frontend_env = dict(base_env)
         if router_mode:
             frontend_env["PYTHONHASHSEED"] = "0"
         command = [
@@ -824,7 +843,8 @@ class DynamoBackend(InferenceBackend):
             node_alloc,
             runtime_dir=self._runtime_dir,
             actor_name_prefix=self._actor_name_prefix,
-            driver_env=frontend_env,
+            subprocess_env=frontend_env,
+            runtime_env=runtime_env,
         )
 
     # ------------------------------------------------------------------

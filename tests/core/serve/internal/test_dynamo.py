@@ -22,7 +22,6 @@ from nemo_curator.core.serve.internal.dynamo import DynamoBackend
 from nemo_curator.core.serve.internal.subprocess_mgr import (
     ManagedSubprocess,
     _define_subprocess_actor,
-    _get_driver_env_vars,
     plan_replica_placement,
 )
 
@@ -228,7 +227,7 @@ class TestDynamoLiveness:
         actor_cls = _define_subprocess_actor()
         actor_name = f"test_liveness_{label}_{os.getpid()}"
         actor = actor_cls.options(name=actor_name, lifetime="detached").remote()
-        status = ray.get(actor.initialize.remote(command, _get_driver_env_vars(), {}, None), timeout=30)
+        status = ray.get(actor.initialize.remote(command, {}, None), timeout=30)
         assert status["pid"] > 0, f"Actor {actor_name} failed to start subprocess"
         run_ref = actor.run.remote()
         return ManagedSubprocess(label=label, actor=actor, run_ref=run_ref)
@@ -241,7 +240,7 @@ class TestDynamoLiveness:
         actor_cls = _define_subprocess_actor()
         actor = actor_cls.options(name=f"test_log_context_{os.getpid()}", lifetime="detached").remote()
         command = ["bash", "-c", "echo 'FATAL: something went wrong' && exit 1"]
-        ray.get(actor.initialize.remote(command, _get_driver_env_vars(), {}, log_file))
+        ray.get(actor.initialize.remote(command, {}, log_file))
         run_ref = actor.run.remote()
         proc = ManagedSubprocess(label="test_worker", actor=actor, run_ref=run_ref, log_file=log_file)
 
@@ -293,7 +292,7 @@ class TestDynamoLiveness:
 
         actor_cls = _define_subprocess_actor()
         actor = actor_cls.options(name=f"test_exit_detect_{os.getpid()}", lifetime="detached").remote()
-        ray.get(actor.initialize.remote(["true"], _get_driver_env_vars(), {}, None))
+        ray.get(actor.initialize.remote(["true"], {}, None))
         run_ref = actor.run.remote()
         proc = ManagedSubprocess(label="exited_worker", actor=actor, run_ref=run_ref)
 

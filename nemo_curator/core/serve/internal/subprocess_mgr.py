@@ -267,44 +267,7 @@ def _stop_subprocess(proc: Any, sigterm_wait: float = _SIGTERM_WAIT_S) -> int | 
     return proc.returncode
 
 
-WORKER_SPECIFIC_ENV_VARS: set[str] = {
-    "CUDA_VISIBLE_DEVICES",
-    "HIP_VISIBLE_DEVICES",
-    "ROCR_VISIBLE_DEVICES",
-    "LOCAL_RANK",
-    "VLLM_NIXL_SIDE_CHANNEL_PORT",
-}
-
 _NOSET_CUDA_RUNTIME_ENV: dict[str, Any] = {"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}}
-
-
-def _merge_subprocess_env(
-    actor_env: dict[str, str],
-    driver_env: dict[str, str],
-    worker_env: dict[str, str],
-) -> dict[str, str]:
-    """Merge driver and worker env vars using the vLLM-style two-tier policy.
-
-    *driver_env* is applied with ``setdefault`` (node-local values win).
-    *worker_env* is applied with direct overwrite (explicit GPU assignment, etc.).
-    """
-    merged = dict(actor_env)
-    for k, v in driver_env.items():
-        merged.setdefault(k, v)
-    merged.update(worker_env)
-    return merged
-
-
-def _get_driver_env_vars(extra_env: dict[str, str] | None = None) -> dict[str, str]:
-    """Return driver-tier environment: ``os.environ`` minus worker-specific vars.
-
-    These are applied with ``setdefault`` on the actor so node-local values win.
-    Optional *extra_env* is merged on top (e.g. ``ALLOW_NONE_AUTHENTICATION``).
-    """
-    driver = {k: v for k, v in os.environ.items() if k not in WORKER_SPECIFIC_ENV_VARS}
-    if extra_env:
-        driver.update(extra_env)
-    return driver
 
 
 def _define_subprocess_actor() -> type:  # noqa: C901
@@ -319,10 +282,9 @@ def _define_subprocess_actor() -> type:  # noqa: C901
     1. **Create** the actor (lightweight ``__init__``).
     2. **Discover GPUs** via ``get_assigned_gpus()`` -- returns Ray-assigned
        accelerator IDs.
-    3. **Launch subprocess** via ``initialize(command, driver_env, worker_env,
-       log_file)`` -- applies driver env with ``setdefault`` (node-local wins),
-       worker env with overwrite (explicit GPU assignment), then starts the
-       process.
+    3. **Launch subprocess** via ``initialize(command, subprocess_env,
+       log_file)`` -- applies *subprocess_env* as overrides on top of
+       the actor's inherited ``os.environ``, then starts the process.
 
     The ``run()`` method blocks until the subprocess exits and is intended
     to be called as ``actor.run.remote()`` -- the returned ``ObjectRef``
@@ -353,22 +315,21 @@ def _define_subprocess_actor() -> type:  # noqa: C901
         def initialize(
             self,
             command: list[str],
-            driver_env: dict[str, str],
-            worker_env: dict[str, str],
+            subprocess_env: dict[str, str],
             log_file: str | None = None,
         ) -> dict:
-            """Apply env tiers and launch the subprocess.
+            """Launch the subprocess with the actor's env plus *subprocess_env* overrides.
 
-            *driver_env* is applied with ``setdefault`` (node-local wins).
-            *worker_env* is applied with direct overwrite (explicit GPU
-            assignment, per-worker ports, etc.).
+            The actor inherits its base environment from the raylet.
+            *subprocess_env* adds explicit overrides on top (e.g.
+            ``CUDA_VISIBLE_DEVICES``, ``ETCD_ENDPOINTS``).
 
             Returns:
                 ``{"pid": int, "log_file": str | None}``
             """
             import subprocess as _sp
 
-            merged_env = _merge_subprocess_env(dict(os.environ), driver_env, worker_env)
+            merged_env = {**os.environ, **subprocess_env}
 
             self._log_file = log_file
             if log_file:
@@ -532,14 +493,19 @@ def spawn_actor(  # noqa: PLR0913
     *,
     runtime_dir: str | None = None,
     actor_name_prefix: str = "",
-    driver_env: dict[str, str] | None = None,
-    worker_env: dict[str, str] | None = None,
+    subprocess_env: dict[str, str] | None = None,
+    runtime_env: dict[str, Any] | None = None,
 ) -> ManagedSubprocess:
     """Create a detached Ray actor that runs *command* as a subprocess.
 
     Handles both GPU workers and non-GPU infra actors (etcd, NATS,
     frontend).  For GPU actors, discovers Ray-assigned GPU IDs and sets
-    ``CUDA_VISIBLE_DEVICES`` explicitly in the worker-tier env.
+    ``CUDA_VISIBLE_DEVICES`` explicitly in *subprocess_env*.
+
+    The subprocess inherits the actor's ``os.environ`` (which comes from
+    the raylet and any ``runtime_env`` settings).  *subprocess_env* adds
+    targeted overrides on top (e.g. ``ETCD_ENDPOINTS``, ``NATS_SERVER``,
+    ``CUDA_VISIBLE_DEVICES``).
 
     Args:
         actor_cls: The ``_SubprocessActor`` Ray remote class.
@@ -550,9 +516,12 @@ def spawn_actor(  # noqa: PLR0913
             discarded.
         actor_name_prefix: Prefix for the detached actor name (used for
             orphan cleanup).
-        driver_env: Driver-tier env (applied with ``setdefault``).
-            Defaults to ``_get_driver_env_vars()``.
-        worker_env: Worker-tier env (applied with overwrite).
+        subprocess_env: Extra env vars for the subprocess (applied as
+            overrides on top of the actor's inherited ``os.environ``).
+        runtime_env: Ray runtime environment for the actor (e.g. ``pip``
+            packages, ``working_dir``).  Merged with the internal
+            ``_NOSET_CUDA_RUNTIME_ENV`` so that
+            ``RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES`` is always set.
     """
     import ray
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -560,26 +529,33 @@ def spawn_actor(  # noqa: PLR0913
     log_file = os.path.join(runtime_dir, f"{label}.log") if runtime_dir else None
     actor_name = f"{actor_name_prefix}_{label}" if actor_name_prefix else label
 
+    # Merge caller-provided runtime_env with _NOSET_CUDA_RUNTIME_ENV.
+    # NOSET env vars always win so that Dynamo can manage GPUs explicitly.
+    if runtime_env:
+        merged_runtime_env = {**runtime_env}
+        user_env_vars = runtime_env.get("env_vars", {})
+        merged_runtime_env["env_vars"] = {**user_env_vars, **_NOSET_CUDA_RUNTIME_ENV["env_vars"]}
+    else:
+        merged_runtime_env = _NOSET_CUDA_RUNTIME_ENV
+
     # Phase 1: create actor -- lightweight __init__, no subprocess yet
     actor = actor_cls.options(
         name=actor_name,
         lifetime="detached",
         num_gpus=node_alloc.num_gpus,
-        runtime_env=_NOSET_CUDA_RUNTIME_ENV,
+        runtime_env=merged_runtime_env,
         scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_alloc.node_id, soft=False),
     ).remote()
 
-    # Phase 2: discover GPUs (if any) and build env tiers
-    actual_worker_env = dict(worker_env or {})
+    # Phase 2: discover GPUs (if any) and add to subprocess env
+    actual_env = dict(subprocess_env or {})
     if node_alloc.num_gpus > 0:
         gpu_ids = ray.get(actor.get_assigned_gpus.remote())
         if gpu_ids:
-            actual_worker_env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
-
-    actual_driver_env = driver_env if driver_env is not None else _get_driver_env_vars()
+            actual_env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
 
     # Phase 3: launch subprocess
-    status = ray.get(actor.initialize.remote(command, actual_driver_env, actual_worker_env, log_file))
+    status = ray.get(actor.initialize.remote(command, actual_env, log_file))
 
     # Phase 4: start run() -- the ObjectRef resolves when the subprocess exits
     run_ref = actor.run.remote()
