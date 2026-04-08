@@ -25,6 +25,7 @@ from nemo_curator.core.serve.internal.subprocess_mgr import (
     _engine_kwargs_to_cli_flags,
     _ignore_head_node,
     _resolve_node_ip,
+    build_worker_actor_name,
     plan_replica_placement,
 )
 
@@ -46,6 +47,27 @@ class TestEngineKwargsToCliFlags:
 
     def test_empty_dict(self):
         assert _engine_kwargs_to_cli_flags({}) == []
+
+
+# ---------------------------------------------------------------------------
+# Worker actor naming
+# ---------------------------------------------------------------------------
+
+
+class TestBuildWorkerActorName:
+    def test_single_gpu_no_tp(self):
+        assert build_worker_actor_name("Qwen3-0.6B", 0, 0, 1) == "Dynamo_DP0_Qwen3-0.6B"
+
+    def test_tp_suffix_added_when_tp_gt_1(self):
+        assert build_worker_actor_name("Qwen3-0.6B", 1, 0, 4) == "Dynamo_DP1_TP0_Qwen3-0.6B"
+        assert build_worker_actor_name("Qwen3-0.6B", 0, 2, 4) == "Dynamo_DP0_TP2_Qwen3-0.6B"
+
+    def test_hf_path_stripped(self):
+        assert build_worker_actor_name("Qwen/Qwen3-0.6B", 0, 0, 1) == "Dynamo_DP0_Qwen3-0.6B"
+
+    def test_disagg_role(self):
+        assert build_worker_actor_name("Qwen3-0.6B", 0, 0, 2, role="decode") == "Dynamo_decode_DP0_TP0_Qwen3-0.6B"
+        assert build_worker_actor_name("Qwen3-0.6B", 1, 0, 2, role="prefill") == "Dynamo_prefill_DP1_TP0_Qwen3-0.6B"
 
 
 # ---------------------------------------------------------------------------

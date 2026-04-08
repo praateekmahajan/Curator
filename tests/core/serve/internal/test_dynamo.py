@@ -102,7 +102,6 @@ class TestDynamoBackendValidation:
         ]
         with pytest.raises(ValueError, match="multi-node tensor parallelism"):
             backend._launch_disagg_workers(
-                type(None),  # actor_cls unused — validation fires before actor creation
                 server.models[0],
                 {},
                 inventory=inventory,

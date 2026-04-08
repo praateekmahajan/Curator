@@ -41,13 +41,13 @@ from nemo_curator.core.serve.internal.subprocess_mgr import (
     NodeAllocation,
     ReplicaPlan,
     _check_binary,
-    _define_subprocess_actor,
     _engine_kwargs_to_cli_flags,
     _get_gpu_inventory,
     _ignore_head_node,
     _kill_actor,
     _resolve_node_ip,
     _wait_for_port,
+    build_worker_actor_name,
     get_free_port_on_node,
     kill_orphaned_actors,
     plan_replica_placement,
@@ -269,12 +269,9 @@ class DynamoBackend(InferenceBackend):
             )
             server.port = get_free_port_on_node(infra_node, server.port)
 
-            actor_cls = _define_subprocess_actor()
-
             try:
                 self._deploy_and_healthcheck(
                     server,
-                    actor_cls,
                     head_node_id=head_node_id,
                     cluster_nodes=cluster_nodes,
                 )
@@ -288,7 +285,6 @@ class DynamoBackend(InferenceBackend):
     def _deploy_and_healthcheck(
         self,
         server: InferenceServer,
-        actor_cls: type,
         *,
         head_node_id: str,
         cluster_nodes: list[dict[str, Any]],
@@ -306,9 +302,9 @@ class DynamoBackend(InferenceBackend):
 
         # Infrastructure -- on infra node (head or first non-head when excluded)
         if not server.etcd_endpoint:
-            self._etcd_actor = self._start_etcd(actor_cls, infra_node_id, self._etcd_port)
+            self._etcd_actor = self._start_etcd(infra_node_id, self._etcd_port)
         if not server.nats_url:
-            self._nats_actor = self._start_nats(actor_cls, infra_node_id, self._nats_port)
+            self._nats_actor = self._start_nats(infra_node_id, self._nats_port)
 
         etcd_endpoint = server.etcd_endpoint or f"http://{self._infra_ip}:{self._etcd_port}"
         nats_url = server.nats_url or f"nats://{self._infra_ip}:{self._nats_port}"
@@ -335,7 +331,6 @@ class DynamoBackend(InferenceBackend):
 
             if is_disagg:
                 plans_with_roles, inventory = self._launch_disagg_workers(
-                    actor_cls,
                     model_config,
                     base_env,
                     inventory=inventory,
@@ -345,7 +340,6 @@ class DynamoBackend(InferenceBackend):
                 )
             else:
                 plans_with_roles, inventory = self._launch_replicas(
-                    actor_cls,
                     model_config,
                     base_env,
                     inventory=inventory,
@@ -382,7 +376,6 @@ class DynamoBackend(InferenceBackend):
         router_mode = first_cfg.get("router_mode", "kv") if any_model_disagg else None
         frontend_runtime_env = self._merge_model_runtime_envs(server.models)
         self._frontend_actor = self._launch_frontend(
-            actor_cls,
             infra_node_id,
             server.port,
             base_env,
@@ -554,7 +547,7 @@ class DynamoBackend(InferenceBackend):
     # Infrastructure actors
     # ------------------------------------------------------------------
 
-    def _start_etcd(self, actor_cls: type, infra_node_id: str, port: int) -> ManagedSubprocess:
+    def _start_etcd(self, infra_node_id: str, port: int) -> ManagedSubprocess:
         data_dir = os.path.join(self._runtime_dir, "etcd_data")
         os.makedirs(data_dir, exist_ok=True)
 
@@ -576,8 +569,7 @@ class DynamoBackend(InferenceBackend):
         ]
         node_alloc = NodeAllocation(node_id=infra_node_id, node_ip=self._infra_ip, num_gpus=0, node_rank=0)
         proc = spawn_actor(
-            actor_cls,
-            "etcd",
+            "Dynamo_ETCD",
             command,
             node_alloc,
             runtime_dir=self._runtime_dir,
@@ -590,15 +582,14 @@ class DynamoBackend(InferenceBackend):
         logger.info("etcd is ready")
         return proc
 
-    def _start_nats(self, actor_cls: type, infra_node_id: str, port: int) -> ManagedSubprocess:
+    def _start_nats(self, infra_node_id: str, port: int) -> ManagedSubprocess:
         store_dir = os.path.join(self._runtime_dir, "nats_data")
         os.makedirs(store_dir, exist_ok=True)
 
         command = ["nats-server", "-p", str(port), "-js", "--store_dir", store_dir]
         node_alloc = NodeAllocation(node_id=infra_node_id, node_ip=self._infra_ip, num_gpus=0, node_rank=0)
         proc = spawn_actor(
-            actor_cls,
-            "nats",
+            "Dynamo_NATS",
             command,
             node_alloc,
             runtime_dir=self._runtime_dir,
@@ -616,7 +607,6 @@ class DynamoBackend(InferenceBackend):
 
     def _launch_replicas(  # noqa: PLR0913
         self,
-        actor_cls: type,
         model_config: InferenceModelConfig,
         base_env: dict[str, str],
         *,
@@ -647,7 +637,6 @@ class DynamoBackend(InferenceBackend):
             for rank in plan.ranks:
                 if rank.node_rank == 0:
                     proc = self._launch_worker(
-                        actor_cls,
                         replica_index=plan.replica_index,
                         model_config=model_config,
                         base_env=base_env,
@@ -659,7 +648,6 @@ class DynamoBackend(InferenceBackend):
                     )
                 else:
                     proc = self._launch_headless_worker(
-                        actor_cls,
                         replica_index=plan.replica_index,
                         model_config=model_config,
                         base_env=base_env,
@@ -673,7 +661,6 @@ class DynamoBackend(InferenceBackend):
 
     def _launch_disagg_workers(  # noqa: PLR0913
         self,
-        actor_cls: type,
         model_config: InferenceModelConfig,
         base_env: dict[str, str],
         *,
@@ -756,10 +743,9 @@ class DynamoBackend(InferenceBackend):
                 *_engine_kwargs_to_cli_flags(model_config.engine_kwargs),
             ]
 
-            label = f"decode_{i}"
+            label = build_worker_actor_name(model_name, i, 0, tp_size, role="decode")
             logger.info(f"Disagg decode worker {i}: {rank0.num_gpus} GPU(s) on {rank0.node_ip}, nixl_port={nixl_port}")
             proc = spawn_actor(
-                actor_cls,
                 label,
                 command,
                 rank0,
@@ -815,13 +801,12 @@ class DynamoBackend(InferenceBackend):
                 *_engine_kwargs_to_cli_flags(model_config.engine_kwargs),
             ]
 
-            label = f"prefill_{i}"
+            label = build_worker_actor_name(model_name, i, 0, tp_size, role="prefill")
             logger.info(
                 f"Disagg prefill worker {i}: {rank0.num_gpus} GPU(s) on {rank0.node_ip}, "
                 f"nixl_port={nixl_port}, kv_events_port={kv_events_port}"
             )
             proc = spawn_actor(
-                actor_cls,
                 label,
                 command,
                 rank0,
@@ -842,7 +827,6 @@ class DynamoBackend(InferenceBackend):
 
     def _launch_worker(  # noqa: PLR0913
         self,
-        actor_cls: type,
         *,
         replica_index: int,
         model_config: InferenceModelConfig,
@@ -891,9 +875,9 @@ class DynamoBackend(InferenceBackend):
                 ]
             )
 
-        label = f"replica_{replica_index}_rank_0"
+        tp_size = model_config.engine_kwargs.get("tensor_parallel_size", 1)
+        label = build_worker_actor_name(model_name, replica_index, 0, tp_size)
         return spawn_actor(
-            actor_cls,
             label,
             command,
             node_alloc,
@@ -903,9 +887,8 @@ class DynamoBackend(InferenceBackend):
             runtime_env=model_config.runtime_env or None,
         )
 
-    def _launch_headless_worker(  # noqa: PLR0913
+    def _launch_headless_worker(
         self,
-        actor_cls: type,
         *,
         replica_index: int,
         model_config: InferenceModelConfig,
@@ -935,9 +918,10 @@ class DynamoBackend(InferenceBackend):
             *_engine_kwargs_to_cli_flags(model_config.engine_kwargs),
         ]
 
-        label = f"replica_{replica_index}_rank_{node_alloc.node_rank}"
+        tp_size = model_config.engine_kwargs.get("tensor_parallel_size", 1)
+        model_name = model_config.model_name or model_config.model_identifier
+        label = build_worker_actor_name(model_name, replica_index, node_alloc.node_rank, tp_size)
         return spawn_actor(
-            actor_cls,
             label,
             command,
             node_alloc,
@@ -949,7 +933,6 @@ class DynamoBackend(InferenceBackend):
 
     def _launch_frontend(  # noqa: PLR0913
         self,
-        actor_cls: type,
         infra_node_id: str,
         port: int,
         base_env: dict[str, str],
@@ -984,8 +967,7 @@ class DynamoBackend(InferenceBackend):
         node_alloc = NodeAllocation(node_id=infra_node_id, node_ip=self._infra_ip, num_gpus=0, node_rank=0)
         logger.info(f"Starting Dynamo frontend on port {port}")
         return spawn_actor(
-            actor_cls,
-            "frontend",
+            "Dynamo_Frontend",
             command,
             node_alloc,
             runtime_dir=self._runtime_dir,

@@ -26,7 +26,7 @@ import contextlib
 import os
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from loguru import logger
 
@@ -270,8 +270,48 @@ def _stop_subprocess(proc: Any, sigterm_wait: float = _SIGTERM_WAIT_S) -> int | 
 _NOSET_CUDA_RUNTIME_ENV: dict[str, Any] = {"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}}
 
 
-def _define_subprocess_actor() -> type:  # noqa: C901
-    """Return the ``_SubprocessActor`` Ray remote class.
+def build_worker_actor_name(
+    model_name: str,
+    replica_index: int,
+    node_rank: int,
+    tp_size: int,
+    *,
+    role: Literal["decode", "prefill"] | None = None,
+) -> str:
+    """Build a descriptive actor name for Ray dashboard visibility.
+
+    Format: ``Dynamo_[<role>_]DP<n>[_TP<n>]_<model>``.
+
+    Examples::
+
+        build_worker_actor_name("Qwen3-0.6B", 0, 0, 1)
+        # -> "Dynamo_DP0_Qwen3-0.6B"
+
+        build_worker_actor_name("Qwen3-0.6B", 1, 0, 4)
+        # -> "Dynamo_DP1_TP0_Qwen3-0.6B"
+
+        build_worker_actor_name("Qwen3-0.6B", 0, 0, 2, role="decode")
+        # -> "Dynamo_decode_DP0_TP0_Qwen3-0.6B"
+    """
+    # Use the last path component for HF identifiers (e.g. "Qwen/Qwen3-0.6B" -> "Qwen3-0.6B")
+    short_name = model_name.rsplit("/", 1)[-1]
+    parts = ["Dynamo"]
+    if role:
+        parts.append(role)
+    parts.append(f"DP{replica_index}")
+    if tp_size > 1:
+        parts.append(f"TP{node_rank}")
+    parts.append(short_name)
+    return "_".join(parts)
+
+
+def _define_subprocess_actor(actor_type: str = "SubprocessActor") -> type:  # noqa: C901
+    """Return a Ray remote actor class named *actor_type*.
+
+    Each call produces a class whose ``__name__`` and ``__qualname__`` are
+    set to *actor_type*, so the Ray dashboard shows descriptive labels
+    (e.g. ``etcd``, ``nats``, ``Dynamo_DP0_Qwen3-0.6B``) instead of a generic
+    ``_SubprocessActor``.
 
     A single actor class used for all backend subprocesses (etcd, NATS,
     frontend, vLLM workers, etc.).  GPU resources are configured per-instance
@@ -390,6 +430,8 @@ def _define_subprocess_actor() -> type:  # noqa: C901
                 self._log_fh.close()
             return rc
 
+    _SubprocessActor.__name__ = actor_type
+    _SubprocessActor.__qualname__ = actor_type
     return _SubprocessActor
 
 
@@ -488,7 +530,6 @@ def get_free_port_on_node(node_id: str, start_port: int, get_next_free_port: boo
 
 
 def spawn_actor(  # noqa: PLR0913
-    actor_cls: type,
     label: str,
     command: list[str],
     node_alloc: NodeAllocation,
@@ -504,14 +545,18 @@ def spawn_actor(  # noqa: PLR0913
     frontend).  For GPU actors, discovers Ray-assigned GPU IDs and sets
     ``CUDA_VISIBLE_DEVICES`` explicitly in *subprocess_env*.
 
+    The actor class is created per-call with ``__name__`` set to *label*,
+    so the Ray dashboard shows descriptive names (e.g. ``Dynamo_ETCD``,
+    ``Dynamo_DP0_Qwen3-0.6B``) instead of a generic ``_SubprocessActor``.
+
     The subprocess inherits the actor's ``os.environ`` (which comes from
     the raylet and any ``runtime_env`` settings).  *subprocess_env* adds
     targeted overrides on top (e.g. ``ETCD_ENDPOINTS``, ``NATS_SERVER``,
     ``CUDA_VISIBLE_DEVICES``).
 
     Args:
-        actor_cls: The ``_SubprocessActor`` Ray remote class.
-        label: Human-readable label (used for actor naming and logs).
+        label: Human-readable label (used for actor naming, class naming,
+            and logs).
         command: Subprocess command to run.
         node_alloc: Node + GPU allocation for this actor.
         runtime_dir: Directory for log files.  If ``None``, logs are
@@ -527,6 +572,8 @@ def spawn_actor(  # noqa: PLR0913
     """
     import ray
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    actor_cls = _define_subprocess_actor(label)
 
     log_file = os.path.join(runtime_dir, f"{label}.log") if runtime_dir else None
     actor_name = f"{actor_name_prefix}_{label}" if actor_name_prefix else label
