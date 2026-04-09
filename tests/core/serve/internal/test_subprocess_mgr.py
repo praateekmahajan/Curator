@@ -179,6 +179,44 @@ class TestPlanReplicaPlacementMocked:
         # Different nodes
         assert plans[0].ranks[0].node_id != plans[1].ranks[0].node_id
 
+    def test_partial_leftover_is_skipped_when_full_node_is_available(self):
+        """A leftover GPU must not force an invalid 1+3 split for TP=4."""
+        inventory = [
+            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 5, "is_head": False},
+            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 8, "is_head": False},
+        ]
+
+        plans = plan_replica_placement(num_replicas=3, tp_size=4, _inventory=inventory)
+
+        assert [[(r.node_id, r.num_gpus) for r in plan.ranks] for plan in plans] == [
+            [("n1", 4)],
+            [("n2", 4)],
+            [("n2", 4)],
+        ]
+
+    def test_even_multi_node_split_uses_equal_per_node_share(self):
+        """TP=4 on two 3-GPU nodes should use a valid 2+2 split."""
+        inventory = [
+            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 3, "is_head": False},
+            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 3, "is_head": False},
+        ]
+
+        plans = plan_replica_placement(num_replicas=1, tp_size=4, _inventory=inventory)
+
+        assert len(plans) == 1
+        assert plans[0].is_multi_node
+        assert [(rank.node_id, rank.num_gpus) for rank in plans[0].ranks] == [("n1", 2), ("n2", 2)]
+
+    def test_invalid_asymmetric_multi_node_split_raises(self):
+        """TP=4 cannot be launched from a 1+3 split even though total GPUs match."""
+        inventory = [
+            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 1, "is_head": False},
+            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 3, "is_head": False},
+        ]
+
+        with pytest.raises(RuntimeError, match="even split"):
+            plan_replica_placement(num_replicas=1, tp_size=4, _inventory=inventory)
+
     def test_insufficient_gpus_raises(self):
         with pytest.raises(RuntimeError, match="Need"):
             plan_replica_placement(num_replicas=1, tp_size=16, _inventory=self._inventory_2x4())

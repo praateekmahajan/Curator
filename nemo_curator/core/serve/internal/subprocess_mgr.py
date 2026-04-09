@@ -198,43 +198,79 @@ def plan_replica_placement(
 
     plans: list[ReplicaPlan] = []
     for replica_idx in range(num_replicas):
-        ranks: list[NodeAllocation] = []
-        remaining = tp_size
-        node_rank = 0
-
-        for node in inventory:
-            nid = node["node_id"]
-            avail = available[nid]
-            if avail <= 0:
-                continue
-
-            take = min(avail, remaining)
-            ranks.append(
-                NodeAllocation(
-                    node_id=nid,
-                    node_ip=node["node_ip"],
-                    num_gpus=take,
-                    node_rank=node_rank,
-                )
-            )
-            available[nid] -= take
-            remaining -= take
-            node_rank += 1
-
-            if remaining == 0:
-                break
-
-        if remaining > 0:
-            placed = tp_size - remaining
-            msg = (
-                f"Cannot place replica {replica_idx}: need {tp_size} GPUs but only "
-                f"{placed} available. Allocated {replica_idx}/{num_replicas} replicas."
-            )
-            raise RuntimeError(msg)
-
+        ranks = _place_single_replica(tp_size, inventory, available)
         plans.append(ReplicaPlan(replica_index=replica_idx, ranks=ranks))
 
     return plans
+
+
+def _place_single_replica(
+    tp_size: int,
+    inventory: list[dict[str, Any]],
+    available: dict[str, int],
+) -> list[NodeAllocation]:
+    """Place one replica, returning a list of ``NodeAllocation`` ranks.
+
+    Placement strategy:
+    1. **Single-node**: if any node has ``>= tp_size`` GPUs, place entirely
+       on the first such node (greedy, head-first).
+    2. **Multi-node (even split)**: vLLM requires each node in a multi-node
+       TP group to have the same number of local GPUs (``tp_size // nnodes``).
+       Find the smallest set of nodes that can each contribute an equal
+       share of ``tp_size``.  Nodes with leftover GPUs below the per-node
+       share are skipped — they cannot participate.
+
+    Updates *available* in-place.
+    """
+    # --- Strategy 1: single-node ---
+    for node in inventory:
+        nid = node["node_id"]
+        if available[nid] >= tp_size:
+            available[nid] -= tp_size
+            return [NodeAllocation(node_id=nid, node_ip=node["node_ip"], num_gpus=tp_size, node_rank=0)]
+
+    # --- Strategy 2: multi-node even split ---
+    # Collect candidate nodes in inventory order so head-node preference and
+    # other deterministic placement rules are preserved.
+    candidates = [(node, available[node["node_id"]]) for node in inventory if available[node["node_id"]] > 0]
+
+    # Try increasing nnodes (2, 3, ...) to find the smallest even split.
+    for nnodes in range(2, len(candidates) + 1):
+        if tp_size % nnodes != 0:
+            continue
+        per_node = tp_size // nnodes
+
+        # Pick the first `nnodes` candidates that have >= per_node GPUs.
+        chosen: list[dict[str, Any]] = []
+        for node, avail in candidates:
+            if avail >= per_node:
+                chosen.append(node)
+            if len(chosen) == nnodes:
+                break
+
+        if len(chosen) == nnodes:
+            ranks: list[NodeAllocation] = []
+            for node_rank, node in enumerate(chosen):
+                nid = node["node_id"]
+                available[nid] -= per_node
+                ranks.append(
+                    NodeAllocation(
+                        node_id=nid,
+                        node_ip=node["node_ip"],
+                        num_gpus=per_node,
+                        node_rank=node_rank,
+                    )
+                )
+            return ranks
+
+    # No valid placement found.
+    total_avail = sum(available.values())
+    msg = (
+        f"Cannot place TP={tp_size} replica: need an even split across nodes "
+        f"but no valid combination found ({total_avail} GPUs available across "
+        f"{sum(1 for v in available.values() if v > 0)} node(s))."
+    )
+    raise RuntimeError(msg)
 
 
 # ---------------------------------------------------------------------------
