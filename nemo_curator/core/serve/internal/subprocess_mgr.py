@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import signal
 import time
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -255,14 +256,33 @@ class ManagedSubprocess:
 
 
 def _stop_subprocess(proc: Any, sigterm_wait: float = _SIGTERM_WAIT_S) -> int | None:  # noqa: ANN401
-    """SIGTERM -> wait -> SIGKILL a subprocess.  Used inside Ray actors."""
+    """SIGTERM -> wait -> SIGKILL a subprocess and its entire process group.
+
+    Subprocesses are launched with ``start_new_session=True`` so they
+    become process-group leaders.  Signaling the group (``os.killpg``)
+    ensures child processes (e.g. vLLM torch.distributed workers) are
+    also terminated rather than becoming orphans.
+    """
     if proc.poll() is not None:
         return proc.returncode
-    proc.terminate()
+    # start_new_session=True makes the child a process-group leader (pgid == pid).
+    # Kill the entire group so grandchildren die too; fall back to just the
+    # child if it somehow changed its group.
+    pgid = None
+    with contextlib.suppress(OSError):
+        pgid = os.getpgid(proc.pid)
+    is_group_leader = pgid is not None and pgid == proc.pid
+    if is_group_leader:
+        os.killpg(pgid, signal.SIGTERM)
+    else:
+        proc.terminate()
     try:
         proc.wait(timeout=sigterm_wait)
     except Exception:  # noqa: BLE001
-        proc.kill()
+        if is_group_leader:
+            os.killpg(pgid, signal.SIGKILL)
+        else:
+            proc.kill()
         proc.wait(timeout=_SIGKILL_WAIT_S)
     return proc.returncode
 
@@ -376,9 +396,13 @@ def _define_subprocess_actor(actor_type: str = "SubprocessActor") -> type:  # no
             if log_file:
                 os.makedirs(os.path.dirname(log_file), exist_ok=True)
                 self._log_fh = open(log_file, "w")  # noqa: SIM115
-                self._proc = _sp.Popen(command, env=merged_env, stdout=self._log_fh, stderr=_sp.STDOUT)  # noqa: S603
+                self._proc = _sp.Popen(  # noqa: S603
+                    command, env=merged_env, stdout=self._log_fh, stderr=_sp.STDOUT, start_new_session=True
+                )
             else:
-                self._proc = _sp.Popen(command, env=merged_env, stdout=_sp.DEVNULL, stderr=_sp.STDOUT)  # noqa: S603
+                self._proc = _sp.Popen(  # noqa: S603
+                    command, env=merged_env, stdout=_sp.DEVNULL, stderr=_sp.STDOUT, start_new_session=True
+                )
 
             return {"pid": self._proc.pid, "log_file": log_file}
 

@@ -23,8 +23,20 @@ from nemo_curator.core.serve.internal.errors import SubprocessError
 from nemo_curator.core.serve.internal.subprocess_mgr import (
     ManagedSubprocess,
     _define_subprocess_actor,
+    _kill_actor,
     plan_replica_placement,
 )
+
+
+def _pid_alive(pid: int) -> bool:
+    """Check if a process is alive via kill(0)."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    else:
+        return True
+
 
 # ---------------------------------------------------------------------------
 # InferenceModelConfig — dynamo_config
@@ -484,6 +496,61 @@ class TestDynamoLiveness:
         finally:
             with contextlib.suppress(Exception):
                 ray.kill(actor, no_restart=True)
+
+    def test_kill_actor_also_kills_child_processes(self, tmp_path: os.PathLike):
+        """Killing an actor must also terminate child processes spawned by the subprocess.
+
+        Subprocesses are launched with start_new_session=True so the entire
+        process group is signaled, preventing orphaned grandchildren (e.g.
+        vLLM torch.distributed workers).
+        """
+        import signal
+        import time
+
+        import ray
+
+        pid_file = str(tmp_path / "child_pids.txt")
+        # Bash spawns two child sleep processes then waits.
+        command = [
+            "bash",
+            "-c",
+            f"sleep 3600 & echo $! > {pid_file}; sleep 3600 & echo $! >> {pid_file}; wait",
+        ]
+
+        actor_cls = _define_subprocess_actor()
+        actor_name = f"test_orphan_kill_{os.getpid()}"
+        actor = actor_cls.options(name=actor_name, lifetime="detached").remote()
+        status = ray.get(actor.initialize.remote(command, {}, None), timeout=10)
+        parent_pid = status["pid"]
+        actor.run.remote()
+
+        # Poll for PID file to have 2 lines (children spawned).
+        deadline = time.monotonic() + 5
+        child_pids: list[int] = []
+        while time.monotonic() < deadline:
+            if os.path.exists(pid_file):
+                with open(pid_file) as f:
+                    lines = [line.strip() for line in f if line.strip()]
+                if len(lines) == 2:
+                    child_pids = [int(line) for line in lines]
+                    break
+            time.sleep(0.05)
+        assert len(child_pids) == 2, f"Expected 2 child PIDs, got {child_pids}"
+
+        # All should be alive before kill
+        for pid in [parent_pid, *child_pids]:
+            os.kill(pid, 0)  # raises if not alive
+
+        _kill_actor(ray, actor_name, actor)
+        time.sleep(0.5)
+
+        alive = [pid for pid in child_pids if _pid_alive(pid)]
+        try:
+            assert not alive, f"Child processes {alive} survived actor kill (orphaned)"
+        finally:
+            for pid in [parent_pid, *child_pids]:
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
 
 
 # ---------------------------------------------------------------------------
