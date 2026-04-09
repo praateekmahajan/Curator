@@ -79,8 +79,14 @@ class InferenceModelConfig:
             Only used when ``backend="dynamo"``. Keys: ``namespace`` (default "curator"),
             ``request_plane`` (default "nats"), ``event_plane`` (default "nats"),
             ``mode`` (set to "disagg" for disaggregated serving),
-            ``prefill_replicas`` / ``decode_replicas`` (disagg worker counts),
             ``router_mode`` (default "kv", disagg frontend routing).
+
+            For disaggregated serving (``mode="disagg"``), per-role config is
+            nested under ``"prefill"`` and ``"decode"`` keys, each a dict with:
+            - ``num_replicas`` (default 1): number of workers for this role.
+            - ``engine_kwargs`` (optional): merged on top of the model-level
+              ``engine_kwargs`` (e.g. to set a different ``tensor_parallel_size``
+              per role).
     """
 
     model_identifier: str

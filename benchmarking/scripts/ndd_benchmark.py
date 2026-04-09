@@ -334,7 +334,7 @@ def main() -> int:
         default=None,
         help=(
             "JSON string of Dynamo backend config. "
-            'For disagg: \'{"mode": "disagg", "prefill_replicas": 2, "decode_replicas": 2}\''
+            'For disagg: \'{"mode": "disagg", "prefill": {"num_replicas": 2}, "decode": {"num_replicas": 2}}\''
         ),
     )
 

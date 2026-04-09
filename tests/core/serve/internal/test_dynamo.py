@@ -44,6 +44,59 @@ class TestDynamoConfig:
 
 
 # ---------------------------------------------------------------------------
+# Disagg role config resolution
+# ---------------------------------------------------------------------------
+
+
+class TestResolveDisaggRoleConfig:
+    def test_defaults_to_1_replica_and_base_engine_kwargs(self):
+        config = InferenceModelConfig(
+            model_identifier="m",
+            engine_kwargs={"tensor_parallel_size": 4, "max_model_len": 8192},
+            dynamo_config={"mode": "disagg"},
+        )
+        (np, pek), (nd, dek) = DynamoBackend._resolve_disagg_role_config(config)
+        assert np == 1
+        assert nd == 1
+        assert pek == {"tensor_parallel_size": 4, "max_model_len": 8192}
+        assert dek == {"tensor_parallel_size": 4, "max_model_len": 8192}
+
+    def test_role_engine_kwargs_override_base(self):
+        config = InferenceModelConfig(
+            model_identifier="m",
+            engine_kwargs={"tensor_parallel_size": 2, "max_model_len": 8192},
+            dynamo_config={
+                "mode": "disagg",
+                "prefill": {"num_replicas": 4, "engine_kwargs": {"tensor_parallel_size": 4}},
+                "decode": {"num_replicas": 2},
+            },
+        )
+        (np, pek), (nd, dek) = DynamoBackend._resolve_disagg_role_config(config)
+        assert np == 4
+        assert nd == 2
+        # Prefill overrides TP but inherits max_model_len
+        assert pek == {"tensor_parallel_size": 4, "max_model_len": 8192}
+        # Decode inherits everything
+        assert dek == {"tensor_parallel_size": 2, "max_model_len": 8192}
+
+    def test_both_roles_override(self):
+        config = InferenceModelConfig(
+            model_identifier="m",
+            engine_kwargs={"tensor_parallel_size": 2},
+            dynamo_config={
+                "mode": "disagg",
+                "prefill": {"num_replicas": 3, "engine_kwargs": {"tensor_parallel_size": 4}},
+                "decode": {"num_replicas": 1, "engine_kwargs": {"tensor_parallel_size": 1}},
+            },
+        )
+        (np, pek), (nd, dek) = DynamoBackend._resolve_disagg_role_config(config)
+        assert np == 3
+        assert nd == 1
+        assert pek["tensor_parallel_size"] == 4
+        assert dek["tensor_parallel_size"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Replica count resolution
 # ---------------------------------------------------------------------------
 
@@ -90,7 +143,11 @@ class TestDynamoBackendValidation:
                 InferenceModelConfig(
                     model_identifier="m",
                     engine_kwargs={"tensor_parallel_size": 8},
-                    dynamo_config={"mode": "disagg", "prefill_replicas": 1, "decode_replicas": 0},
+                    dynamo_config={
+                        "mode": "disagg",
+                        "prefill": {"num_replicas": 1},
+                        "decode": {"num_replicas": 0},
+                    },
                 )
             ],
             backend="dynamo",
@@ -483,7 +540,11 @@ class TestGpuValidation:
                 InferenceModelConfig(
                     model_identifier="big-model",
                     engine_kwargs={"tensor_parallel_size": 8},
-                    dynamo_config={"mode": "disagg", "prefill_replicas": 1, "decode_replicas": 1},
+                    dynamo_config={
+                        "mode": "disagg",
+                        "prefill": {"num_replicas": 1},
+                        "decode": {"num_replicas": 1},
+                    },
                 )
             ],
             backend="dynamo",
@@ -538,13 +599,142 @@ class TestGpuValidation:
                 InferenceModelConfig(
                     model_identifier="m",
                     engine_kwargs={"tensor_parallel_size": 2},
-                    dynamo_config={"mode": "disagg", "prefill_replicas": 2, "decode_replicas": 2},
+                    dynamo_config={
+                        "mode": "disagg",
+                        "prefill": {"num_replicas": 2},
+                        "decode": {"num_replicas": 2},
+                    },
                 )
             ],
             backend="dynamo",
         )
         inventory = [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False}]
         with pytest.raises(ValueError, match="require 8 GPUs total but only 4"):
+            DynamoBackend._validate_gpu_requirements(server, inventory)
+
+    def test_asymmetric_tp_gpu_count(self):
+        """4 prefill @ TP=2 + 2 decode @ TP=1 = 10 GPUs."""
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(
+                    model_identifier="m",
+                    engine_kwargs={"tensor_parallel_size": 1},
+                    dynamo_config={
+                        "mode": "disagg",
+                        "prefill": {"num_replicas": 4, "engine_kwargs": {"tensor_parallel_size": 2}},
+                        "decode": {"num_replicas": 2},
+                    },
+                )
+            ],
+            backend="dynamo",
+        )
+        inventory = [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 8, "is_head": False}]
+        with pytest.raises(ValueError, match="require 10 GPUs total but only 8"):
+            DynamoBackend._validate_gpu_requirements(server, inventory)
+
+    def test_asymmetric_tp_accepts_valid(self):
+        """4 prefill @ TP=2 + 2 decode @ TP=1 = 10 GPUs on a 12-GPU cluster."""
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(
+                    model_identifier="m",
+                    dynamo_config={
+                        "mode": "disagg",
+                        "prefill": {"num_replicas": 4, "engine_kwargs": {"tensor_parallel_size": 2}},
+                        "decode": {"num_replicas": 2, "engine_kwargs": {"tensor_parallel_size": 1}},
+                    },
+                )
+            ],
+            backend="dynamo",
+        )
+        inventory = [
+            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 8, "is_head": False},
+            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 4, "is_head": False},
+        ]
+        DynamoBackend._validate_gpu_requirements(server, inventory)  # should not raise
+
+    def test_asymmetric_tp_2node_16gpu_decode_tp8(self):
+        """2 prefill TP=4 + 1 decode TP=8 on 2x8-GPU nodes = 16 GPUs."""
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(
+                    model_identifier="m",
+                    dynamo_config={
+                        "mode": "disagg",
+                        "prefill": {"num_replicas": 2, "engine_kwargs": {"tensor_parallel_size": 4}},
+                        "decode": {"num_replicas": 1, "engine_kwargs": {"tensor_parallel_size": 8}},
+                    },
+                )
+            ],
+            backend="dynamo",
+        )
+        inventory = [
+            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 8, "is_head": False},
+            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 8, "is_head": False},
+        ]
+        DynamoBackend._validate_gpu_requirements(server, inventory)  # should not raise
+
+    def test_asymmetric_tp_2node_16gpu_decode_tp1(self):
+        """2 prefill TP=4 + 8 decode TP=1 on 2x8-GPU nodes = 16 GPUs."""
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(
+                    model_identifier="m",
+                    dynamo_config={
+                        "mode": "disagg",
+                        "prefill": {"num_replicas": 2, "engine_kwargs": {"tensor_parallel_size": 4}},
+                        "decode": {"num_replicas": 8, "engine_kwargs": {"tensor_parallel_size": 1}},
+                    },
+                )
+            ],
+            backend="dynamo",
+        )
+        inventory = [
+            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 8, "is_head": False},
+            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 8, "is_head": False},
+        ]
+        DynamoBackend._validate_gpu_requirements(server, inventory)  # should not raise
+
+    def test_disagg_ignores_deployment_config_num_replicas(self):
+        """deployment_config.num_replicas is ignored in disagg mode — only role replicas count."""
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(
+                    model_identifier="m",
+                    deployment_config={"num_replicas": 99},
+                    dynamo_config={
+                        "mode": "disagg",
+                        "prefill": {"num_replicas": 1, "engine_kwargs": {"tensor_parallel_size": 1}},
+                        "decode": {"num_replicas": 1, "engine_kwargs": {"tensor_parallel_size": 1}},
+                    },
+                )
+            ],
+            backend="dynamo",
+        )
+        # 2 GPUs total (1 prefill + 1 decode), NOT 99*something
+        inventory = [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 2, "is_head": False}]
+        DynamoBackend._validate_gpu_requirements(server, inventory)  # should not raise
+
+    def test_asymmetric_tp_rejects_role_exceeding_node(self):
+        """Prefill TP=8 on 4-GPU nodes should fail even if decode TP=1."""
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(
+                    model_identifier="m",
+                    dynamo_config={
+                        "mode": "disagg",
+                        "prefill": {"num_replicas": 1, "engine_kwargs": {"tensor_parallel_size": 8}},
+                        "decode": {"num_replicas": 1, "engine_kwargs": {"tensor_parallel_size": 1}},
+                    },
+                )
+            ],
+            backend="dynamo",
+        )
+        inventory = [
+            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False},
+            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 4, "is_head": False},
+        ]
+        with pytest.raises(ValueError, match="prefill requests TP=8"):
             DynamoBackend._validate_gpu_requirements(server, inventory)
 
 
@@ -555,6 +745,30 @@ class TestGpuValidation:
 
 class TestMixedDisaggInventory:
     """Verify that disagg and non-disagg models share the GPU inventory correctly."""
+
+    def test_asymmetric_tp_placement_decode_tp8_prefill_tp4(self):
+        """Decode TP=8 takes all of n1, then 2 prefill TP=4 land on n2."""
+        inventory = [
+            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 8, "is_head": False},
+            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 8, "is_head": False},
+        ]
+
+        # Decode planned first (matches _launch_disagg_workers order)
+        decode_plans = plan_replica_placement(num_replicas=1, tp_size=8, _inventory=inventory)
+        assert len(decode_plans) == 1
+        assert decode_plans[0].ranks[0].node_id == "n1"
+        assert decode_plans[0].ranks[0].num_gpus == 8
+        inventory = DynamoBackend._subtract_placed_gpus(inventory, decode_plans)
+
+        # Prefill planned second on remaining inventory
+        prefill_plans = plan_replica_placement(num_replicas=2, tp_size=4, _inventory=inventory)
+        assert len(prefill_plans) == 2
+        for plan in prefill_plans:
+            assert plan.ranks[0].node_id == "n2"
+            assert plan.ranks[0].num_gpus == 4
+        inventory = DynamoBackend._subtract_placed_gpus(inventory, prefill_plans)
+
+        assert len(inventory) == 0
 
     def test_disagg_and_non_disagg_use_disjoint_gpus(self):
         """A non-disagg model followed by a disagg model should not double-book GPUs.

@@ -1,0 +1,84 @@
+# NDD benchmark: Dynamo aggregated vs disaggregated serving
+#
+# Compares aggregated DP=4 (4 workers, TP=1) against disaggregated 2P+2D
+# on 4 GPUs with the same model.
+#
+# Usage:
+#   bash benchmarking/tools/run_dynamo.sh \
+#     --config /raid/curator-team/nightly/paths.yaml \
+#     --config benchmarking/ndd_dynamo_disagg.yaml
+#
+#   # Run only disagg:
+#   bash benchmarking/tools/run_dynamo.sh \
+#     --config /raid/curator-team/nightly/paths.yaml \
+#     --config benchmarking/ndd_dynamo_disagg.yaml \
+#     --entries disagg
+
+default_timeout_s: 3600
+
+delete_scratch: false
+object_store_size: 100000000000  # 100GB
+
+entries:
+  # -----------------------------------------------------------------------
+  # Baseline: Dynamo aggregated DP=4 (4 replicas, TP=1)
+  # -----------------------------------------------------------------------
+  - name: ndd_dynamo_agg_dp4
+    enabled: true
+    script: ndd_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={dataset:ndd_gretel_symptoms,jsonl}
+      --output-path={session_entry_dir}/scratch/output
+      --inference-server-type=dynamo
+      --model-id=openai/gpt-oss-20b
+      --executor=ray_data
+      --engine-kwargs='{"tensor_parallel_size": 1}'
+      --autoscaling-config='{"min_replicas": 4, "max_replicas": 4}'
+    timeout_s: 3600
+    ray:
+      num_cpus: 16
+      num_gpus: 4
+      enable_object_spilling: false
+
+  # -----------------------------------------------------------------------
+  # Disaggregated: 2 prefill + 2 decode workers (TP=1 each, 4 GPUs)
+  # -----------------------------------------------------------------------
+  - name: ndd_dynamo_disagg_2p2d
+    enabled: true
+    script: ndd_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={dataset:ndd_gretel_symptoms,jsonl}
+      --output-path={session_entry_dir}/scratch/output
+      --inference-server-type=dynamo
+      --model-id=openai/gpt-oss-20b
+      --executor=ray_data
+      --engine-kwargs='{"tensor_parallel_size": 1}'
+      --dynamo-config='{"mode": "disagg", "prefill": {"num_replicas": 2}, "decode": {"num_replicas": 2}}'
+    timeout_s: 3600
+    ray:
+      num_cpus: 16
+      num_gpus: 4
+      enable_object_spilling: false
+
+  # -----------------------------------------------------------------------
+  # Disaggregated: 1 prefill + 3 decode workers (TP=1 each, 4 GPUs)
+  # -----------------------------------------------------------------------
+  - name: ndd_dynamo_disagg_1p3d
+    enabled: true
+    script: ndd_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={dataset:ndd_gretel_symptoms,jsonl}
+      --output-path={session_entry_dir}/scratch/output
+      --inference-server-type=dynamo
+      --model-id=openai/gpt-oss-20b
+      --executor=ray_data
+      --engine-kwargs='{"tensor_parallel_size": 1}'
+      --dynamo-config='{"mode": "disagg", "prefill": {"num_replicas": 1}, "decode": {"num_replicas": 3}}'
+    timeout_s: 3600
+    ray:
+      num_cpus: 16
+      num_gpus: 4
+      enable_object_spilling: false

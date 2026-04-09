@@ -190,25 +190,29 @@ class DynamoBackend(InferenceBackend):
 
         for model_config in server.models:
             dynamo_cfg = model_config.dynamo_config
-            tp_size = model_config.engine_kwargs.get("tensor_parallel_size", 1)
             is_disagg = dynamo_cfg.get("mode") == "disagg"
             model_name = model_config.model_name or model_config.model_identifier
 
-            # Check A: disagg TP must fit on a single node
-            if is_disagg and tp_size > max_gpus_per_node:
-                msg = (
-                    f"Model '{model_name}' requests TP={tp_size} in disaggregated mode, "
-                    f"but max GPUs per node is {max_gpus_per_node}. "
-                    f"Disaggregated mode does not support multi-node TP."
-                )
-                raise ValueError(msg)
-
-            # Accumulate total GPU demand
             if is_disagg:
-                num_prefill = dynamo_cfg.get("prefill_replicas", 1)
-                num_decode = dynamo_cfg.get("decode_replicas", 1)
-                total_needed += (num_prefill + num_decode) * tp_size
+                (num_prefill, prefill_ek), (num_decode, decode_ek) = DynamoBackend._resolve_disagg_role_config(
+                    model_config
+                )
+                prefill_tp = prefill_ek.get("tensor_parallel_size", 1)
+                decode_tp = decode_ek.get("tensor_parallel_size", 1)
+
+                # Check A: disagg TP must fit on a single node (check both roles)
+                for role, tp in [("prefill", prefill_tp), ("decode", decode_tp)]:
+                    if tp > max_gpus_per_node:
+                        msg = (
+                            f"Model '{model_name}' {role} requests TP={tp} in disaggregated mode, "
+                            f"but max GPUs per node is {max_gpus_per_node}. "
+                            f"Disaggregated mode does not support multi-node TP."
+                        )
+                        raise ValueError(msg)
+
+                total_needed += num_prefill * prefill_tp + num_decode * decode_tp
             else:
+                tp_size = model_config.engine_kwargs.get("tensor_parallel_size", 1)
                 num_replicas = DynamoBackend._resolve_num_replicas(model_config)
                 total_needed += num_replicas * tp_size
 
@@ -316,8 +320,6 @@ class DynamoBackend(InferenceBackend):
 
         for model_config in server.models:
             dynamo_cfg = model_config.dynamo_config
-            tp_size = model_config.engine_kwargs.get("tensor_parallel_size", 1)
-            num_replicas = self._resolve_num_replicas(model_config)
             namespace = dynamo_cfg.get("namespace", DEFAULT_DYNAMO_NAMESPACE)
             request_plane = dynamo_cfg.get("request_plane", DEFAULT_DYNAMO_REQUEST_PLANE)
             event_plane = dynamo_cfg.get("event_plane", DEFAULT_DYNAMO_EVENT_PLANE)
@@ -327,7 +329,11 @@ class DynamoBackend(InferenceBackend):
 
             model_name = model_config.model_name or model_config.model_identifier
             expected_models.add(model_name)
-            logger.info(f"Deploying model '{model_name}' (TP={tp_size}, replicas={num_replicas})")
+
+            if not is_disagg:
+                tp_size = model_config.engine_kwargs.get("tensor_parallel_size", 1)
+                num_replicas = self._resolve_num_replicas(model_config)
+                logger.info(f"Deploying model '{model_name}' (TP={tp_size}, replicas={num_replicas})")
 
             if is_disagg:
                 plans_with_roles, inventory = self._launch_disagg_workers(
@@ -535,6 +541,29 @@ class DynamoBackend(InferenceBackend):
         return reduce(InferenceModelConfig._merge_runtime_envs, envs) or None
 
     @staticmethod
+    def _resolve_disagg_role_config(
+        model_config: InferenceModelConfig,
+    ) -> tuple[tuple[int, dict[str, Any]], tuple[int, dict[str, Any]]]:
+        """Resolve per-role replica count and engine_kwargs for disaggregated serving.
+
+        Reads ``dynamo_config["prefill"]`` and ``dynamo_config["decode"]`` dicts.
+        Each may contain ``num_replicas`` (default 1) and ``engine_kwargs``
+        (merged on top of model-level ``engine_kwargs``).
+
+        Returns:
+            ``((num_prefill, prefill_engine_kwargs), (num_decode, decode_engine_kwargs))``
+        """
+        dynamo_cfg = model_config.dynamo_config
+        base_ek = model_config.engine_kwargs
+
+        def _resolve_role(role: str) -> tuple[int, dict[str, Any]]:
+            role_cfg = dynamo_cfg.get(role, {})
+            num = role_cfg.get("num_replicas", 1)
+            return num, {**base_ek, **role_cfg.get("engine_kwargs", {})}
+
+        return _resolve_role("prefill"), _resolve_role("decode")
+
+    @staticmethod
     def _resolve_num_replicas(model_config: InferenceModelConfig) -> int:
         num = model_config.deployment_config.get("num_replicas", 0)
         if num and num > 0:
@@ -671,31 +700,34 @@ class DynamoBackend(InferenceBackend):
     ) -> tuple[list[tuple[ReplicaPlan, str]], list[dict[str, Any]]]:
         """Launch separate prefill and decode worker pools for disaggregated serving.
 
-        Each worker gets ``tp_size`` GPUs on a single node.  Workers are placed
-        greedily on available GPUs.  Prefill workers additionally get
-        ``--kv-events-config`` for ZMQ event publishing.
+        Each role can have its own ``num_replicas`` and ``engine_kwargs``
+        (including ``tensor_parallel_size``), configured via nested dicts
+        in ``dynamo_config["prefill"]`` and ``dynamo_config["decode"]``.
+        Role-level ``engine_kwargs`` are merged on top of the model-level
+        defaults.
+
+        Workers are placed greedily on available GPUs.  Prefill workers
+        additionally get ``--kv-events-config`` for ZMQ event publishing.
 
         Multi-node tensor parallelism *within* a single disagg worker is not
         yet supported — each worker's TP group must fit on one node.
-
-        The ``dynamo_config`` dict on *model_config* controls pool sizes:
-        - ``prefill_replicas`` (default 1): number of prefill workers
-        - ``decode_replicas`` (default 1): number of decode workers
 
         Returns:
             Tuple of (list of (plan, role) pairs, remaining GPU inventory).
             Role is ``"decode"`` or ``"prefill"``.
         """
         dynamo_cfg = model_config.dynamo_config
-        num_prefill = dynamo_cfg.get("prefill_replicas", 1)
-        num_decode = dynamo_cfg.get("decode_replicas", 1)
-        total_workers = num_prefill + num_decode
-        tp_size = model_config.engine_kwargs.get("tensor_parallel_size", 1)
+        (num_prefill, prefill_ek), (num_decode, decode_ek) = self._resolve_disagg_role_config(model_config)
+        prefill_tp = prefill_ek.get("tensor_parallel_size", 1)
+        decode_tp = decode_ek.get("tensor_parallel_size", 1)
 
-        # Plan placement against the shared inventory (same as non-disagg path).
-        plans = plan_replica_placement(total_workers, tp_size, _inventory=inventory)
+        # Plan placement separately per role (they may have different TP sizes).
+        decode_plans = plan_replica_placement(num_decode, decode_tp, _inventory=inventory) if num_decode else []
+        inventory = self._subtract_placed_gpus(inventory, decode_plans)
 
-        for plan in plans:
+        prefill_plans = plan_replica_placement(num_prefill, prefill_tp, _inventory=inventory) if num_prefill else []
+
+        for plan in [*decode_plans, *prefill_plans]:
             if plan.is_multi_node:
                 msg = (
                     f"Disaggregated serving does not yet support multi-node tensor parallelism. "
@@ -715,8 +747,7 @@ class DynamoBackend(InferenceBackend):
         worker_index = 0
 
         # Launch decode workers first (matching Dynamo example convention)
-        for i in range(num_decode):
-            plan = plans[worker_index]
+        for i, plan in enumerate(decode_plans):
             rank0 = plan.ranks[0]
             nixl_port = get_free_port_on_node(rank0.node_id, 20097 + worker_index)
 
@@ -740,10 +771,10 @@ class DynamoBackend(InferenceBackend):
                 "decode",
                 "--kv-transfer-config",
                 kv_transfer_config,
-                *_engine_kwargs_to_cli_flags(model_config.engine_kwargs),
+                *_engine_kwargs_to_cli_flags(decode_ek),
             ]
 
-            label = build_worker_actor_name(model_name, i, 0, tp_size, role="decode")
+            label = build_worker_actor_name(model_name, i, 0, decode_tp, role="decode")
             logger.info(f"Disagg decode worker {i}: {rank0.num_gpus} GPU(s) on {rank0.node_ip}, nixl_port={nixl_port}")
             proc = spawn_actor(
                 label,
@@ -758,8 +789,7 @@ class DynamoBackend(InferenceBackend):
             worker_index += 1
 
         # Launch prefill workers
-        for i in range(num_prefill):
-            plan = plans[worker_index]
+        for i, plan in enumerate(prefill_plans):
             rank0 = plan.ranks[0]
             nixl_port = get_free_port_on_node(rank0.node_id, 20097 + worker_index)
             kv_events_port = get_free_port_on_node(rank0.node_id, 20081 + i)
@@ -798,10 +828,10 @@ class DynamoBackend(InferenceBackend):
                 kv_transfer_config,
                 "--kv-events-config",
                 kv_events_config,
-                *_engine_kwargs_to_cli_flags(model_config.engine_kwargs),
+                *_engine_kwargs_to_cli_flags(prefill_ek),
             ]
 
-            label = build_worker_actor_name(model_name, i, 0, tp_size, role="prefill")
+            label = build_worker_actor_name(model_name, i, 0, prefill_tp, role="prefill")
             logger.info(
                 f"Disagg prefill worker {i}: {rank0.num_gpus} GPU(s) on {rank0.node_ip}, "
                 f"nixl_port={nixl_port}, kv_events_port={kv_events_port}"
@@ -818,12 +848,17 @@ class DynamoBackend(InferenceBackend):
             self._worker_actors.append(proc)
             worker_index += 1
 
+        total_gpus = num_decode * decode_tp + num_prefill * prefill_tp
+        tp_desc = f"TP={decode_tp}" if decode_tp == prefill_tp else f"prefill_TP={prefill_tp}, decode_TP={decode_tp}"
         logger.info(
             f"Disaggregated serving: {num_decode} decode + {num_prefill} prefill "
-            f"workers launched ({total_workers * tp_size} GPUs total, TP={tp_size})"
+            f"workers launched ({total_gpus} GPUs total, {tp_desc})"
         )
-        plans_with_roles = [(plans[i], "decode" if i < num_decode else "prefill") for i in range(total_workers)]
-        return plans_with_roles, self._subtract_placed_gpus(inventory, plans)
+        all_plans = self._subtract_placed_gpus(inventory, prefill_plans)
+        plans_with_roles: list[tuple[ReplicaPlan, str]] = [(p, "decode") for p in decode_plans] + [
+            (p, "prefill") for p in prefill_plans
+        ]
+        return plans_with_roles, all_plans
 
     def _launch_worker(  # noqa: PLR0913
         self,
