@@ -18,7 +18,7 @@ import os
 import pytest
 
 from nemo_curator.core.serve import InferenceModelConfig, InferenceServer
-from nemo_curator.core.serve.internal.dynamo import DynamoBackend
+from nemo_curator.core.serve.internal.dynamo import DynamoBackend, _dynamo_endpoint, _model_name_to_component
 from nemo_curator.core.serve.internal.errors import SubprocessError
 from nemo_curator.core.serve.internal.subprocess_mgr import (
     ManagedSubprocess,
@@ -203,6 +203,125 @@ class TestDynamoBackendValidation:
         )
         backend = DynamoBackend(server)
         backend.stop()  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# Model name → component slug
+# ---------------------------------------------------------------------------
+
+
+class TestModelNameToComponent:
+    def test_hf_org_and_model(self):
+        assert _model_name_to_component("Qwen/Qwen3-0.6B") == "qwen_qwen3_0_6b"
+
+    def test_hf_org_with_dots(self):
+        assert _model_name_to_component("google/gemma-3-4b-it") == "google_gemma_3_4b_it"
+
+    def test_simple_name(self):
+        assert _model_name_to_component("my-custom-model") == "my_custom_model"
+
+    def test_already_clean(self):
+        assert _model_name_to_component("model_a") == "model_a"
+
+    def test_leading_trailing_special_chars(self):
+        assert _model_name_to_component("/some/model/") == "some_model"
+
+    def test_dots_replaced(self):
+        """Dots must be replaced — they are delimiters in dyn:// endpoint strings."""
+        result = _model_name_to_component("v1.5-model")
+        assert "." not in result
+        assert result == "v1_5_model"
+
+    def test_all_special_chars_raises(self):
+        """Input that sanitizes to empty should raise, not produce an invalid endpoint."""
+        with pytest.raises(ValueError, match="empty component slug"):
+            _model_name_to_component("---")
+
+
+# ---------------------------------------------------------------------------
+# Unique model name validation
+# ---------------------------------------------------------------------------
+
+
+class TestUniqueModelNameValidation:
+    def test_unique_names_pass(self):
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(model_identifier="org/model-a", model_name="model-a"),
+                InferenceModelConfig(model_identifier="org/model-b", model_name="model-b"),
+            ],
+            backend="dynamo",
+        )
+        DynamoBackend._validate_unique_model_names(server)  # should not raise
+
+    def test_duplicate_model_name_raises(self):
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(model_identifier="org/model-a", model_name="same-name"),
+                InferenceModelConfig(model_identifier="org/model-b", model_name="same-name"),
+            ],
+            backend="dynamo",
+        )
+        with pytest.raises(ValueError, match="Duplicate model name"):
+            DynamoBackend._validate_unique_model_names(server)
+
+    def test_duplicate_identifier_without_model_name_raises(self):
+        """Two configs with same model_identifier and no model_name should collide."""
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(model_identifier="Qwen/Qwen3-0.6B"),
+                InferenceModelConfig(model_identifier="Qwen/Qwen3-0.6B"),
+            ],
+            backend="dynamo",
+        )
+        with pytest.raises(ValueError, match="Duplicate model name"):
+            DynamoBackend._validate_unique_model_names(server)
+
+    def test_same_identifier_different_model_name_passes(self):
+        """Same model_identifier is fine if model_name is unique."""
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(model_identifier="Qwen/Qwen3-0.6B", model_name="qwen-fast"),
+                InferenceModelConfig(model_identifier="Qwen/Qwen3-0.6B", model_name="qwen-throughput"),
+            ],
+            backend="dynamo",
+        )
+        DynamoBackend._validate_unique_model_names(server)  # should not raise
+
+    def test_single_model_always_passes(self):
+        server = InferenceServer(
+            models=[InferenceModelConfig(model_identifier="m")],
+            backend="dynamo",
+        )
+        DynamoBackend._validate_unique_model_names(server)  # should not raise
+
+    def test_component_slug_collision_raises(self):
+        """Names that differ but sanitize to the same component should be rejected."""
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(model_identifier="x", model_name="a.b"),
+                InferenceModelConfig(model_identifier="y", model_name="a-b"),
+            ],
+            backend="dynamo",
+        )
+        with pytest.raises(ValueError, match="both sanitize to component"):
+            DynamoBackend._validate_unique_model_names(server)
+
+
+# ---------------------------------------------------------------------------
+# Endpoint URI builder
+# ---------------------------------------------------------------------------
+
+
+class TestDynamoEndpoint:
+    def test_aggregate(self):
+        assert _dynamo_endpoint("curator", "qwen") == "dyn://curator.qwen.generate"
+
+    def test_with_role(self):
+        assert _dynamo_endpoint("curator", "gemma", role="decode") == "dyn://curator.gemma_decode.generate"
+
+    def test_prefill_role(self):
+        assert _dynamo_endpoint("ns", "model_a", role="prefill") == "dyn://ns.model_a_prefill.generate"
 
 
 # ---------------------------------------------------------------------------

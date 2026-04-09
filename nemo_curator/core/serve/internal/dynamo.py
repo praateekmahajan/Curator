@@ -18,6 +18,7 @@ import contextlib
 import http
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -57,6 +58,39 @@ from nemo_curator.core.serve.server import InferenceModelConfig
 
 if TYPE_CHECKING:
     from nemo_curator.core.serve.server import InferenceServer
+
+
+def _model_name_to_component(name: str) -> str:
+    """Sanitize a model name into a valid Dynamo component name.
+
+    Dynamo endpoints use ``dyn://namespace.component.endpoint`` format
+    where dots are delimiters.  This replaces all non-alphanumeric
+    characters with underscores to produce a safe component name.
+
+    Differs from ``nemo_curator.stages.text.models.utils.format_name_with_suffix``
+    which only takes the last path component and does not replace dots —
+    both are required here to avoid collisions across HuggingFace orgs
+    and to keep dots out of the ``dyn://`` URI.
+
+    Examples:
+        >>> _model_name_to_component("Qwen/Qwen3-0.6B")
+        'qwen_qwen3_0_6b'
+        >>> _model_name_to_component("google/gemma-3-4b-it")
+        'google_gemma_3_4b_it'
+        >>> _model_name_to_component("my-custom-model")
+        'my_custom_model'
+    """
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    if not slug:
+        msg = f"Model name {name!r} produces an empty component slug after sanitization."
+        raise ValueError(msg)
+    return slug
+
+
+def _dynamo_endpoint(namespace: str, component: str, role: str | None = None) -> str:
+    """Build a ``dyn://namespace.component.endpoint`` URI for worker registration."""
+    suffix = f"_{role}" if role else ""
+    return f"dyn://{namespace}.{component}{suffix}.generate"
 
 
 class DynamoBackend(InferenceBackend):
@@ -172,6 +206,45 @@ class DynamoBackend(InferenceBackend):
                     f"same namespace, request_plane, and event_plane."
                 )
                 raise ValueError(msg)
+
+    @staticmethod
+    def _validate_unique_model_names(server: InferenceServer) -> None:
+        """Reject duplicate model names and component-slug collisions.
+
+        Each model must have a unique ``model_name`` (or ``model_identifier``
+        when ``model_name`` is not set).  Dynamo routes requests by model name,
+        so duplicates would be unroutable.  When deploying the same
+        ``model_identifier`` multiple times (e.g. with different TP), each
+        config must set a distinct ``model_name``.
+
+        Also checks that sanitized component names are unique — two
+        different model names that collapse to the same slug (e.g. ``a.b``
+        and ``a-b`` both become ``a_b``) would cause silent routing conflicts.
+        """
+        seen_names: dict[str, int] = {}
+        seen_components: dict[str, tuple[int, str]] = {}
+        for i, m in enumerate(server.models):
+            name = m.model_name or m.model_identifier
+            if name in seen_names:
+                msg = (
+                    f"Duplicate model name {name!r} at index {i} "
+                    f"(first seen at index {seen_names[name]}). "
+                    f"When deploying the same model_identifier multiple times, "
+                    f"each must have a distinct model_name."
+                )
+                raise ValueError(msg)
+            seen_names[name] = i
+
+            comp = _model_name_to_component(name)
+            if comp in seen_components:
+                prev_idx, prev_name = seen_components[comp]
+                msg = (
+                    f"Model names {prev_name!r} (index {prev_idx}) and "
+                    f"{name!r} (index {i}) both sanitize to component "
+                    f"{comp!r}. Use more distinct model_name values."
+                )
+                raise ValueError(msg)
+            seen_components[comp] = (i, name)
 
     @staticmethod
     def _validate_gpu_requirements(server: InferenceServer, inventory: list[dict[str, Any]]) -> None:
@@ -303,6 +376,7 @@ class DynamoBackend(InferenceBackend):
         # Fail-fast validations before starting any infrastructure (etcd/NATS).
         self._validate_gpu_requirements(server, inventory)
         self._validate_frontend_config(server)
+        self._validate_unique_model_names(server)
 
         # Infrastructure -- on infra node (head or first non-head when excluded)
         if not server.etcd_endpoint:
@@ -744,6 +818,7 @@ class DynamoBackend(InferenceBackend):
         )
 
         model_name = model_config.model_name or model_config.model_identifier
+        component = _model_name_to_component(model_name)
         worker_index = 0
 
         # Launch decode workers first (matching Dynamo example convention)
@@ -759,8 +834,8 @@ class DynamoBackend(InferenceBackend):
                 model_config.model_identifier,
                 "--served-model-name",
                 model_name,
-                "--namespace",
-                namespace,
+                "--endpoint",
+                _dynamo_endpoint(namespace, component, role="decode"),
                 "--discovery-backend",
                 "etcd",
                 "--request-plane",
@@ -814,8 +889,8 @@ class DynamoBackend(InferenceBackend):
                 model_config.model_identifier,
                 "--served-model-name",
                 model_name,
-                "--namespace",
-                namespace,
+                "--endpoint",
+                _dynamo_endpoint(namespace, component, role="prefill"),
                 "--discovery-backend",
                 "etcd",
                 "--request-plane",
@@ -879,6 +954,7 @@ class DynamoBackend(InferenceBackend):
         coordinates with headless workers via ``torch.distributed``.
         """
         model_name = model_config.model_name or model_config.model_identifier
+        component = _model_name_to_component(model_name)
         command = [
             sys.executable,
             "-m",
@@ -887,8 +963,8 @@ class DynamoBackend(InferenceBackend):
             model_config.model_identifier,
             "--served-model-name",
             model_name,
-            "--namespace",
-            namespace,
+            "--endpoint",
+            _dynamo_endpoint(namespace, component),
             "--discovery-backend",
             "etcd",
             "--request-plane",
