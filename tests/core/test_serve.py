@@ -76,6 +76,32 @@ class TestInferenceModelConfig:
         assert result_verbose.runtime_env["env_vars"]["VLLM_LOGGING_LEVEL"] == "DEBUG"
         assert "RAY_SERVE_LOG_TO_STDERR" not in result_verbose.runtime_env["env_vars"]
 
+    def test_merge_runtime_envs_concatenates_pip_lists(self) -> None:
+        """pip/uv lists are concatenated, not replaced, during merge."""
+        base = {"pip": ["ai-dynamo[vllm]"], "env_vars": {"A": "1"}}
+        override = {"pip": ["extra-package==1.0"], "env_vars": {"B": "2"}}
+        result = InferenceModelConfig._merge_runtime_envs(base, override)
+
+        assert sorted(result["pip"]) == sorted(["ai-dynamo[vllm]", "extra-package==1.0"])
+        assert result["env_vars"] == {"A": "1", "B": "2"}
+
+    def test_merge_runtime_envs_concatenates_uv_lists(self) -> None:
+        """uv lists are concatenated like pip lists."""
+        base = {"uv": ["ai-dynamo[vllm]"]}
+        override = {"uv": ["other-pkg"]}
+        result = InferenceModelConfig._merge_runtime_envs(base, override)
+
+        assert sorted(result["uv"]) == sorted(["ai-dynamo[vllm]", "other-pkg"])
+
+    def test_merge_runtime_envs_mixed_pip_uv(self) -> None:
+        """Base has pip, override has uv -- both preserved."""
+        base = {"pip": ["pkg-a"]}
+        override = {"uv": ["pkg-b"]}
+        result = InferenceModelConfig._merge_runtime_envs(base, override)
+
+        assert result["pip"] == ["pkg-a"]
+        assert result["uv"] == ["pkg-b"]
+
 
 class TestBackendDispatch:
     def test_backend_param_creates_dynamo(self):
@@ -314,3 +340,45 @@ class TestInferenceServerIntegration:
         assert len(response.choices[0].message.content) > 0
 
         server2.stop()
+
+
+class TestDynamoRuntimeEnv:
+    def test_default_injects_ai_dynamo_vllm(self) -> None:
+        """With no user runtime_env, result contains ai-dynamo[vllm] uv requirement."""
+        from nemo_curator.core.serve.internal.dynamo import DynamoBackend
+
+        config = InferenceModelConfig(model_identifier="some-model")
+        result = DynamoBackend._dynamo_runtime_env(config)
+
+        assert "uv" in result
+        assert "ai-dynamo[vllm]" in result["uv"]
+
+    def test_merges_with_user_runtime_env(self) -> None:
+        """User runtime_env is merged: uv/pip lists concatenated, env_vars merged."""
+        from nemo_curator.core.serve.internal.dynamo import DynamoBackend
+
+        config = InferenceModelConfig(
+            model_identifier="some-model",
+            runtime_env={
+                "uv": ["extra-package"],
+                "env_vars": {"MY_VAR": "1"},
+            },
+        )
+        result = DynamoBackend._dynamo_runtime_env(config)
+
+        assert "ai-dynamo[vllm]" in result["uv"]
+        assert "extra-package" in result["uv"]
+        assert result["env_vars"]["MY_VAR"] == "1"
+
+    def test_user_env_vars_preserved(self) -> None:
+        """User env_vars are not overwritten by the default (which has no env_vars)."""
+        from nemo_curator.core.serve.internal.dynamo import DynamoBackend
+
+        config = InferenceModelConfig(
+            model_identifier="some-model",
+            runtime_env={"env_vars": {"VLLM_LOGGING_LEVEL": "DEBUG"}},
+        )
+        result = DynamoBackend._dynamo_runtime_env(config)
+
+        assert result["env_vars"]["VLLM_LOGGING_LEVEL"] == "DEBUG"
+        assert "ai-dynamo[vllm]" in result["uv"]

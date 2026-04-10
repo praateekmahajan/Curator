@@ -124,7 +124,13 @@ class InferenceModelConfig:
         base: dict[str, Any],
         override: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        """Merge two runtime_env dicts, with special handling for ``env_vars``."""
+        """Merge two runtime_env dicts.
+
+        Special handling:
+        - ``env_vars``: dicts are merged (override wins on key conflict).
+        - ``pip`` / ``uv``: lists are concatenated (both sets of packages installed).
+        - All other keys: override replaces base.
+        """
         if not base and not override:
             return {}
         if not override:
@@ -133,10 +139,20 @@ class InferenceModelConfig:
             return {**override}
 
         merged = {**base, **override}
+
+        # Merge env_vars dicts
         base_env_vars = base.get("env_vars", {})
         override_env_vars = override.get("env_vars", {})
         if base_env_vars or override_env_vars:
             merged["env_vars"] = {**base_env_vars, **override_env_vars}
+
+        # Concatenate pip/uv package lists
+        for key in ("pip", "uv"):
+            base_pkgs = base.get(key, [])
+            override_pkgs = override.get(key, [])
+            if base_pkgs and override_pkgs:
+                merged[key] = [*base_pkgs, *override_pkgs]
+
         return merged
 
 

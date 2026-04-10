@@ -93,6 +93,15 @@ def _dynamo_endpoint(namespace: str, component: str, role: str | None = None) ->
     return f"dyn://{namespace}.{component}{suffix}.generate"
 
 
+# Default runtime_env for Dynamo workers — installs ai-dynamo[vllm] which
+# brings the exact vLLM version matching the installed ai-dynamo release.
+# Uses uv (faster than pip). Ray caches this per content-hash, so the
+# install cost is paid once per node.
+_DYNAMO_VLLM_RUNTIME_ENV: dict[str, Any] = {
+    "uv": ["ai-dynamo[vllm]"],
+}
+
+
 class DynamoBackend(InferenceBackend):
     """NVIDIA Dynamo inference backend.
 
@@ -602,17 +611,32 @@ class DynamoBackend(InferenceBackend):
         return infra["NodeID"], infra["NodeManagerAddress"]
 
     @staticmethod
-    def _merge_model_runtime_envs(models: list[InferenceModelConfig]) -> dict[str, Any] | None:
+    def _dynamo_runtime_env(model_config: InferenceModelConfig) -> dict[str, Any]:
+        """Build the runtime_env for a Dynamo worker/frontend actor.
+
+        Merges the default ``ai-dynamo[vllm]`` requirement with any
+        user-provided ``runtime_env`` from the model config.
+        """
+        return InferenceModelConfig._merge_runtime_envs(
+            _DYNAMO_VLLM_RUNTIME_ENV,
+            model_config.runtime_env or None,
+        )
+
+    @staticmethod
+    def _merge_model_runtime_envs(models: list[InferenceModelConfig]) -> dict[str, Any]:
         """Merge ``runtime_env`` dicts from all model configs for the frontend.
 
-        Returns ``None`` when no model specifies a ``runtime_env``.
+        Always includes ``ai-dynamo[vllm]`` as a base, then merges any
+        user-provided ``runtime_env`` from model configs on top.
         """
         from functools import reduce
 
         envs = [m.runtime_env for m in models if m.runtime_env]
-        if not envs:
-            return None
-        return reduce(InferenceModelConfig._merge_runtime_envs, envs) or None
+        user_merged = reduce(InferenceModelConfig._merge_runtime_envs, envs) if envs else None
+        return InferenceModelConfig._merge_runtime_envs(
+            _DYNAMO_VLLM_RUNTIME_ENV,
+            user_merged,
+        )
 
     @staticmethod
     def _resolve_disagg_role_config(
@@ -858,7 +882,7 @@ class DynamoBackend(InferenceBackend):
                 runtime_dir=self._runtime_dir,
                 actor_name_prefix=self._actor_name_prefix,
                 subprocess_env={**base_env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port), "PYTHONHASHSEED": "0"},
-                runtime_env=model_config.runtime_env or None,
+                runtime_env=self._dynamo_runtime_env(model_config),
             )
             self._worker_actors.append(proc)
             worker_index += 1
@@ -918,7 +942,7 @@ class DynamoBackend(InferenceBackend):
                 runtime_dir=self._runtime_dir,
                 actor_name_prefix=self._actor_name_prefix,
                 subprocess_env={**base_env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port), "PYTHONHASHSEED": "0"},
-                runtime_env=model_config.runtime_env or None,
+                runtime_env=self._dynamo_runtime_env(model_config),
             )
             self._worker_actors.append(proc)
             worker_index += 1
@@ -995,7 +1019,7 @@ class DynamoBackend(InferenceBackend):
             runtime_dir=self._runtime_dir,
             actor_name_prefix=self._actor_name_prefix,
             subprocess_env=base_env,
-            runtime_env=model_config.runtime_env or None,
+            runtime_env=self._dynamo_runtime_env(model_config),
         )
 
     def _launch_headless_worker(
@@ -1039,7 +1063,7 @@ class DynamoBackend(InferenceBackend):
             runtime_dir=self._runtime_dir,
             actor_name_prefix=self._actor_name_prefix,
             subprocess_env=base_env,
-            runtime_env=model_config.runtime_env or None,
+            runtime_env=self._dynamo_runtime_env(model_config),
         )
 
     def _launch_frontend(  # noqa: PLR0913
