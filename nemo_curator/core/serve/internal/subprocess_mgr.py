@@ -379,8 +379,12 @@ def _define_subprocess_actor(actor_type: str = "SubprocessActor") -> type:  # no
     2. **Discover GPUs** via ``get_assigned_gpus()`` -- returns Ray-assigned
        accelerator IDs.
     3. **Launch subprocess** via ``initialize(command, subprocess_env,
+       log_file)`` or ``initialize(python_args=..., subprocess_env,
        log_file)`` -- applies *subprocess_env* as overrides on top of
        the actor's inherited ``os.environ``, then starts the process.
+       When *python_args* is given, the actor prepends its own
+       ``sys.executable`` so the subprocess uses the runtime_env's
+       Python, not the driver's.
     4. **Start run()** -- the returned ``ObjectRef`` resolves on exit,
        enabling ``ray.wait()``-based liveness detection.
 
@@ -411,9 +415,11 @@ def _define_subprocess_actor(actor_type: str = "SubprocessActor") -> type:  # no
 
         def initialize(
             self,
-            command: list[str],
+            command: list[str] | None,
             subprocess_env: dict[str, str],
             log_file: str | None = None,
+            *,
+            python_args: list[str] | None = None,
         ) -> dict:
             """Launch the subprocess with the actor's env plus *subprocess_env* overrides.
 
@@ -421,10 +427,24 @@ def _define_subprocess_actor(actor_type: str = "SubprocessActor") -> type:  # no
             *subprocess_env* adds explicit overrides on top (e.g.
             ``CUDA_VISIBLE_DEVICES``, ``ETCD_ENDPOINTS``).
 
+            Pass *command* for binary subprocesses (etcd, nats) or
+            *python_args* for Python module invocations (``-m dynamo.vllm``).
+            When *python_args* is given, the actor prepends its own
+            ``sys.executable`` — which inside a ``runtime_env`` points to
+            the isolated virtualenv's Python, not the driver's.
+
             Returns:
                 ``{"pid": int, "log_file": str | None}``
             """
+            if (command is None) == (python_args is None):
+                msg = "Exactly one of 'command' or 'python_args' must be provided"
+                raise ValueError(msg)
+
             import subprocess as _sp
+            import sys as _sys
+
+            if python_args is not None:
+                command = [_sys.executable, *python_args]
 
             merged_env = {**os.environ, **subprocess_env}
 
@@ -591,19 +611,28 @@ def get_free_port_on_node(node_id: str, start_port: int, get_next_free_port: boo
 
 def spawn_actor(  # noqa: PLR0913
     label: str,
-    command: list[str],
     node_alloc: NodeAllocation,
     *,
+    command: list[str] | None = None,
+    python_args: list[str] | None = None,
     runtime_dir: str | None = None,
     actor_name_prefix: str = "",
     subprocess_env: dict[str, str] | None = None,
     runtime_env: dict[str, Any] | None = None,
 ) -> ManagedSubprocess:
-    """Create a detached Ray actor that runs *command* as a subprocess.
+    """Create a detached Ray actor that runs a subprocess.
 
     Handles both GPU workers and non-GPU infra actors (etcd, NATS,
     frontend).  For GPU actors, discovers Ray-assigned GPU IDs and sets
     ``CUDA_VISIBLE_DEVICES`` explicitly in *subprocess_env*.
+
+    Pass *command* for binary subprocesses (etcd, nats) or *python_args*
+    for Python module invocations (``["-m", "dynamo.vllm", ...]``).
+    When *python_args* is used, the **actor** prepends its own
+    ``sys.executable`` — which inside a ``runtime_env`` points to the
+    isolated virtualenv's Python, not the driver's.  This ensures
+    subprocesses load packages from the runtime_env (e.g. the correct
+    vLLM version) rather than the base environment.
 
     The actor class is created per-call with ``__name__`` set to *label*,
     so the Ray dashboard shows descriptive names (e.g. ``Dynamo_ETCD``,
@@ -617,8 +646,13 @@ def spawn_actor(  # noqa: PLR0913
     Args:
         label: Human-readable label (used for actor naming, class naming,
             and logs).
-        command: Subprocess command to run.
         node_alloc: Node + GPU allocation for this actor.
+        command: Full subprocess command for binary processes (mutually
+            exclusive with *python_args*).
+        python_args: Arguments for a Python subprocess (e.g.
+            ``["-m", "dynamo.vllm", "--model", ...]``).  The actor
+            prepends ``sys.executable`` at launch time (mutually
+            exclusive with *command*).
         runtime_dir: Directory for log files.  If ``None``, logs are
             discarded.
         actor_name_prefix: Prefix for the detached actor name (used for
@@ -630,6 +664,10 @@ def spawn_actor(  # noqa: PLR0913
             ``_NOSET_CUDA_RUNTIME_ENV`` so that
             ``RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES`` is always set.
     """
+    if (command is None) == (python_args is None):
+        msg = "spawn_actor requires exactly one of 'command' or 'python_args'"
+        raise ValueError(msg)
+
     import ray
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
@@ -664,7 +702,7 @@ def spawn_actor(  # noqa: PLR0913
             actual_env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
 
     # Phase 3: launch subprocess
-    status = ray.get(actor.initialize.remote(command, actual_env, log_file))
+    status = ray.get(actor.initialize.remote(command, actual_env, log_file, python_args=python_args))
 
     # Phase 4: start run() -- the ObjectRef resolves when the subprocess exits
     run_ref = actor.run.remote()

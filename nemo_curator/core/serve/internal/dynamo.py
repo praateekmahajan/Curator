@@ -20,7 +20,6 @@ import json
 import os
 import re
 import shutil
-import sys
 import tempfile
 import time
 import uuid
@@ -697,8 +696,8 @@ class DynamoBackend(InferenceBackend):
         node_alloc = NodeAllocation(node_id=infra_node_id, node_ip=self._infra_ip, num_gpus=0, node_rank=0)
         proc = spawn_actor(
             "Dynamo_ETCD",
-            command,
             node_alloc,
+            command=command,
             runtime_dir=self._runtime_dir,
             actor_name_prefix=self._actor_name_prefix,
             subprocess_env={"ALLOW_NONE_AUTHENTICATION": "yes"},
@@ -717,8 +716,8 @@ class DynamoBackend(InferenceBackend):
         node_alloc = NodeAllocation(node_id=infra_node_id, node_ip=self._infra_ip, num_gpus=0, node_rank=0)
         proc = spawn_actor(
             "Dynamo_NATS",
-            command,
             node_alloc,
+            command=command,
             runtime_dir=self._runtime_dir,
             actor_name_prefix=self._actor_name_prefix,
         )
@@ -850,8 +849,7 @@ class DynamoBackend(InferenceBackend):
             rank0 = plan.ranks[0]
             nixl_port = get_free_port_on_node(rank0.node_id, 20097 + worker_index)
 
-            command = [
-                sys.executable,
+            python_args = [
                 "-m",
                 "dynamo.vllm",
                 "--model",
@@ -877,8 +875,8 @@ class DynamoBackend(InferenceBackend):
             logger.info(f"Disagg decode worker {i}: {rank0.num_gpus} GPU(s) on {rank0.node_ip}, nixl_port={nixl_port}")
             proc = spawn_actor(
                 label,
-                command,
                 rank0,
+                python_args=python_args,
                 runtime_dir=self._runtime_dir,
                 actor_name_prefix=self._actor_name_prefix,
                 subprocess_env={**base_env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port), "PYTHONHASHSEED": "0"},
@@ -905,8 +903,7 @@ class DynamoBackend(InferenceBackend):
                 )
             )
 
-            command = [
-                sys.executable,
+            python_args = [
                 "-m",
                 "dynamo.vllm",
                 "--model",
@@ -937,8 +934,8 @@ class DynamoBackend(InferenceBackend):
             )
             proc = spawn_actor(
                 label,
-                command,
                 rank0,
+                python_args=python_args,
                 runtime_dir=self._runtime_dir,
                 actor_name_prefix=self._actor_name_prefix,
                 subprocess_env={**base_env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port), "PYTHONHASHSEED": "0"},
@@ -979,8 +976,7 @@ class DynamoBackend(InferenceBackend):
         """
         model_name = model_config.model_name or model_config.model_identifier
         component = _model_name_to_component(model_name)
-        command = [
-            sys.executable,
+        python_args = [
             "-m",
             "dynamo.vllm",
             "--model",
@@ -999,7 +995,7 @@ class DynamoBackend(InferenceBackend):
         ]
 
         if multi_node_plan is not None:
-            command.extend(
+            python_args.extend(
                 [
                     "--nnodes",
                     str(multi_node_plan.nnodes),
@@ -1014,8 +1010,8 @@ class DynamoBackend(InferenceBackend):
         label = build_worker_actor_name(model_name, replica_index, 0, tp_size)
         return spawn_actor(
             label,
-            command,
             node_alloc,
+            python_args=python_args,
             runtime_dir=self._runtime_dir,
             actor_name_prefix=self._actor_name_prefix,
             subprocess_env=base_env,
@@ -1037,8 +1033,7 @@ class DynamoBackend(InferenceBackend):
         they run only vLLM workers coordinated with rank 0 via
         ``torch.distributed`` (NCCL).  No model registration, no etcd/NATS.
         """
-        command = [
-            sys.executable,
+        python_args = [
             "-m",
             "dynamo.vllm",
             "--model",
@@ -1058,8 +1053,8 @@ class DynamoBackend(InferenceBackend):
         label = build_worker_actor_name(model_name, replica_index, node_alloc.node_rank, tp_size)
         return spawn_actor(
             label,
-            command,
             node_alloc,
+            python_args=python_args,
             runtime_dir=self._runtime_dir,
             actor_name_prefix=self._actor_name_prefix,
             subprocess_env=base_env,
@@ -1081,8 +1076,7 @@ class DynamoBackend(InferenceBackend):
         frontend_env = dict(base_env)
         if router_mode:
             frontend_env["PYTHONHASHSEED"] = "0"
-        command = [
-            sys.executable,
+        python_args = [
             "-m",
             "dynamo.frontend",
             "--http-port",
@@ -1097,14 +1091,14 @@ class DynamoBackend(InferenceBackend):
             event_plane,
         ]
         if router_mode:
-            command.extend(["--router-mode", router_mode, "--router-reset-states"])
+            python_args.extend(["--router-mode", router_mode, "--router-reset-states"])
 
         node_alloc = NodeAllocation(node_id=infra_node_id, node_ip=self._infra_ip, num_gpus=0, node_rank=0)
         logger.info(f"Starting Dynamo frontend on port {port}")
         return spawn_actor(
             "Dynamo_Frontend",
-            command,
             node_alloc,
+            python_args=python_args,
             runtime_dir=self._runtime_dir,
             actor_name_prefix=self._actor_name_prefix,
             subprocess_env=frontend_env,
