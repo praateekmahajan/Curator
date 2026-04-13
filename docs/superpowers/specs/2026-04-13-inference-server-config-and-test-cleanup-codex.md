@@ -57,7 +57,7 @@ The chosen design is the typed-config variant corresponding to the earlier "Opti
 - models use backend-specific model config classes rather than a generic model config with backend-specific bags.
 - server-wide Dynamo router and infra settings live once on the Dynamo server config.
 - `engine_kwargs` stays a raw dict, but it moves into backend- or engine-specific model config types instead of staying on the generic model config.
-- `runtime_env` lives once per server on the backend config.
+- one user-provided `runtime_env` lives once per server on the backend config, while backend implementations may still layer internal defaults or overrides at launch time.
 
 This is the right shape even if Dynamo later supports both vLLM and SGLang, because "Dynamo" remains a backend family while the engine family is selected inside the Dynamo server config.
 
@@ -112,6 +112,7 @@ This config deliberately holds only per-model settings. Router, namespace, disco
 ```python
 @dataclass
 class RayServeServerConfig:
+    family: ClassVar[Literal["ray_serve"]] = "ray_serve"
     runtime_env: dict[str, Any] = field(default_factory=dict)
 ```
 
@@ -136,6 +137,7 @@ class DynamoRouterConfig:
 ```python
 @dataclass
 class DynamoServerConfig:
+    family: ClassVar[Literal["dynamo"]] = "dynamo"
     engine: Literal["vllm"] = "vllm"
     runtime_env: dict[str, Any] = field(default_factory=dict)
     etcd_endpoint: str | None = None
@@ -197,6 +199,7 @@ These validations still matter:
 - disaggregated serving role validation
 - multi-node placement constraints
 - backend/model family mismatch errors
+- stable backend-family reporting for `_active_servers` and pipeline GPU-contention checks
 
 ## Placement Of Existing Fields
 
@@ -233,10 +236,8 @@ nemo_curator/core/serve/
       types.py
     ray_serve/
       backend.py
-      config.py
     dynamo/
       backend.py
-      config.py
       vllm.py
 ```
 
@@ -250,6 +251,7 @@ nemo_curator/core/serve/
 - `config.py`
   - owns public typed config classes
   - owns backend/model compatibility validation entrypoints
+  - is the only place public serve config dataclasses are defined
 
 - `backends/ray_serve/*`
   - owns Ray Serve-specific translation from typed config into `LLMConfig` and Serve deployment behavior
@@ -272,9 +274,13 @@ nemo_curator/core/serve/
 - Dynamo infra fields
 - backend-specific config parsing
 
+It still needs a stable backend-family identifier for active-server tracking and for pipeline contention checks. That identifier should come from the typed backend config, for example `server.backend.family`, rather than from a user-supplied backend string.
+
 ### Ray Serve translation
 
 `InferenceModelConfig.to_llm_config()` is Ray Serve-specific behavior today. That logic should move into the Ray Serve backend area rather than stay on a generic model config type.
+
+Ray Serve should continue to merge backend-owned runtime environment with its internal quiet/logging overrides at translation time.
 
 ### Dynamo translation
 
@@ -285,6 +291,8 @@ Current Dynamo code reads repeated server-wide settings from model-level dicts. 
 - role-level settings come from `DynamoRoleConfig`
 
 That means helpers like current router-resolution code become simpler and narrower.
+
+Dynamo should continue to merge backend-owned runtime environment with backend-added defaults such as `ai-dynamo[vllm]` injection inside the backend implementation rather than exposing those internal defaults in the public config surface.
 
 ## PR Decomposition
 
@@ -370,6 +378,7 @@ Why separate:
 
 | Source | Primary test file |
 | --- | --- |
+| `config.py` | `tests/core/serve/test_config.py` |
 | `server.py` | `tests/core/serve/test_server.py` |
 | `backends/shared/subprocess_mgr.py` | `tests/core/serve/backends/shared/test_subprocess_mgr.py` |
 | `backends/ray_serve/backend.py` | `tests/core/serve/backends/ray_serve/test_backend.py` |
