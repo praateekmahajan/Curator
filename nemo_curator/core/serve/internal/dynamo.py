@@ -101,6 +101,19 @@ _DYNAMO_VLLM_RUNTIME_ENV: dict[str, Any] = {
 }
 
 
+_FRONTEND_ROUTER_KEYS = (
+    "router_mode",
+    "router_kv_events",
+    "router_kv_overlap_score_weight",
+    "router_temperature",
+    "router_queue_threshold",
+    "router_ttl_secs",
+    "router_max_tree_size",
+    "router_prune_target_ratio",
+    "router_reset_states",
+)
+
+
 class DynamoBackend(InferenceBackend):
     """NVIDIA Dynamo inference backend.
 
@@ -116,6 +129,12 @@ class DynamoBackend(InferenceBackend):
       in etcd); rank 1+ run headless vLLM workers coordinated via
       ``torch.distributed``.  Each rank is pinned to its planned node via
       ``NodeAffinitySchedulingStrategy``.
+
+    Supports KV-cache-aware routing via ``dynamo_config["router_mode"]``.
+    When ``router_mode="kv"``, workers publish KV cache events over ZMQ
+    (exact mode) or the frontend predicts cache state from routing decisions
+    (approximate mode, ``router_kv_events=False``).  Router settings are
+    resolved once across all models and validated for consistency.
 
     This backend reserves GPUs via ``num_gpus`` on Ray actors, so
     Ray's scheduler is aware of Dynamo's GPU usage.  Pipelines with GPU
@@ -181,37 +200,84 @@ class DynamoBackend(InferenceBackend):
             json.dump(manifest, f, indent=2)
 
     @staticmethod
-    def _validate_frontend_config(server: InferenceServer) -> None:
-        """Reject mismatched namespace/request_plane/event_plane across models.
+    def _resolve_frontend_router_config(server: InferenceServer) -> dict[str, Any]:
+        """Resolve a single set of frontend router settings from all models.
 
-        The Dynamo frontend uses a single namespace and plane config, taken
-        from the first model.  If other models specify different values,
-        they would be silently ignored — fail loud instead.
+        Returns a dict with the effective value for each ``_FRONTEND_ROUTER_KEYS``
+        key.  Values are taken from the first model that explicitly sets each key,
+        falling back to Dynamo defaults.  When no model has a ``router_mode`` set,
+        disagg models default to ``"kv"``; otherwise ``None`` (round-robin).
+        """
+
+        def _first_explicit(key: str) -> str | float | bool | int | None:
+            return next((m.dynamo_config[key] for m in server.models if key in m.dynamo_config), None)
+
+        any_disagg = any(m.dynamo_config.get("mode") == "disagg" for m in server.models)
+        explicit_mode = _first_explicit("router_mode")
+        router_mode = explicit_mode if explicit_mode is not None else ("kv" if any_disagg else None)
+
+        explicit_kv_events = _first_explicit("router_kv_events")
+        router_kv_events = explicit_kv_events if explicit_kv_events is not None else True
+
+        def _with_default(key: str, default: str | float | bool) -> str | float | bool:
+            val = _first_explicit(key)
+            return val if val is not None else default
+
+        return {
+            "router_mode": router_mode,
+            "router_kv_events": router_kv_events,
+            "router_kv_overlap_score_weight": _with_default("router_kv_overlap_score_weight", 1.0),
+            "router_temperature": _with_default("router_temperature", 0.0),
+            "router_queue_threshold": _first_explicit("router_queue_threshold"),
+            "router_ttl_secs": _with_default("router_ttl_secs", 120.0),
+            "router_max_tree_size": _with_default("router_max_tree_size", 2**20),
+            "router_prune_target_ratio": _with_default("router_prune_target_ratio", 0.8),
+            "router_reset_states": _with_default("router_reset_states", False),
+        }
+
+    @staticmethod
+    def _validate_frontend_config(server: InferenceServer) -> None:
+        """Reject mismatched frontend-wide settings across models.
+
+        The Dynamo frontend uses a single namespace, plane config, and router
+        config.  If models specify conflicting values for any of these, they
+        would be silently ignored — fail loud instead.
         """
         if len(server.models) <= 1:
             return
+
+        ref_router = DynamoBackend._resolve_frontend_router_config(server)
         first = server.models[0].dynamo_config
         ref_ns = first.get("namespace", DEFAULT_DYNAMO_NAMESPACE)
         ref_rp = first.get("request_plane", DEFAULT_DYNAMO_REQUEST_PLANE)
         ref_ep = first.get("event_plane", DEFAULT_DYNAMO_EVENT_PLANE)
+
         for i, m in enumerate(server.models[1:], start=1):
             cfg = m.dynamo_config
+            mismatches = []
+
             ns = cfg.get("namespace", DEFAULT_DYNAMO_NAMESPACE)
             rp = cfg.get("request_plane", DEFAULT_DYNAMO_REQUEST_PLANE)
             ep = cfg.get("event_plane", DEFAULT_DYNAMO_EVENT_PLANE)
-            mismatches = []
             if ns != ref_ns:
                 mismatches.append(f"namespace: {ns!r} vs {ref_ns!r}")
             if rp != ref_rp:
                 mismatches.append(f"request_plane: {rp!r} vs {ref_rp!r}")
             if ep != ref_ep:
                 mismatches.append(f"event_plane: {ep!r} vs {ref_ep!r}")
+
+            # Compare explicitly-set router keys against the resolved reference.
+            effective_router = {**ref_router, **{k: cfg[k] for k in _FRONTEND_ROUTER_KEYS if k in cfg}}
+            for key, ref_value in ref_router.items():
+                if effective_router[key] != ref_value:
+                    mismatches.append(f"{key}: {effective_router[key]!r} vs {ref_value!r}")
+
             if mismatches:
                 model_name = m.model_name or m.model_identifier
                 msg = (
                     f"Model '{model_name}' (index {i}) has frontend config that differs "
                     f"from model 0: {', '.join(mismatches)}. All models must share the "
-                    f"same namespace, request_plane, and event_plane."
+                    f"same frontend configuration."
                 )
                 raise ValueError(msg)
 
@@ -374,7 +440,13 @@ class DynamoBackend(InferenceBackend):
         head_node_id: str,
         cluster_nodes: list[dict[str, Any]],
     ) -> None:
-        """Launch infra, workers for all models, frontend and wait for health."""
+        """Validate config, launch infra/workers/frontend, and wait for health.
+
+        Sequence: fail-fast validations (GPU requirements, frontend config
+        consistency, model name uniqueness) -> etcd/NATS -> workers for each
+        model -> manifest (ready=False) -> frontend with resolved router
+        config -> health check -> manifest (ready=True).
+        """
         infra_node_id = self._infra_node_id
 
         # Build GPU inventory once; each model's placement shrinks it so
@@ -397,7 +469,6 @@ class DynamoBackend(InferenceBackend):
         base_env = {"ETCD_ENDPOINTS": etcd_endpoint, "NATS_SERVER": nats_url}
 
         expected_models: set[str] = set()
-        any_model_disagg = False
         placements: list[dict[str, Any]] = []
 
         for model_config in server.models:
@@ -406,8 +477,6 @@ class DynamoBackend(InferenceBackend):
             request_plane = dynamo_cfg.get("request_plane", DEFAULT_DYNAMO_REQUEST_PLANE)
             event_plane = dynamo_cfg.get("event_plane", DEFAULT_DYNAMO_EVENT_PLANE)
             is_disagg = dynamo_cfg.get("mode") == "disagg"
-            if is_disagg:
-                any_model_disagg = True
 
             model_name = model_config.model_name or model_config.model_identifier
             expected_models.add(model_name)
@@ -458,10 +527,7 @@ class DynamoBackend(InferenceBackend):
         namespace = first_cfg.get("namespace", DEFAULT_DYNAMO_NAMESPACE)
         request_plane = first_cfg.get("request_plane", DEFAULT_DYNAMO_REQUEST_PLANE)
         event_plane = first_cfg.get("event_plane", DEFAULT_DYNAMO_EVENT_PLANE)
-        # KV-aware routing is safe for mixed deployments: the router falls
-        # back to default (round-robin) routing for non-disagg models that
-        # don't publish KV-cache events.
-        router_mode = first_cfg.get("router_mode", "kv") if any_model_disagg else None
+        frontend_router_cfg = self._resolve_frontend_router_config(server)
         frontend_runtime_env = self._merge_model_runtime_envs(server.models)
         self._frontend_actor = self._launch_frontend(
             infra_node_id,
@@ -470,7 +536,7 @@ class DynamoBackend(InferenceBackend):
             namespace=namespace,
             request_plane=request_plane,
             event_plane=event_plane,
-            router_mode=router_mode,
+            frontend_router_cfg=frontend_router_cfg,
             runtime_env=frontend_runtime_env,
         )
 
@@ -731,6 +797,56 @@ class DynamoBackend(InferenceBackend):
     # Worker / frontend actors
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _aggregated_model_uses_exact_kv_events(model_config: InferenceModelConfig) -> bool:
+        """Return True if an aggregated model should publish ZMQ KV events.
+
+        True when the model opts into KV-aware routing (``router_mode="kv"``)
+        with exact event tracking (``router_kv_events`` defaults to True).
+        Disagg models are handled separately by ``_launch_disagg_workers``.
+        """
+        cfg = model_config.dynamo_config
+        if cfg.get("mode") == "disagg":
+            return False
+        if cfg.get("router_mode") != "kv":
+            return False
+        return cfg.get("router_kv_events", True)
+
+    @staticmethod
+    def _build_worker_kv_events_config(
+        model_config: InferenceModelConfig,
+        *,
+        node_id: str,
+        port_seed: int,
+        enabled: bool,
+    ) -> str:
+        """Build a ``--kv-events-config`` JSON string for a Dynamo worker.
+
+        When *enabled*, allocates a unique port via ``get_free_port_on_node``
+        and merges the user's optional ``kv_events_config`` template (but
+        always owns ``endpoint`` and ``enable_kv_cache_events``).
+
+        When not enabled, explicitly disables KV events to prevent Dynamo's
+        auto-configuration from binding a conflicting default port.
+        """
+        template = dict(model_config.dynamo_config.get("kv_events_config", {}))
+
+        if not enabled:
+            template["enable_kv_cache_events"] = False
+            template.pop("endpoint", None)
+            return json.dumps(template)
+
+        kv_events_port = get_free_port_on_node(node_id, port_seed)
+        template.update(
+            {
+                "publisher": "zmq",
+                "topic": "kv-events",
+                "endpoint": f"tcp://*:{kv_events_port}",
+                "enable_kv_cache_events": True,
+            }
+        )
+        return json.dumps(template)
+
     def _launch_replicas(  # noqa: PLR0913
         self,
         model_config: InferenceModelConfig,
@@ -889,18 +1005,11 @@ class DynamoBackend(InferenceBackend):
         for i, plan in enumerate(prefill_plans):
             rank0 = plan.ranks[0]
             nixl_port = get_free_port_on_node(rank0.node_id, 20097 + worker_index)
-            kv_events_port = get_free_port_on_node(rank0.node_id, 20081 + i)
-
-            kv_events_config = json.dumps(
-                dynamo_cfg.get(
-                    "kv_events_config",
-                    {
-                        "publisher": "zmq",
-                        "topic": "kv-events",
-                        "endpoint": f"tcp://*:{kv_events_port}",
-                        "enable_kv_cache_events": True,
-                    },
-                )
+            kv_events_config = self._build_worker_kv_events_config(
+                model_config,
+                node_id=rank0.node_id,
+                port_seed=20081 + i,
+                enabled=True,
             )
 
             python_args = [
@@ -929,8 +1038,7 @@ class DynamoBackend(InferenceBackend):
 
             label = build_worker_actor_name(model_name, i, 0, prefill_tp, role="prefill")
             logger.info(
-                f"Disagg prefill worker {i}: {rank0.num_gpus} GPU(s) on {rank0.node_ip}, "
-                f"nixl_port={nixl_port}, kv_events_port={kv_events_port}"
+                f"Disagg prefill worker {i}: {rank0.num_gpus} GPU(s) on {rank0.node_ip}, nixl_port={nixl_port}"
             )
             proc = spawn_actor(
                 label,
@@ -976,6 +1084,19 @@ class DynamoBackend(InferenceBackend):
         """
         model_name = model_config.model_name or model_config.model_identifier
         component = _model_name_to_component(model_name)
+
+        # Always pass explicit --kv-events-config for aggregated workers.
+        # Without this, Dynamo's args.py auto-creates KVEventsConfig binding
+        # tcp://*:20080 when prefix_caching is enabled (default in vLLM >=0.16),
+        # causing all workers on the same node to fight over the same port.
+        kv_events_enabled = self._aggregated_model_uses_exact_kv_events(model_config)
+        kv_events_config = self._build_worker_kv_events_config(
+            model_config,
+            node_id=node_alloc.node_id,
+            port_seed=20080 + replica_index,
+            enabled=kv_events_enabled,
+        )
+
         python_args = [
             "-m",
             "dynamo.vllm",
@@ -991,6 +1112,8 @@ class DynamoBackend(InferenceBackend):
             request_plane,
             "--event-plane",
             event_plane,
+            "--kv-events-config",
+            kv_events_config,
             *_engine_kwargs_to_cli_flags(model_config.engine_kwargs),
         ]
 
@@ -1032,13 +1155,27 @@ class DynamoBackend(InferenceBackend):
         Headless workers bypass Dynamo's ``DistributedRuntime`` entirely --
         they run only vLLM workers coordinated with rank 0 via
         ``torch.distributed`` (NCCL).  No model registration, no etcd/NATS.
+        KV events are explicitly disabled to prevent Dynamo's auto-config
+        from binding a conflicting default port.
         """
+        # Headless workers don't run the scheduler so they won't bind a KV
+        # events port.  Pass explicit disable defensively so that future
+        # Dynamo/vLLM versions can't auto-configure one.
+        kv_events_config = self._build_worker_kv_events_config(
+            model_config,
+            node_id=node_alloc.node_id,
+            port_seed=20080 + replica_index + node_alloc.node_rank,
+            enabled=False,
+        )
+
         python_args = [
             "-m",
             "dynamo.vllm",
             "--model",
             model_config.model_identifier,
             "--headless",
+            "--kv-events-config",
+            kv_events_config,
             "--nnodes",
             str(plan.nnodes),
             "--node-rank",
@@ -1061,7 +1198,7 @@ class DynamoBackend(InferenceBackend):
             runtime_env=self._dynamo_runtime_env(model_config),
         )
 
-    def _launch_frontend(  # noqa: PLR0913
+    def _launch_frontend(  # noqa: PLR0913, C901
         self,
         infra_node_id: str,
         port: int,
@@ -1070,12 +1207,19 @@ class DynamoBackend(InferenceBackend):
         namespace: str,
         request_plane: str,
         event_plane: str,
-        router_mode: str | None = None,
+        frontend_router_cfg: dict[str, Any],
         runtime_env: dict[str, Any] | None = None,
     ) -> ManagedSubprocess:
+        """Launch the Dynamo frontend (OpenAI-compatible HTTP proxy).
+
+        Translates *frontend_router_cfg* (from ``_resolve_frontend_router_config``)
+        into ``--router-*`` CLI flags for ``dynamo.frontend``.
+        """
         frontend_env = dict(base_env)
+        router_mode = frontend_router_cfg.get("router_mode")
         if router_mode:
             frontend_env["PYTHONHASHSEED"] = "0"
+
         python_args = [
             "-m",
             "dynamo.frontend",
@@ -1090,8 +1234,44 @@ class DynamoBackend(InferenceBackend):
             "--event-plane",
             event_plane,
         ]
+
         if router_mode:
-            python_args.extend(["--router-mode", router_mode, "--router-reset-states"])
+            python_args.extend(["--router-mode", router_mode])
+
+            # Exact vs approximate KV routing
+            if not frontend_router_cfg.get("router_kv_events", True):
+                python_args.append("--no-router-kv-events")
+
+            # Tuning knobs — only pass when explicitly set (non-default)
+            if frontend_router_cfg.get("router_kv_overlap_score_weight") is not None:
+                python_args.extend(
+                    [
+                        "--router-kv-overlap-score-weight",
+                        str(frontend_router_cfg["router_kv_overlap_score_weight"]),
+                    ]
+                )
+            if frontend_router_cfg.get("router_temperature") is not None:
+                python_args.extend(["--router-temperature", str(frontend_router_cfg["router_temperature"])])
+            if frontend_router_cfg.get("router_queue_threshold") is not None:
+                python_args.extend(["--router-queue-threshold", str(frontend_router_cfg["router_queue_threshold"])])
+
+            # Approximate-mode knobs (TTL, tree pruning) — only relevant when
+            # KV events are disabled so the router predicts cache state.
+            if not frontend_router_cfg.get("router_kv_events", True):
+                if frontend_router_cfg.get("router_ttl_secs") is not None:
+                    python_args.extend(["--router-ttl-secs", str(frontend_router_cfg["router_ttl_secs"])])
+                if frontend_router_cfg.get("router_max_tree_size") is not None:
+                    python_args.extend(["--router-max-tree-size", str(frontend_router_cfg["router_max_tree_size"])])
+                if frontend_router_cfg.get("router_prune_target_ratio") is not None:
+                    python_args.extend(
+                        [
+                            "--router-prune-target-ratio",
+                            str(frontend_router_cfg["router_prune_target_ratio"]),
+                        ]
+                    )
+
+            if frontend_router_cfg.get("router_reset_states"):
+                python_args.append("--router-reset-states")
 
         node_alloc = NodeAllocation(node_id=infra_node_id, node_ip=self._infra_ip, num_gpus=0, node_rank=0)
         logger.info(f"Starting Dynamo frontend on port {port}")

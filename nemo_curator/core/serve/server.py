@@ -76,13 +76,43 @@ class InferenceModelConfig:
             worker and frontend actors (e.g. to install ``ai-dynamo`` in an
             isolated env).
         dynamo_config: Dynamo-specific configuration.
-            Only used when ``backend="dynamo"``. Keys: ``namespace`` (default "curator"),
-            ``request_plane`` (default "nats"), ``event_plane`` (default "nats"),
-            ``mode`` (set to "disagg" for disaggregated serving),
-            ``router_mode`` (default "kv", disagg frontend routing).
+            Only used when ``backend="dynamo"``.
 
-            For disaggregated serving (``mode="disagg"``), per-role config is
-            nested under ``"prefill"`` and ``"decode"`` keys, each a dict with:
+            **Infrastructure keys:**
+
+            - ``namespace`` (default ``"curator"``): Dynamo service namespace.
+            - ``request_plane`` (default ``"nats"``): transport for requests.
+            - ``event_plane`` (default ``"nats"``): transport for events.
+
+            **Router keys** (frontend-wide — all models must agree):
+
+            - ``router_mode``: routing strategy (``"round-robin"``, ``"random"``,
+              ``"kv"``, ``"direct"``).  Defaults to ``"kv"`` when any model uses
+              disaggregated serving, otherwise round-robin.
+            - ``router_kv_events`` (default ``True`` when ``router_mode="kv"``):
+              ``True`` for exact KV-aware routing (workers publish cache state
+              via ZMQ), ``False`` for approximate mode (router predicts cache
+              state from routing decisions).
+            - ``router_kv_overlap_score_weight``: cache-hit vs decode-cost weight.
+            - ``router_temperature``: softmax temperature for worker sampling.
+            - ``router_queue_threshold``: queue depth before shedding.
+            - ``router_ttl_secs``: TTL for stale entries (approximate mode).
+            - ``router_max_tree_size``: max prefix tree size (approximate mode).
+            - ``router_prune_target_ratio``: prune target ratio (approximate mode).
+            - ``router_reset_states``: clear router state on startup (opt-in).
+
+            **Worker KV events** (advanced override):
+
+            - ``kv_events_config``: optional template dict for worker-side
+              ``--kv-events-config``.  NeMo owns ``endpoint`` allocation and
+              the effective ``enable_kv_cache_events`` value; user-supplied
+              ``endpoint`` values are overwritten.
+
+            **Disaggregated serving** (``mode="disagg"``):
+
+            Per-role config is nested under ``"prefill"`` and ``"decode"``
+            keys, each a dict with:
+
             - ``num_replicas`` (default 1): number of workers for this role.
             - ``engine_kwargs`` (optional): merged on top of the model-level
               ``engine_kwargs`` (e.g. to set a different ``tensor_parallel_size``

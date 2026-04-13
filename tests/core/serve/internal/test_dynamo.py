@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import json
 import os
 
 import pytest
@@ -22,6 +23,7 @@ from nemo_curator.core.serve.internal.dynamo import DynamoBackend, _dynamo_endpo
 from nemo_curator.core.serve.internal.errors import SubprocessError
 from nemo_curator.core.serve.internal.subprocess_mgr import (
     ManagedSubprocess,
+    NodeAllocation,
     _define_subprocess_actor,
     _kill_actor,
     plan_replica_placement,
@@ -710,6 +712,64 @@ class TestFrontendConfigValidation:
         )
         DynamoBackend._validate_frontend_config(server)  # should not raise
 
+    def test_rejects_mismatched_router_mode(self):
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(model_identifier="model-a", dynamo_config={"router_mode": "kv"}),
+                InferenceModelConfig(model_identifier="model-b", dynamo_config={"router_mode": "round-robin"}),
+            ],
+            backend="dynamo",
+        )
+        with pytest.raises(ValueError, match="router_mode"):
+            DynamoBackend._validate_frontend_config(server)
+
+    def test_rejects_mismatched_router_kv_events(self):
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(
+                    model_identifier="model-a",
+                    dynamo_config={"router_mode": "kv", "router_kv_events": True},
+                ),
+                InferenceModelConfig(
+                    model_identifier="model-b",
+                    dynamo_config={"router_mode": "kv", "router_kv_events": False},
+                ),
+            ],
+            backend="dynamo",
+        )
+        with pytest.raises(ValueError, match="router_kv_events"):
+            DynamoBackend._validate_frontend_config(server)
+
+    def test_rejects_mismatched_router_temperature(self):
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(
+                    model_identifier="model-a",
+                    dynamo_config={"router_mode": "kv", "router_temperature": 0.0},
+                ),
+                InferenceModelConfig(
+                    model_identifier="model-b",
+                    dynamo_config={"router_mode": "kv", "router_temperature": 0.7},
+                ),
+            ],
+            backend="dynamo",
+        )
+        with pytest.raises(ValueError, match="router_temperature"):
+            DynamoBackend._validate_frontend_config(server)
+
+    def test_allows_omitted_router_fields_to_inherit_shared_defaults(self):
+        server = InferenceServer(
+            models=[
+                InferenceModelConfig(
+                    model_identifier="model-a",
+                    dynamo_config={"router_mode": "kv", "router_kv_events": False},
+                ),
+                InferenceModelConfig(model_identifier="model-b", dynamo_config={}),
+            ],
+            backend="dynamo",
+        )
+        DynamoBackend._validate_frontend_config(server)  # should not raise
+
 
 # ---------------------------------------------------------------------------
 # Pre-infra GPU validation
@@ -994,6 +1054,162 @@ class TestMixedDisaggInventory:
         # Second model has no GPUs left
         with pytest.raises(RuntimeError, match="No GPU nodes"):
             plan_replica_placement(num_replicas=1, tp_size=1, _inventory=inventory)
+
+
+# ---------------------------------------------------------------------------
+# Aggregated worker and frontend launch args
+# ---------------------------------------------------------------------------
+
+
+def _capture_spawn(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    """Capture ``spawn_actor()`` calls without actually launching Ray actors."""
+    calls: list[dict] = []
+
+    def fake_spawn_actor(label: str, node_alloc: NodeAllocation, **kwargs) -> ManagedSubprocess:
+        calls.append({"label": label, "node_alloc": node_alloc, **kwargs})
+        return ManagedSubprocess(label=label, actor=object())
+
+    monkeypatch.setattr("nemo_curator.core.serve.internal.dynamo.spawn_actor", fake_spawn_actor)
+    return calls
+
+
+class TestAggregatedWorkerLaunchArgs:
+    """Tests for explicit --kv-events-config in aggregated worker launch paths."""
+
+    def test_launch_worker_disables_kv_events_by_default(self, monkeypatch: pytest.MonkeyPatch):
+        calls = _capture_spawn(monkeypatch)
+        backend = DynamoBackend(InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo"))
+        backend._runtime_dir = "/tmp/runtime"  # noqa: S108
+
+        backend._launch_worker(
+            replica_index=0,
+            model_config=InferenceModelConfig(model_identifier="Qwen/Qwen3-0.6B"),
+            base_env={},
+            node_alloc=NodeAllocation(node_id="n1", node_ip="10.0.0.1", num_gpus=1, node_rank=0),
+            namespace="curator",
+            request_plane="nats",
+            event_plane="nats",
+        )
+
+        python_args = calls[0]["python_args"]
+        idx = python_args.index("--kv-events-config")
+        assert json.loads(python_args[idx + 1]) == {"enable_kv_cache_events": False}
+
+    def test_launch_worker_enables_exact_kv_events_for_kv_router(self, monkeypatch: pytest.MonkeyPatch):
+        calls = _capture_spawn(monkeypatch)
+        monkeypatch.setattr(
+            "nemo_curator.core.serve.internal.dynamo.get_free_port_on_node", lambda _node_id, _start: 24567
+        )
+
+        backend = DynamoBackend(InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo"))
+        backend._runtime_dir = "/tmp/runtime"  # noqa: S108
+
+        model = InferenceModelConfig(
+            model_identifier="Qwen/Qwen3-0.6B",
+            dynamo_config={"router_mode": "kv", "router_kv_events": True},
+        )
+        backend._launch_worker(
+            replica_index=3,
+            model_config=model,
+            base_env={},
+            node_alloc=NodeAllocation(node_id="n1", node_ip="10.0.0.1", num_gpus=1, node_rank=0),
+            namespace="curator",
+            request_plane="nats",
+            event_plane="zmq",
+        )
+
+        python_args = calls[0]["python_args"]
+        cfg = json.loads(python_args[python_args.index("--kv-events-config") + 1])
+        assert cfg["enable_kv_cache_events"] is True
+        assert cfg["endpoint"] == "tcp://*:24567"
+        assert cfg["publisher"] == "zmq"
+        assert cfg["topic"] == "kv-events"
+
+
+class TestFrontendLaunchArgs:
+    """Tests for Dynamo frontend router CLI args."""
+
+    def test_launch_frontend_uses_router_kv_events_by_default(self, monkeypatch: pytest.MonkeyPatch):
+        calls = _capture_spawn(monkeypatch)
+        backend = DynamoBackend(InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo"))
+        backend._infra_ip = "10.0.0.9"
+        backend._launch_frontend(
+            "infra",
+            8000,
+            {},
+            namespace="curator",
+            request_plane="nats",
+            event_plane="nats",
+            frontend_router_cfg={"router_mode": "kv", "router_kv_events": True},
+            runtime_env=None,
+        )
+
+        args = calls[0]["python_args"]
+        assert "--router-mode" in args
+        assert args[args.index("--router-mode") + 1] == "kv"
+        assert "--no-router-kv-events" not in args
+
+    def test_launch_frontend_uses_no_router_kv_events_for_approx_mode(self, monkeypatch: pytest.MonkeyPatch):
+        calls = _capture_spawn(monkeypatch)
+        backend = DynamoBackend(InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo"))
+        backend._infra_ip = "10.0.0.9"
+        backend._launch_frontend(
+            "infra",
+            8000,
+            {},
+            namespace="curator",
+            request_plane="nats",
+            event_plane="nats",
+            frontend_router_cfg={
+                "router_mode": "kv",
+                "router_kv_events": False,
+                "router_ttl_secs": 90.0,
+                "router_max_tree_size": 2**20,
+                "router_prune_target_ratio": 0.8,
+            },
+            runtime_env=None,
+        )
+
+        args = calls[0]["python_args"]
+        assert "--no-router-kv-events" in args
+        assert "--router-ttl-secs" in args
+
+    def test_launch_frontend_no_router_args_when_no_router_mode(self, monkeypatch: pytest.MonkeyPatch):
+        calls = _capture_spawn(monkeypatch)
+        backend = DynamoBackend(InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo"))
+        backend._infra_ip = "10.0.0.9"
+        backend._launch_frontend(
+            "infra",
+            8000,
+            {},
+            namespace="curator",
+            request_plane="nats",
+            event_plane="nats",
+            frontend_router_cfg={"router_mode": None},
+            runtime_env=None,
+        )
+
+        args = calls[0]["python_args"]
+        assert "--router-mode" not in args
+        assert "--no-router-kv-events" not in args
+
+    def test_launch_frontend_does_not_hardcode_router_reset_states(self, monkeypatch: pytest.MonkeyPatch):
+        calls = _capture_spawn(monkeypatch)
+        backend = DynamoBackend(InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo"))
+        backend._infra_ip = "10.0.0.9"
+        backend._launch_frontend(
+            "infra",
+            8000,
+            {},
+            namespace="curator",
+            request_plane="nats",
+            event_plane="nats",
+            frontend_router_cfg={"router_mode": "kv", "router_kv_events": True},
+            runtime_env=None,
+        )
+
+        args = calls[0]["python_args"]
+        assert "--router-reset-states" not in args
 
 
 # ---------------------------------------------------------------------------
