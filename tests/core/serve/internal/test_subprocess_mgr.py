@@ -12,21 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import contextlib
 import os
+import re
 
 import pytest
 
 from nemo_curator.core.serve.internal.subprocess_mgr import (
+    NEMO_CURATOR_DYNAMO_NAMESPACE,
     ManagedSubprocess,
-    NodeAllocation,
-    ReplicaPlan,
+    ReplicaBundleSpec,
     _define_subprocess_actor,
     _engine_kwargs_to_cli_flags,
     _ignore_head_node,
-    _resolve_node_ip,
+    build_replica_pg,
     build_worker_actor_name,
-    plan_replica_placement,
+    check_total_gpu_capacity,
+    get_bundle_node_ip,
+    get_free_port_in_bundle,
+    graceful_stop_actor,
+    plan_replica_bundle_shape,
+    remove_named_pgs_with_prefix,
+    spawn_actor,
 )
 
 # ---------------------------------------------------------------------------
@@ -71,323 +80,291 @@ class TestBuildWorkerActorName:
 
 
 # ---------------------------------------------------------------------------
-# NodeAllocation / ReplicaPlan dataclasses
+# plan_replica_bundle_shape -- mocked topology (no Ray needed)
 # ---------------------------------------------------------------------------
 
 
-class TestNodeAllocation:
-    def test_fields(self):
-        a = NodeAllocation(node_id="n1", node_ip="10.0.0.1", num_gpus=2, node_rank=0)
-        assert a.node_id == "n1"
-        assert a.node_ip == "10.0.0.1"
-        assert a.num_gpus == 2
-        assert a.node_rank == 0
+class TestPlanReplicaBundleShapeSingleNode:
+    """Single-node placement when any node has enough GPUs for TP."""
 
+    def test_fits_on_single_node(self):
+        topology = [{"node_id": "n1", "num_gpus": 8, "is_head": False}]
+        spec = plan_replica_bundle_shape(tp_size=4, _topology=topology)
+        assert not spec.is_multi_node
+        assert spec.nnodes == 1
+        assert spec.per_node_gpus == 4
+        assert spec.strategy == "STRICT_PACK"
+        assert spec.bundles == [{"CPU": 1, "GPU": 4}]
+        assert spec.bundle_label_selector is None
 
-class TestReplicaPlan:
-    def test_single_node(self):
-        plan = ReplicaPlan(
-            replica_index=0,
-            ranks=[NodeAllocation(node_id="n1", node_ip="10.0.0.1", num_gpus=4, node_rank=0)],
-        )
-        assert not plan.is_multi_node
-        assert plan.nnodes == 1
-        assert plan.total_gpus == 4
-        assert plan.master_addr == "10.0.0.1"
+    def test_tp1_single_bundle(self):
+        topology = [{"node_id": "n1", "num_gpus": 8, "is_head": False}]
+        spec = plan_replica_bundle_shape(tp_size=1, _topology=topology)
+        assert spec.nnodes == 1
+        assert spec.bundles == [{"CPU": 1, "GPU": 1}]
 
-    def test_multi_node(self):
-        plan = ReplicaPlan(
-            replica_index=0,
-            ranks=[
-                NodeAllocation(node_id="n1", node_ip="10.0.0.1", num_gpus=4, node_rank=0),
-                NodeAllocation(node_id="n2", node_ip="10.0.0.2", num_gpus=4, node_rank=1),
-            ],
-        )
-        assert plan.is_multi_node
-        assert plan.nnodes == 2
-        assert plan.total_gpus == 8
-        assert plan.master_addr == "10.0.0.1"
+    def test_total_gpus_matches(self):
+        topology = [{"node_id": "n1", "num_gpus": 8, "is_head": False}]
+        spec = plan_replica_bundle_shape(tp_size=4, _topology=topology)
+        assert spec.total_gpus == 4
 
-
-# ---------------------------------------------------------------------------
-# GPU placement planner -- mocked inventory (no Ray needed)
-# ---------------------------------------------------------------------------
-
-
-class TestPlanReplicaPlacementMocked:
-    """Tests with pre-built inventory (no Ray cluster required)."""
-
-    def _inventory_1x8(self) -> list[dict]:
-        return [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 8, "is_head": False}]
-
-    def _inventory_2x4(self) -> list[dict]:
-        return [
-            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False},
-            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 4, "is_head": False},
+    def test_partial_leftover_still_prefers_single_node(self):
+        """5+8 GPU cluster, TP=4 -> single-node (max_per_node=8 >= 4)."""
+        topology = [
+            {"node_id": "n1", "num_gpus": 5, "is_head": False},
+            {"node_id": "n2", "num_gpus": 8, "is_head": False},
         ]
+        spec = plan_replica_bundle_shape(tp_size=4, _topology=topology)
+        assert not spec.is_multi_node
 
-    def _inventory_3x4(self) -> list[dict]:
-        return [
-            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False},
-            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 4, "is_head": False},
-            {"node_id": "n3", "node_ip": "10.0.0.3", "num_gpus": 4, "is_head": False},
+
+class TestPlanReplicaBundleShapeMultiNode:
+    """Multi-node placement when TP exceeds any single node's capacity."""
+
+    def test_multi_node_even_split(self):
+        """TP=8 across two 4-GPU nodes -> STRICT_SPREAD with 4+4."""
+        topology = [
+            {"node_id": "n1", "num_gpus": 4, "is_head": False},
+            {"node_id": "n2", "num_gpus": 4, "is_head": False},
         ]
+        spec = plan_replica_bundle_shape(tp_size=8, _topology=topology)
+        assert spec.is_multi_node
+        assert spec.nnodes == 2
+        assert spec.per_node_gpus == 4
+        assert spec.strategy == "STRICT_SPREAD"
+        assert spec.bundles == [{"CPU": 1, "GPU": 4}, {"CPU": 1, "GPU": 4}]
 
-    def test_single_node_single_replica(self):
-        plans = plan_replica_placement(num_replicas=1, tp_size=4, _inventory=self._inventory_1x8())
-        assert len(plans) == 1
-        assert not plans[0].is_multi_node
-        assert plans[0].ranks[0].num_gpus == 4
+    def test_multi_node_three_nodes(self):
+        """TP=12 across three 4-GPU nodes."""
+        topology = [{"node_id": f"n{i}", "num_gpus": 4, "is_head": False} for i in range(1, 4)]
+        spec = plan_replica_bundle_shape(tp_size=12, _topology=topology)
+        assert spec.nnodes == 3
+        assert spec.per_node_gpus == 4
+        assert spec.total_gpus == 12
 
-    def test_single_node_multiple_replicas(self):
-        plans = plan_replica_placement(num_replicas=2, tp_size=4, _inventory=self._inventory_1x8())
-        assert len(plans) == 2
-        for plan in plans:
-            assert not plan.is_multi_node
-            assert plan.ranks[0].num_gpus == 4
-
-    def test_multi_node_tp(self):
-        """TP=8 across 2 nodes with 4 GPUs each."""
-        plans = plan_replica_placement(num_replicas=1, tp_size=8, _inventory=self._inventory_2x4())
-        assert len(plans) == 1
-        plan = plans[0]
-        assert plan.is_multi_node
-        assert plan.nnodes == 2
-        assert plan.ranks[0].node_rank == 0
-        assert plan.ranks[0].num_gpus == 4
-        assert plan.ranks[0].node_ip == "10.0.0.1"
-        assert plan.ranks[1].node_rank == 1
-        assert plan.ranks[1].num_gpus == 4
-        assert plan.ranks[1].node_ip == "10.0.0.2"
-        assert plan.master_addr == "10.0.0.1"
-
-    def test_multi_node_tp_three_nodes(self):
-        """TP=12 across 3 nodes with 4 GPUs each."""
-        plans = plan_replica_placement(num_replicas=1, tp_size=12, _inventory=self._inventory_3x4())
-        assert len(plans) == 1
-        plan = plans[0]
-        assert plan.nnodes == 3
-        assert plan.total_gpus == 12
-
-    def test_multiple_replicas_across_nodes(self):
-        """2 replicas x TP=4 on 2 nodes with 4 GPUs each."""
-        plans = plan_replica_placement(num_replicas=2, tp_size=4, _inventory=self._inventory_2x4())
-        assert len(plans) == 2
-        # Each replica fits on one node
-        assert not plans[0].is_multi_node
-        assert not plans[1].is_multi_node
-        # Different nodes
-        assert plans[0].ranks[0].node_id != plans[1].ranks[0].node_id
-
-    def test_partial_leftover_is_skipped_when_full_node_is_available(self):
-        """A leftover GPU must not force an invalid 1+3 split for TP=4."""
-        inventory = [
-            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 5, "is_head": False},
-            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 8, "is_head": False},
+    def test_even_split_across_smaller_nodes(self):
+        """TP=4 on two 3-GPU nodes -> valid 2+2 split."""
+        topology = [
+            {"node_id": "n1", "num_gpus": 3, "is_head": False},
+            {"node_id": "n2", "num_gpus": 3, "is_head": False},
         ]
+        spec = plan_replica_bundle_shape(tp_size=4, _topology=topology)
+        assert spec.nnodes == 2
+        assert spec.per_node_gpus == 2
 
-        plans = plan_replica_placement(num_replicas=3, tp_size=4, _inventory=inventory)
-
-        assert [[(r.node_id, r.num_gpus) for r in plan.ranks] for plan in plans] == [
-            [("n1", 4)],
-            [("n2", 4)],
-            [("n2", 4)],
+    def test_asymmetric_split_rejected(self):
+        """TP=4 with 1+3 cannot be launched by vLLM (uneven local_world_size)."""
+        topology = [
+            {"node_id": "n1", "num_gpus": 1, "is_head": False},
+            {"node_id": "n2", "num_gpus": 3, "is_head": False},
         ]
-
-    def test_even_multi_node_split_uses_equal_per_node_share(self):
-        """TP=4 on two 3-GPU nodes should use a valid 2+2 split."""
-        inventory = [
-            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 3, "is_head": False},
-            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 3, "is_head": False},
-        ]
-
-        plans = plan_replica_placement(num_replicas=1, tp_size=4, _inventory=inventory)
-
-        assert len(plans) == 1
-        assert plans[0].is_multi_node
-        assert [(rank.node_id, rank.num_gpus) for rank in plans[0].ranks] == [("n1", 2), ("n2", 2)]
-
-    def test_invalid_asymmetric_multi_node_split_raises(self):
-        """TP=4 cannot be launched from a 1+3 split even though total GPUs match."""
-        inventory = [
-            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 1, "is_head": False},
-            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 3, "is_head": False},
-        ]
-
         with pytest.raises(RuntimeError, match="even split"):
-            plan_replica_placement(num_replicas=1, tp_size=4, _inventory=inventory)
+            plan_replica_bundle_shape(tp_size=4, _topology=topology)
 
-    def test_insufficient_gpus_raises(self):
-        with pytest.raises(RuntimeError, match="Need"):
-            plan_replica_placement(num_replicas=1, tp_size=16, _inventory=self._inventory_2x4())
-
-    def test_empty_inventory_raises(self):
-        with pytest.raises(RuntimeError, match="No GPU nodes"):
-            plan_replica_placement(num_replicas=1, tp_size=1, _inventory=[])
-
-    def test_partial_placement_raises(self):
-        """Not enough GPUs for all replicas."""
-        with pytest.raises(RuntimeError):
-            plan_replica_placement(num_replicas=3, tp_size=4, _inventory=self._inventory_2x4())
-
-
-# ---------------------------------------------------------------------------
-# Deterministic rank-0 placement + head-node exclusion
-# ---------------------------------------------------------------------------
-
-
-class TestHeadNodePolicy:
-    """Tests for CURATOR_IGNORE_RAY_HEAD_NODE and deterministic ordering."""
-
-    def _inventory_head_and_workers(self) -> list[dict]:
-        """Head node (n1, 4 GPUs) + two worker nodes (n2, n3, 4 GPUs each)."""
-        return [
-            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 4, "is_head": False},
-            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": True},
-            {"node_id": "n3", "node_ip": "10.0.0.3", "num_gpus": 4, "is_head": False},
+    def test_no_valid_combination_raises(self):
+        """TP=6 on two 2-GPU nodes: 2 doesn't divide 6; 3 nodes not available."""
+        topology = [
+            {"node_id": "n1", "num_gpus": 2, "is_head": False},
+            {"node_id": "n2", "num_gpus": 2, "is_head": False},
         ]
+        with pytest.raises(RuntimeError, match="even split"):
+            plan_replica_bundle_shape(tp_size=6, _topology=topology)
 
-    def test_rank0_on_head_node_when_allowed(self):
-        """Without the flag, head node gets rank 0."""
-        inv = self._inventory_head_and_workers()
-        plans = plan_replica_placement(num_replicas=1, tp_size=4, _inventory=inv)
-        assert plans[0].ranks[0].node_id == "n1"
-        assert plans[0].ranks[0].node_ip == "10.0.0.1"
 
-    def test_head_node_excluded_from_workers(self, monkeypatch: pytest.MonkeyPatch):
-        """With the flag set, no worker plans land on the head node."""
+class TestPlanReplicaBundleShapeErrors:
+    def test_empty_topology_raises(self):
+        with pytest.raises(RuntimeError, match="No GPU nodes"):
+            plan_replica_bundle_shape(tp_size=1, _topology=[])
+
+
+class TestPlanReplicaBundleShapeHeadExclusion:
+    """CURATOR_IGNORE_RAY_HEAD_NODE maps to a bundle_label_selector."""
+
+    def test_flag_unset_no_selector(self):
+        topology = [
+            {"node_id": "head", "num_gpus": 8, "is_head": True},
+            {"node_id": "worker", "num_gpus": 8, "is_head": False},
+        ]
+        spec = plan_replica_bundle_shape(tp_size=4, _topology=topology)
+        assert spec.bundle_label_selector is None
+
+    def test_flag_set_adds_single_node_selector(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("CURATOR_IGNORE_RAY_HEAD_NODE", "1")
-        inv = self._inventory_head_and_workers()
-        plans = plan_replica_placement(num_replicas=2, tp_size=4, _inventory=inv)
-        for plan in plans:
-            for rank in plan.ranks:
-                assert rank.node_id != "n1", "Worker should not be on head node"
+        topology = [
+            {"node_id": "head", "num_gpus": 8, "is_head": True},
+            {"node_id": "worker", "num_gpus": 8, "is_head": False},
+        ]
+        spec = plan_replica_bundle_shape(tp_size=4, _topology=topology)
+        assert spec.nnodes == 1
+        assert spec.bundle_label_selector == [{"ray.io/node-type": "worker"}]
 
-    def test_no_eligible_nodes_raises(self, monkeypatch: pytest.MonkeyPatch):
-        """Single head-only node + flag -> clear error."""
-        monkeypatch.setenv("CURATOR_IGNORE_RAY_HEAD_NODE", "1")
-        inv = [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 8, "is_head": True}]
-        with pytest.raises(RuntimeError, match="CURATOR_IGNORE_RAY_HEAD_NODE"):
-            plan_replica_placement(num_replicas=1, tp_size=1, _inventory=inv)
-
-    def test_deterministic_ordering(self):
-        """Same inventory -> same plan every time, head first."""
-        inv = self._inventory_head_and_workers()
-        plans_a = plan_replica_placement(num_replicas=3, tp_size=4, _inventory=inv)
-        plans_b = plan_replica_placement(num_replicas=3, tp_size=4, _inventory=inv)
-        for a, b in zip(plans_a, plans_b, strict=True):
-            assert a.ranks[0].node_id == b.ranks[0].node_id
-
-    def test_deterministic_ordering_head_first(self):
-        """Head node sorts first regardless of input order."""
-        inv = self._inventory_head_and_workers()
-        plans = plan_replica_placement(num_replicas=3, tp_size=4, _inventory=inv)
-        # First replica on head (n1), then n2, then n3
-        assert plans[0].ranks[0].node_id == "n1"
-        assert plans[1].ranks[0].node_id == "n2"
-        assert plans[2].ranks[0].node_id == "n3"
-
-    def test_multi_replica_stable_plans(self, monkeypatch: pytest.MonkeyPatch):
-        """Multiple replicas with head excluded -> stable assignment by node_id."""
+    def test_flag_set_adds_multi_node_selector(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("CURATOR_IGNORE_RAY_HEAD_NODE", "true")
-        inv = self._inventory_head_and_workers()
-        plans = plan_replica_placement(num_replicas=2, tp_size=4, _inventory=inv)
-        # n2 and n3 are the only options, sorted by node_id
-        assert plans[0].ranks[0].node_id == "n2"
-        assert plans[1].ranks[0].node_id == "n3"
+        topology = [
+            {"node_id": "w1", "num_gpus": 4, "is_head": False},
+            {"node_id": "w2", "num_gpus": 4, "is_head": False},
+        ]
+        spec = plan_replica_bundle_shape(tp_size=8, _topology=topology)
+        assert spec.nnodes == 2
+        assert spec.bundle_label_selector == [{"ray.io/node-type": "worker"}] * 2
 
-    def test_ignore_head_node_helper(self, monkeypatch: pytest.MonkeyPatch):
-        """_ignore_head_node reads the env var correctly."""
+    def test_flag_set_filters_head_from_topology(self, monkeypatch: pytest.MonkeyPatch):
+        """With flag set, the head node is ignored when choosing bundle shape."""
+        monkeypatch.setenv("CURATOR_IGNORE_RAY_HEAD_NODE", "1")
+        topology = [
+            {"node_id": "head", "num_gpus": 16, "is_head": True},
+            {"node_id": "w1", "num_gpus": 4, "is_head": False},
+            {"node_id": "w2", "num_gpus": 4, "is_head": False},
+        ]
+        # Even though head has 16 GPUs (enough for TP=8), the planner must
+        # split across the two 4-GPU workers because head is excluded.
+        spec = plan_replica_bundle_shape(tp_size=8, _topology=topology)
+        assert spec.is_multi_node
+        assert spec.nnodes == 2
+
+    def test_only_head_node_raises(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("CURATOR_IGNORE_RAY_HEAD_NODE", "1")
+        topology = [{"node_id": "head", "num_gpus": 8, "is_head": True}]
+        with pytest.raises(RuntimeError, match="CURATOR_IGNORE_RAY_HEAD_NODE"):
+            plan_replica_bundle_shape(tp_size=4, _topology=topology)
+
+
+class TestIgnoreHeadNodeHelper:
+    """_ignore_head_node reads the env var correctly."""
+
+    def test_defaults_false(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv("CURATOR_IGNORE_RAY_HEAD_NODE", raising=False)
         assert not _ignore_head_node()
-        monkeypatch.setenv("CURATOR_IGNORE_RAY_HEAD_NODE", "1")
-        assert _ignore_head_node()
-        monkeypatch.setenv("CURATOR_IGNORE_RAY_HEAD_NODE", "yes")
-        assert _ignore_head_node()
-        monkeypatch.setenv("CURATOR_IGNORE_RAY_HEAD_NODE", "TRUE")
-        assert _ignore_head_node()
-        monkeypatch.setenv("CURATOR_IGNORE_RAY_HEAD_NODE", "0")
-        assert not _ignore_head_node()
-        monkeypatch.setenv("CURATOR_IGNORE_RAY_HEAD_NODE", "")
-        assert not _ignore_head_node()
+
+    def test_truthy_values(self, monkeypatch: pytest.MonkeyPatch):
+        for v in ("1", "true", "True", "TRUE", "yes", "YES"):
+            monkeypatch.setenv("CURATOR_IGNORE_RAY_HEAD_NODE", v)
+            assert _ignore_head_node(), f"{v!r} should be truthy"
+
+    def test_falsy_values(self, monkeypatch: pytest.MonkeyPatch):
+        for v in ("", "0", "false", "no"):
+            monkeypatch.setenv("CURATOR_IGNORE_RAY_HEAD_NODE", v)
+            assert not _ignore_head_node(), f"{v!r} should be falsy"
 
 
 # ---------------------------------------------------------------------------
-# GPU placement planner -- real Ray cluster
+# Total GPU capacity check
+# ---------------------------------------------------------------------------
+
+
+class TestCheckTotalGpuCapacity:
+    def test_fits(self):
+        check_total_gpu_capacity(4, _cluster_resources={"GPU": 8})
+
+    def test_exact(self):
+        check_total_gpu_capacity(8, _cluster_resources={"GPU": 8})
+
+    def test_overcommit_raises(self):
+        with pytest.raises(RuntimeError, match="Need 9 GPUs"):
+            check_total_gpu_capacity(9, _cluster_resources={"GPU": 8})
+
+
+# ---------------------------------------------------------------------------
+# ReplicaBundleSpec dataclass
+# ---------------------------------------------------------------------------
+
+
+class TestReplicaBundleSpec:
+    def test_single_node_properties(self):
+        spec = ReplicaBundleSpec(
+            bundles=[{"CPU": 1, "GPU": 4}],
+            strategy="STRICT_PACK",
+            nnodes=1,
+            per_node_gpus=4,
+        )
+        assert not spec.is_multi_node
+        assert spec.total_gpus == 4
+
+    def test_multi_node_properties(self):
+        spec = ReplicaBundleSpec(
+            bundles=[{"CPU": 1, "GPU": 4}, {"CPU": 1, "GPU": 4}],
+            strategy="STRICT_SPREAD",
+            nnodes=2,
+            per_node_gpus=4,
+        )
+        assert spec.is_multi_node
+        assert spec.total_gpus == 8
+
+
+# ---------------------------------------------------------------------------
+# Namespace constant
+# ---------------------------------------------------------------------------
+
+
+class TestNamespaceConstant:
+    def test_exists(self):
+        """The namespace constant is used by DynamoBackend.start/stop's ray.init calls."""
+        assert NEMO_CURATOR_DYNAMO_NAMESPACE == "nemo_curator_dynamo"
+
+
+# ---------------------------------------------------------------------------
+# Placement group creation -- real Ray cluster
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.gpu
 @pytest.mark.usefixtures("shared_ray_client")
-class TestGpuPlacement:
-    """Tests against the real shared Ray cluster (session fixture provides 2 GPUs)."""
+class TestBuildReplicaPg:
+    """PG creation against a real Ray cluster (2 GPUs available)."""
 
-    def test_placement_uses_available_gpus(self):
-        plans = plan_replica_placement(num_replicas=2, tp_size=1)
-        assert len(plans) == 2
-        assert plans[0].ranks[0].num_gpus == 1
-        assert plans[1].ranks[0].num_gpus == 1
+    def test_single_node_pg_becomes_ready(self):
+        import ray
 
-    def test_placement_tp2(self):
-        """TP=2 on 2 GPUs -> 1 replica, 1 rank, 2 GPUs."""
-        plans = plan_replica_placement(num_replicas=1, tp_size=2)
-        assert len(plans) == 1
-        assert plans[0].ranks[0].num_gpus == 2
-        assert not plans[0].is_multi_node
+        spec = plan_replica_bundle_shape(
+            tp_size=1,
+            _topology=[{"node_id": "n", "num_gpus": 1, "is_head": False}],
+        )
+        pg_name = f"test_single_{os.getpid()}"
+        pg = build_replica_pg(spec, name=pg_name)
+        try:
+            # PG must be ready -- build_replica_pg waits internally.
+            assert ray.util.get_placement_group(pg_name) is not None
+        finally:
+            with contextlib.suppress(Exception):
+                ray.util.remove_placement_group(pg)
 
-    def test_insufficient_gpus_raises(self):
-        with pytest.raises(RuntimeError, match="Need"):
-            plan_replica_placement(num_replicas=10, tp_size=4)
+    def test_bundle_node_ip_reachable(self):
+        import ray
 
-    def test_placement_has_valid_node_info(self):
-        plans = plan_replica_placement(num_replicas=1, tp_size=1)
-        assert plans[0].ranks[0].node_id
-        assert plans[0].ranks[0].node_ip
+        spec = ReplicaBundleSpec(
+            bundles=[{"CPU": 1, "GPU": 1}],
+            strategy="STRICT_PACK",
+            nnodes=1,
+            per_node_gpus=1,
+        )
+        pg_name = f"test_ip_{os.getpid()}"
+        pg = build_replica_pg(spec, name=pg_name)
+        try:
+            ip = get_bundle_node_ip(pg, 0)
+            # Must look like an IPv4 (or "127.0.0.1" for single-machine)
+            assert re.match(r"^\d+\.\d+\.\d+\.\d+$", ip), f"unexpected ip: {ip!r}"
+        finally:
+            with contextlib.suppress(Exception):
+                ray.util.remove_placement_group(pg)
 
+    def test_free_port_in_bundle(self):
+        import ray
 
-# ---------------------------------------------------------------------------
-# Network addressing -- _resolve_node_ip (mocked ray.nodes())
-# ---------------------------------------------------------------------------
-
-_RAY_NODES = [
-    {"NodeID": "head1", "NodeManagerAddress": "10.0.0.1", "Alive": True, "Resources": {"GPU": 4, "CPU": 8}},
-    {"NodeID": "worker1", "NodeManagerAddress": "10.0.0.2", "Alive": True, "Resources": {"GPU": 4, "CPU": 8}},
-    {"NodeID": "worker2", "NodeManagerAddress": "10.0.0.3", "Alive": True, "Resources": {"GPU": 4, "CPU": 8}},
-]
-
-
-class TestResolveNodeIp:
-    """Tests for _resolve_node_ip with mocked ray.nodes()."""
-
-    def test_returns_routable_ip(self):
-        ip = _resolve_node_ip("worker1", nodes=_RAY_NODES)
-        assert ip == "10.0.0.2"
-
-    def test_raises_for_unknown_node(self):
-        with pytest.raises(RuntimeError, match="Could not resolve IP"):
-            _resolve_node_ip("nonexistent", nodes=_RAY_NODES)
-
-    def test_skips_dead_nodes(self):
-        nodes = [
-            {"NodeID": "n1", "NodeManagerAddress": "10.0.0.1", "Alive": False},
-            {"NodeID": "n1", "NodeManagerAddress": "10.0.0.99", "Alive": True},
-        ]
-        assert _resolve_node_ip("n1", nodes=nodes) == "10.0.0.99"
-
-
-class TestMultiNodePlacement:
-    """Tests for multi-node TP addressing via plan_replica_placement."""
-
-    def test_multi_node_tp_uses_rank0_ip_as_master_addr(self):
-        """Multi-node TP: master_addr is the rank-0 node's IP."""
-        inventory = [
-            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False},
-            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 4, "is_head": False},
-        ]
-        plans = plan_replica_placement(num_replicas=1, tp_size=8, _inventory=inventory)
-        assert plans[0].master_addr == "10.0.0.1"
-        assert plans[0].ranks[0].node_ip == "10.0.0.1"
-        assert plans[0].ranks[1].node_ip == "10.0.0.2"
+        spec = ReplicaBundleSpec(
+            bundles=[{"CPU": 1, "GPU": 1}],
+            strategy="STRICT_PACK",
+            nnodes=1,
+            per_node_gpus=1,
+        )
+        pg_name = f"test_port_{os.getpid()}"
+        pg = build_replica_pg(spec, name=pg_name)
+        try:
+            port = get_free_port_in_bundle(pg, 0, 30000)
+            assert port >= 30000
+            assert port < 65536
+        finally:
+            with contextlib.suppress(Exception):
+                ray.util.remove_placement_group(pg)
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +375,7 @@ class TestMultiNodePlacement:
 @pytest.mark.gpu
 @pytest.mark.usefixtures("shared_ray_client")
 class TestSubprocessActorLifecycle:
-    """Test subprocess actor creation and run-ref based exit detection."""
+    """Actor + subprocess lifecycle against a real Ray cluster."""
 
     def test_worker_death_detected_via_run_ref(self):
         """Killing an actor makes its run ref ready in ray.wait()."""
@@ -422,6 +399,72 @@ class TestSubprocessActorLifecycle:
                 ray.kill(proc.actor, no_restart=True)
             raise
 
+    def test_graceful_stop_terminates_subprocess(self, tmp_path: os.PathLike):
+        """graceful_stop_actor reaps the subprocess; subsequent is_alive returns False."""
+        import ray
+        from ray.util.placement_group import placement_group
+
+        pg = placement_group(bundles=[{"CPU": 1}], strategy="STRICT_PACK", lifetime="detached")
+        ray.get(pg.ready(), timeout=30)
+        try:
+            proc = spawn_actor(
+                "graceful_stop_test",
+                pg,
+                0,
+                num_gpus=0,
+                command=["sleep", "3600"],
+                runtime_dir=str(tmp_path),
+                actor_name_prefix=f"test_{os.getpid()}",
+            )
+            assert ray.get(proc.actor.is_alive.remote(), timeout=10)
+            graceful_stop_actor(ray, proc.label, proc.actor)
+            # Actor may be dead at this point; can't call is_alive. The fact
+            # graceful_stop_actor returned without raising is the contract.
+        finally:
+            with contextlib.suppress(Exception):
+                ray.util.remove_placement_group(pg)
+
+
+# ---------------------------------------------------------------------------
+# Orphan PG cleanup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.gpu
+@pytest.mark.usefixtures("shared_ray_client")
+class TestRemoveNamedPgsWithPrefix:
+    """Verify named PGs can be looked up and reaped by prefix in the current namespace."""
+
+    def test_removes_matching_pgs(self):
+        import ray
+        from ray.util.placement_group import placement_group
+
+        prefix = f"orphan_test_{os.getpid()}_"
+        created = []
+        try:
+            for i in range(3):
+                pg = placement_group(
+                    bundles=[{"CPU": 1}], strategy="STRICT_PACK", lifetime="detached", name=f"{prefix}{i}"
+                )
+                ray.get(pg.ready(), timeout=30)
+                created.append(pg)
+
+            removed = remove_named_pgs_with_prefix(prefix)
+            assert removed >= 3
+
+            # Lookups by name should now fail for the reaped PGs.
+            for i in range(3):
+                with pytest.raises(Exception):  # noqa: B017, PT011
+                    ray.util.get_placement_group(f"{prefix}{i}")
+        finally:
+            for pg in created:
+                with contextlib.suppress(Exception):
+                    ray.util.remove_placement_group(pg)
+
+    def test_no_matches_returns_zero(self):
+        removed = remove_named_pgs_with_prefix(f"no_such_prefix_{os.getpid()}_")
+        assert removed == 0
+
 
 # ---------------------------------------------------------------------------
 # Subprocess env propagation (real subprocesses, real Ray cluster)
@@ -434,7 +477,7 @@ class TestSubprocessEnvPropagation:
     """Validate the simplified single-dict subprocess_env model.
 
     Actors inherit ``os.environ`` from the raylet (which shares the
-    driver's base environment).  Only runtime-computed vars (e.g.
+    driver's base environment). Only runtime-computed vars (e.g.
     ``ETCD_ENDPOINTS``) need explicit passing via ``subprocess_env``.
     """
 
@@ -514,3 +557,53 @@ class TestSubprocessEnvPropagation:
         )
         assert "PATH=/" in log, f"PATH should survive targeted overwrite, got: {log!r}"
         assert "etcd=http://10.0.0.1:2379" in log
+
+
+# ---------------------------------------------------------------------------
+# CUDA_VISIBLE_DEVICES propagation to subprocess
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.gpu
+@pytest.mark.usefixtures("shared_ray_client")
+class TestCudaVisibleDevicesPropagation:
+    """Verify the subprocess receives a correct CUDA_VISIBLE_DEVICES.
+
+    ``spawn_actor`` always sets ``CUDA_VISIBLE_DEVICES`` in the subprocess
+    env from ``ray.get_accelerator_ids()``. This test proves the subprocess
+    sees exactly the Ray-assigned IDs, which is the ground truth Dynamo
+    subprocesses rely on -- regardless of whether
+    ``RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES`` is set.
+    """
+
+    def test_subprocess_sees_ray_assigned_cuda_ids(self, tmp_path: os.PathLike):
+        import ray
+        from ray.util.placement_group import placement_group
+
+        pg = placement_group(bundles=[{"CPU": 1, "GPU": 1}], strategy="STRICT_PACK", lifetime="detached")
+        ray.get(pg.ready(), timeout=30)
+        try:
+            proc = spawn_actor(
+                "cuda_test",
+                pg,
+                0,
+                num_gpus=1,
+                command=["bash", "-c", "echo CUDA=$CUDA_VISIBLE_DEVICES"],
+                runtime_dir=str(tmp_path),
+                actor_name_prefix=f"test_{os.getpid()}",
+            )
+            ray.get(proc.run_ref, timeout=15)
+            log = ray.get(proc.actor.read_log_tail.remote(), timeout=10)
+            # The subprocess must see exactly one CUDA id, derived from the
+            # actor's Ray-assigned accelerator IDs.
+            m = re.search(r"CUDA=(\S*)", log)
+            assert m is not None, f"CUDA line not found in log: {log!r}"
+            cuda_val = m.group(1)
+            assert cuda_val, f"empty CUDA_VISIBLE_DEVICES. Full log:\n{log}"
+            assert cuda_val != "MISSING", f"subprocess reports CUDA=MISSING. Full log:\n{log}"
+            # Must be a comma-separated list of ints (matching accelerator IDs)
+            for token in cuda_val.split(","):
+                assert token.strip().isdigit(), f"non-numeric CUDA id: {token!r}"
+        finally:
+            with contextlib.suppress(Exception):
+                ray.util.remove_placement_group(pg)

@@ -23,9 +23,12 @@ import shutil
 import tempfile
 import time
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from loguru import logger
+
+if TYPE_CHECKING:
+    from ray.util.placement_group import PlacementGroup
 
 from nemo_curator.core.serve.internal.base import InferenceBackend
 from nemo_curator.core.serve.internal.constants import (
@@ -37,20 +40,22 @@ from nemo_curator.core.serve.internal.constants import (
 )
 from nemo_curator.core.serve.internal.errors import SubprocessError
 from nemo_curator.core.serve.internal.subprocess_mgr import (
+    NEMO_CURATOR_DYNAMO_NAMESPACE,
     ManagedSubprocess,
-    NodeAllocation,
-    ReplicaPlan,
+    ReplicaBundleSpec,
     _check_binary,
     _engine_kwargs_to_cli_flags,
-    _get_gpu_inventory,
-    _ignore_head_node,
-    _kill_actor,
-    _resolve_node_ip,
+    _get_gpu_topology,
     _wait_for_port,
+    build_infra_pg,
+    build_replica_pg,
     build_worker_actor_name,
-    get_free_port_on_node,
-    kill_orphaned_actors,
-    plan_replica_placement,
+    check_total_gpu_capacity,
+    get_bundle_node_ip,
+    get_free_port_in_bundle,
+    graceful_stop_actors,
+    plan_replica_bundle_shape,
+    remove_named_pgs_with_prefix,
     spawn_actor,
 )
 from nemo_curator.core.serve.server import InferenceModelConfig
@@ -59,25 +64,23 @@ if TYPE_CHECKING:
     from nemo_curator.core.serve.server import InferenceServer
 
 
+_INFRA_ETCD_BUNDLE = 0
+_INFRA_NATS_BUNDLE = 1
+_INFRA_FRONTEND_BUNDLE = 2
+_INFRA_NUM_BUNDLES = 3
+
+
 def _model_name_to_component(name: str) -> str:
     """Sanitize a model name into a valid Dynamo component name.
 
-    Dynamo endpoints use ``dyn://namespace.component.endpoint`` format
-    where dots are delimiters.  This replaces all non-alphanumeric
-    characters with underscores to produce a safe component name.
+    Dynamo endpoints use ``dyn://namespace.component.endpoint`` format where
+    dots are delimiters. This replaces all non-alphanumeric characters with
+    underscores to produce a safe component name.
 
     Differs from ``nemo_curator.stages.text.models.utils.format_name_with_suffix``
-    which only takes the last path component and does not replace dots —
-    both are required here to avoid collisions across HuggingFace orgs
-    and to keep dots out of the ``dyn://`` URI.
-
-    Examples:
-        >>> _model_name_to_component("Qwen/Qwen3-0.6B")
-        'qwen_qwen3_0_6b'
-        >>> _model_name_to_component("google/gemma-3-4b-it")
-        'google_gemma_3_4b_it'
-        >>> _model_name_to_component("my-custom-model")
-        'my_custom_model'
+    which only takes the last path component and does not replace dots --
+    both are required here to avoid collisions across HuggingFace orgs and
+    to keep dots out of the ``dyn://`` URI.
     """
     slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
     if not slug:
@@ -92,10 +95,8 @@ def _dynamo_endpoint(namespace: str, component: str, role: str | None = None) ->
     return f"dyn://{namespace}.{component}{suffix}.generate"
 
 
-# Default runtime_env for Dynamo workers — installs ai-dynamo[vllm] which
+# Default runtime_env for Dynamo workers -- installs ai-dynamo[vllm] which
 # brings the exact vLLM version matching the installed ai-dynamo release.
-# Uses uv (faster than pip). Ray caches this per content-hash, so the
-# install cost is paid once per node.
 _DYNAMO_VLLM_RUNTIME_ENV: dict[str, Any] = {
     "uv": ["ai-dynamo[vllm]"],
 }
@@ -115,38 +116,38 @@ _FRONTEND_ROUTER_KEYS = (
 
 
 class DynamoBackend(InferenceBackend):
-    """NVIDIA Dynamo inference backend.
+    """NVIDIA Dynamo inference backend, built on Ray placement groups.
 
-    Launches Dynamo infrastructure (etcd + NATS), vLLM workers, and an
-    OpenAI-compatible frontend as subprocesses managed by detached Ray actors.
+    Each model replica is backed by one placement group whose bundles
+    describe its TP topology:
 
-    Supports both single-node and multi-node tensor parallelism:
+    - **Single-node TP** (``tp_size <= GPUs-per-node``): one bundle of
+      ``tp_size`` GPUs with ``STRICT_PACK``. One Ray actor running
+      ``python -m dynamo.vllm``.
+    - **Multi-node TP** (``tp_size > GPUs-per-node``): ``nnodes`` bundles of
+      ``tp_size / nnodes`` GPUs each with ``STRICT_SPREAD``. Rank 0 runs the
+      full Dynamo worker (model registration in etcd); rank 1+ run
+      ``dynamo.vllm --headless`` workers coordinated via ``torch.distributed``.
+      ``--master-addr`` is resolved by querying the rank-0 bundle's node IP
+      after ``pg.ready()``.
 
-    - **Single-node TP**: Each replica runs on one node.  One Ray actor per
-      replica with ``num_gpus=tp_size``.
-    - **Multi-node TP** (TP > GPUs on any single node): Each replica spans
-      multiple nodes.  Rank 0 runs the full Dynamo worker (model registration
-      in etcd); rank 1+ run headless vLLM workers coordinated via
-      ``torch.distributed``.  Each rank is pinned to its planned node via
-      ``NodeAffinitySchedulingStrategy``.
+    Infra services (etcd, NATS, frontend) share a ``STRICT_PACK`` PG so they
+    co-locate. When ``CURATOR_IGNORE_RAY_HEAD_NODE=1``, every bundle carries
+    ``{"ray.io/node-type": "worker"}`` as a label selector, keeping both
+    workers and infra off the head node.
 
-    Supports KV-cache-aware routing via ``dynamo_config["router_mode"]``.
-    When ``router_mode="kv"``, workers publish KV cache events over ZMQ
-    (exact mode) or the frontend predicts cache state from routing decisions
-    (approximate mode, ``router_kv_events=False``).  Router settings are
-    resolved once across all models and validated for consistency.
-
-    This backend reserves GPUs via ``num_gpus`` on Ray actors, so
-    Ray's scheduler is aware of Dynamo's GPU usage.  Pipelines with GPU
-    stages can coexist when using executors that respect Ray's resource
-    accounting (e.g. ``RayDataExecutor``).
+    Teardown: the primary path is ``actor.stop.remote()`` (graceful SIGTERM
+    on the subprocess group) followed by ``remove_placement_group(pg)``
+    which reaps any remaining actors atomically. A
+    ``remove_named_pgs_with_prefix`` sweep catches leftovers from prior
+    driver sessions (e.g. after a Jupyter kernel restart).
     """
 
     def __init__(self, server: InferenceServer) -> None:
         self._server = server
         self._runtime_dir: str | None = None
-        self._head_ip: str | None = None
-        self._infra_node_id: str | None = None
+        self._infra_pg: PlacementGroup | None = None
+        self._replica_pgs: list[PlacementGroup] = []
         self._infra_ip: str | None = None
         self._etcd_actor: ManagedSubprocess | None = None
         self._nats_actor: ManagedSubprocess | None = None
@@ -155,42 +156,16 @@ class DynamoBackend(InferenceBackend):
         self._etcd_port: int | None = None
         self._nats_port: int | None = None
         self._actor_name_prefix: str = ""
+        self._pg_name_prefix: str = ""
 
-    @staticmethod
-    def _subtract_placed_gpus(inventory: list[dict[str, Any]], plans: list[ReplicaPlan]) -> list[dict[str, Any]]:
-        """Remove GPUs consumed by *plans* from *inventory*, returning what remains."""
-        used: dict[str, int] = {}
-        for plan in plans:
-            for rank in plan.ranks:
-                used[rank.node_id] = used.get(rank.node_id, 0) + rank.num_gpus
-        return [
-            {**n, "num_gpus": n["num_gpus"] - used.get(n["node_id"], 0)}
-            for n in inventory
-            if n["num_gpus"] - used.get(n["node_id"], 0) > 0
-        ]
-
-    @staticmethod
-    def _plan_to_placement(
-        model_name: str, plan: ReplicaPlan, *, mode: str | None = None, role: str | None = None
-    ) -> dict[str, Any]:
-        """Convert a ReplicaPlan to a manifest-friendly dict."""
-        entry: dict[str, Any] = {
-            "model": model_name,
-            "replica": plan.replica_index,
-            "ranks": [{"node": r.node_ip, "gpus": r.num_gpus, "node_rank": r.node_rank} for r in plan.ranks],
-        }
-        if mode:
-            entry["mode"] = mode
-        if role:
-            entry["role"] = role
-        return entry
+    # ------------------------------------------------------------------
+    # Manifest
+    # ------------------------------------------------------------------
 
     def _write_manifest(self, data: dict[str, Any], *, ready: bool) -> None:
         """Write deployment manifest to ``{runtime_dir}/manifest.json`` and log it."""
         manifest = {**data, "ready": ready, "timestamp": time.time()}
 
-        # Log manifest to driver logs so it's accessible even in multi-node
-        # clusters where the runtime dir may not be on a shared filesystem.
         logger.info(f"Deployment manifest (ready={ready}): {json.dumps(manifest, indent=2)}")
 
         if not self._runtime_dir:
@@ -199,14 +174,19 @@ class DynamoBackend(InferenceBackend):
         with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=2)
 
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _resolve_frontend_router_config(server: InferenceServer) -> dict[str, Any]:
         """Resolve a single set of frontend router settings from all models.
 
         Returns a dict with the effective value for each ``_FRONTEND_ROUTER_KEYS``
-        key.  Values are taken from the first model that explicitly sets each key,
-        falling back to Dynamo defaults.  When no model has a ``router_mode`` set,
-        disagg models default to ``"kv"``; otherwise ``None`` (round-robin).
+        key. Values are taken from the first model that explicitly sets each
+        key, falling back to Dynamo defaults. When no model has a
+        ``router_mode`` set, disagg models default to ``"kv"``; otherwise
+        ``None`` (round-robin).
         """
 
         def _first_explicit(key: str) -> str | float | bool | int | None:
@@ -240,8 +220,8 @@ class DynamoBackend(InferenceBackend):
         """Reject mismatched frontend-wide settings across models.
 
         The Dynamo frontend uses a single namespace, plane config, and router
-        config.  If models specify conflicting values for any of these, they
-        would be silently ignored — fail loud instead.
+        config. If models specify conflicting values, they would be silently
+        ignored -- fail loud instead.
         """
         if len(server.models) <= 1:
             return
@@ -266,7 +246,6 @@ class DynamoBackend(InferenceBackend):
             if ep != ref_ep:
                 mismatches.append(f"event_plane: {ep!r} vs {ref_ep!r}")
 
-            # Compare explicitly-set router keys against the resolved reference.
             effective_router = {**ref_router, **{k: cfg[k] for k in _FRONTEND_ROUTER_KEYS if k in cfg}}
             for key, ref_value in ref_router.items():
                 if effective_router[key] != ref_value:
@@ -283,18 +262,7 @@ class DynamoBackend(InferenceBackend):
 
     @staticmethod
     def _validate_unique_model_names(server: InferenceServer) -> None:
-        """Reject duplicate model names and component-slug collisions.
-
-        Each model must have a unique ``model_name`` (or ``model_identifier``
-        when ``model_name`` is not set).  Dynamo routes requests by model name,
-        so duplicates would be unroutable.  When deploying the same
-        ``model_identifier`` multiple times (e.g. with different TP), each
-        config must set a distinct ``model_name``.
-
-        Also checks that sanitized component names are unique — two
-        different model names that collapse to the same slug (e.g. ``a.b``
-        and ``a-b`` both become ``a_b``) would cause silent routing conflicts.
-        """
+        """Reject duplicate model names and component-slug collisions."""
         seen_names: dict[str, int] = {}
         seen_components: dict[str, tuple[int, str]] = {}
         for i, m in enumerate(server.models):
@@ -321,18 +289,18 @@ class DynamoBackend(InferenceBackend):
             seen_components[comp] = (i, name)
 
     @staticmethod
-    def _validate_gpu_requirements(server: InferenceServer, inventory: list[dict[str, Any]]) -> None:
+    def _validate_gpu_requirements(server: InferenceServer, topology: list[dict[str, Any]] | None = None) -> None:
         """Coarse fail-fast: reject configs that obviously exceed cluster capacity.
-
-        This is an early rejection check, not proof of valid placement.
-        The authoritative placement is ``plan_replica_placement()`` against
-        the shared inventory.
 
         Check A: disagg models require TP to fit on a single node.
         Check B: total GPU demand across all models must not exceed supply.
+
+        Ray's per-PG ``STRICT_PACK`` / ``STRICT_SPREAD`` is the authoritative
+        admission gate; this is a coarse pre-check for better error messages.
         """
-        max_gpus_per_node = max((n["num_gpus"] for n in inventory), default=0)
-        total_available = sum(n["num_gpus"] for n in inventory)
+        if topology is None:
+            topology = _get_gpu_topology()
+        max_gpus_per_node = max((n["num_gpus"] for n in topology), default=0)
         total_needed = 0
 
         for model_config in server.models:
@@ -347,7 +315,6 @@ class DynamoBackend(InferenceBackend):
                 prefill_tp = prefill_ek.get("tensor_parallel_size", 1)
                 decode_tp = decode_ek.get("tensor_parallel_size", 1)
 
-                # Check A: disagg TP must fit on a single node (check both roles)
                 for role, tp in [("prefill", prefill_tp), ("decode", decode_tp)]:
                     if tp > max_gpus_per_node:
                         msg = (
@@ -363,13 +330,7 @@ class DynamoBackend(InferenceBackend):
                 num_replicas = DynamoBackend._resolve_num_replicas(model_config)
                 total_needed += num_replicas * tp_size
 
-        # Check B: aggregate overcommit
-        if total_needed > total_available:
-            msg = (
-                f"Models require {total_needed} GPUs total but only "
-                f"{total_available} available across {len(inventory)} node(s)."
-            )
-            raise ValueError(msg)
+        check_total_gpu_capacity(total_needed)
 
     # ------------------------------------------------------------------
     # Start
@@ -389,80 +350,62 @@ class DynamoBackend(InferenceBackend):
             _check_binary("nats-server")
 
         short_id = uuid.uuid4().hex[:8]
-        self._actor_name_prefix = f"dynamo_{server.name}_{short_id}"
+        self._pg_name_prefix = f"dynamo_{server.name}_"
+        self._actor_name_prefix = f"{self._pg_name_prefix}{short_id}"
         self._runtime_dir = tempfile.mkdtemp(prefix=f"nemo_curator_dynamo_{short_id}_")
         logger.info(f"Dynamo runtime dir: {self._runtime_dir}")
 
-        with ray.init(ignore_reinit_error=True):
-            head_node_id = ray.get_runtime_context().get_node_id()
-            cluster_nodes = ray.nodes()
-            self._head_ip = _resolve_node_ip(head_node_id, nodes=cluster_nodes)
-
-            self._infra_node_id, self._infra_ip = self._resolve_infra_node(cluster_nodes, head_node_id)
-            server._host = self._infra_ip
-
-            # Kill any orphaned actors from a previous run with the same server name
-            # (e.g. after a Jupyter kernel restart that bypassed atexit cleanup).
-            kill_orphaned_actors(ray, f"dynamo_{server.name}_")
-
-            # Resolve ports on the infra node (not the driver) so that
-            # port availability is checked where services actually bind.
-            infra_node = self._infra_node_id
-            self._etcd_port = (
-                int(server.etcd_endpoint.rsplit(":", 1)[-1])
-                if server.etcd_endpoint
-                else get_free_port_on_node(infra_node, DEFAULT_ETCD_PORT)
-            )
-            self._nats_port = (
-                int(server.nats_url.rsplit(":", 1)[-1])
-                if server.nats_url
-                else get_free_port_on_node(infra_node, DEFAULT_NATS_PORT)
-            )
-            server.port = get_free_port_on_node(infra_node, server.port)
+        with ray.init(namespace=NEMO_CURATOR_DYNAMO_NAMESPACE, ignore_reinit_error=True):
+            # Reap PGs + actors from previous runs with the same server name
+            # (e.g. after a Jupyter kernel restart that bypassed atexit).
+            remove_named_pgs_with_prefix(self._pg_name_prefix)
 
             try:
-                self._deploy_and_healthcheck(
-                    server,
-                    head_node_id=head_node_id,
-                    cluster_nodes=cluster_nodes,
-                )
+                self._deploy_and_healthcheck(server)
             except Exception:
-                # Still connected to Ray here — kill directly without opening another context.
-                for label, actor in self._collect_actors_for_shutdown():
-                    _kill_actor(ray, label, actor)
+                # Still connected to Ray -- tear down inside the same context.
+                self._teardown_actors_and_pgs(ray)
                 self._cleanup_runtime_dir()
                 raise
 
-    def _deploy_and_healthcheck(
-        self,
-        server: InferenceServer,
-        *,
-        head_node_id: str,
-        cluster_nodes: list[dict[str, Any]],
-    ) -> None:
-        """Validate config, launch infra/workers/frontend, and wait for health.
+    def _deploy_and_healthcheck(self, server: InferenceServer) -> None:
+        """Validate config, create PGs, launch infra/workers/frontend, health check.
 
-        Sequence: fail-fast validations (GPU requirements, frontend config
-        consistency, model name uniqueness) -> etcd/NATS -> workers for each
-        model -> manifest (ready=False) -> frontend with resolved router
-        config -> health check -> manifest (ready=True).
+        Sequence: fail-fast validations -> infra PG -> etcd/NATS -> per-model
+        replica PGs + worker actors -> manifest (ready=False) -> frontend ->
+        health check -> manifest (ready=True).
         """
-        infra_node_id = self._infra_node_id
+        # Snapshot cluster topology once; all per-replica planning reuses it
+        # instead of re-calling ``ray.nodes()`` per model/replica.
+        topology = _get_gpu_topology()
 
-        # Build GPU inventory once; each model's placement shrinks it so
-        # subsequent models are assigned to different GPUs.
-        inventory = _get_gpu_inventory(head_node_id, nodes=cluster_nodes)
-
-        # Fail-fast validations before starting any infrastructure (etcd/NATS).
-        self._validate_gpu_requirements(server, inventory)
+        self._validate_gpu_requirements(server, topology)
         self._validate_frontend_config(server)
         self._validate_unique_model_names(server)
 
-        # Infrastructure -- on infra node (head or first non-head when excluded)
+        # Infra PG (etcd + NATS + frontend) -- STRICT_PACK + optional
+        # worker-label selector for head-node exclusion.
+        infra_pg_name = f"{self._actor_name_prefix}_pg_infra"
+        self._infra_pg = build_infra_pg(name=infra_pg_name, num_bundles=_INFRA_NUM_BUNDLES)
+        self._infra_ip = get_bundle_node_ip(self._infra_pg, _INFRA_ETCD_BUNDLE)
+        server._host = self._infra_ip
+
+        self._etcd_port = (
+            int(server.etcd_endpoint.rsplit(":", 1)[-1])
+            if server.etcd_endpoint
+            else get_free_port_in_bundle(self._infra_pg, _INFRA_ETCD_BUNDLE, DEFAULT_ETCD_PORT)
+        )
+        self._nats_port = (
+            int(server.nats_url.rsplit(":", 1)[-1])
+            if server.nats_url
+            else get_free_port_in_bundle(self._infra_pg, _INFRA_NATS_BUNDLE, DEFAULT_NATS_PORT)
+        )
+        server.port = get_free_port_in_bundle(self._infra_pg, _INFRA_FRONTEND_BUNDLE, server.port)
+
         if not server.etcd_endpoint:
-            self._etcd_actor = self._start_etcd(infra_node_id, self._etcd_port)
+            self._etcd_actor = self._start_etcd(self._etcd_port)
         if not server.nats_url:
-            self._nats_actor = self._start_nats(infra_node_id, self._nats_port)
+            self._nats_actor = self._start_nats(self._nats_port)
 
         etcd_endpoint = server.etcd_endpoint or f"http://{self._infra_ip}:{self._etcd_port}"
         nats_url = server.nats_url or f"nats://{self._infra_ip}:{self._nats_port}"
@@ -481,37 +424,30 @@ class DynamoBackend(InferenceBackend):
             model_name = model_config.model_name or model_config.model_identifier
             expected_models.add(model_name)
 
-            if not is_disagg:
-                tp_size = model_config.engine_kwargs.get("tensor_parallel_size", 1)
-                num_replicas = self._resolve_num_replicas(model_config)
-                logger.info(f"Deploying model '{model_name}' (TP={tp_size}, replicas={num_replicas})")
-
             if is_disagg:
-                plans_with_roles, inventory = self._launch_disagg_workers(
+                entries = self._launch_disagg_workers(
                     model_config,
                     base_env,
-                    inventory=inventory,
                     namespace=namespace,
                     request_plane=request_plane,
                     event_plane=event_plane,
+                    topology=topology,
                 )
             else:
-                plans_with_roles, inventory = self._launch_replicas(
+                tp_size = model_config.engine_kwargs.get("tensor_parallel_size", 1)
+                num_replicas = self._resolve_num_replicas(model_config)
+                logger.info(f"Deploying model '{model_name}' (TP={tp_size}, replicas={num_replicas})")
+                entries = self._launch_replicas(
                     model_config,
                     base_env,
-                    inventory=inventory,
                     num_replicas=num_replicas,
                     namespace=namespace,
                     request_plane=request_plane,
                     event_plane=event_plane,
+                    topology=topology,
                 )
+            placements.extend(entries)
 
-            for plan, role in plans_with_roles:
-                placements.append(
-                    self._plan_to_placement(model_name, plan, mode="disagg" if role else None, role=role)
-                )
-
-        # Write initial manifest before frontend launch (ready=False).
         manifest_data = {
             "models": sorted(expected_models),
             "endpoint": server.endpoint,
@@ -522,7 +458,7 @@ class DynamoBackend(InferenceBackend):
         }
         self._write_manifest(manifest_data, ready=False)
 
-        # Frontend -- co-located with infra, auto-discovers all registered models
+        # Frontend -- auto-discovers all registered models.
         first_cfg = server.models[0].dynamo_config
         namespace = first_cfg.get("namespace", DEFAULT_DYNAMO_NAMESPACE)
         request_plane = first_cfg.get("request_plane", DEFAULT_DYNAMO_REQUEST_PLANE)
@@ -530,7 +466,6 @@ class DynamoBackend(InferenceBackend):
         frontend_router_cfg = self._resolve_frontend_router_config(server)
         frontend_runtime_env = self._merge_model_runtime_envs(server.models)
         self._frontend_actor = self._launch_frontend(
-            infra_node_id,
             server.port,
             base_env,
             namespace=namespace,
@@ -540,19 +475,13 @@ class DynamoBackend(InferenceBackend):
             runtime_env=frontend_runtime_env,
         )
 
-        # Health check — must stay inside ray.init context so actor handles
-        # (is_alive, read_log_tail) remain valid for subprocess liveness checks.
+        # Health check -- stay inside ray.init context so actor handles remain valid.
         self._wait_for_models(server, expected_models)
 
-        # Update manifest after successful health check (ready=True).
         self._write_manifest(manifest_data, ready=True)
 
     def _wait_for_models(self, server: InferenceServer, expected_models: set[str]) -> None:
-        """Poll ``/v1/models`` until all *expected_models* appear in the response.
-
-        Also checks subprocess liveness via Ray actors periodically.  If any
-        crash, reads their log tail and raises immediately with the output.
-        """
+        """Poll ``/v1/models`` until all *expected_models* appear."""
         import urllib.request
 
         models_url = f"{server.endpoint}/models"
@@ -585,7 +514,6 @@ class DynamoBackend(InferenceBackend):
                     logger.debug(f"Health check attempt {attempt} failed, retrying...")
             time.sleep(2)
 
-        # Final liveness check before giving up -- surface crash info if available
         self._check_subprocess_health()
         elapsed_s = round(time.monotonic() - start_time, 1)
         msg = (
@@ -604,16 +532,7 @@ class DynamoBackend(InferenceBackend):
         )
 
     def _check_subprocess_health(self) -> None:
-        """Detect subprocess exits via ``ray.wait()`` on run refs.
-
-        Every actor launched by ``spawn_actor`` has a ``run_ref`` — an
-        ObjectRef that resolves when the subprocess exits (or the actor
-        dies).  ``ray.wait(timeout=0)`` checks all refs in a single
-        non-blocking call with no per-actor RPC overhead.
-
-        Note: does NOT use ``with ray.init()`` — the driver must already be
-        connected.
-        """
+        """Detect subprocess exits via ``ray.wait()`` on run refs."""
         import ray
 
         procs: list[ManagedSubprocess] = []
@@ -654,34 +573,9 @@ class DynamoBackend(InferenceBackend):
             debug_context={"label": label, "reason": reason, "log_tail": tail},
         )
 
-    def _resolve_infra_node(self, cluster_nodes: list[dict[str, Any]], head_node_id: str) -> tuple[str, str]:
-        """Pick the node that should host etcd, NATS, and the frontend.
-
-        Returns ``(node_id, node_ip)``.  When ``CURATOR_IGNORE_RAY_HEAD_NODE``
-        is set, selects the first non-head node (sorted by CPU count, then
-        node ID for stability).  Otherwise returns the head node.
-        """
-        if not _ignore_head_node():
-            return head_node_id, self._head_ip
-
-        non_head = [n for n in cluster_nodes if n["NodeID"] != head_node_id and n.get("Alive", False)]
-        if not non_head:
-            msg = "CURATOR_IGNORE_RAY_HEAD_NODE is set but no non-head nodes are available."
-            raise RuntimeError(msg)
-        non_head.sort(key=lambda n: (-n.get("Resources", {}).get("CPU", 0), n["NodeID"]))
-        infra = non_head[0]
-        logger.info(
-            f"Head-node exclusion active: infra will run on {infra['NodeManagerAddress']} (node {infra['NodeID'][:8]})"
-        )
-        return infra["NodeID"], infra["NodeManagerAddress"]
-
     @staticmethod
     def _dynamo_runtime_env(model_config: InferenceModelConfig) -> dict[str, Any]:
-        """Build the runtime_env for a Dynamo worker/frontend actor.
-
-        Merges the default ``ai-dynamo[vllm]`` requirement with any
-        user-provided ``runtime_env`` from the model config.
-        """
+        """Build the runtime_env for a Dynamo worker/frontend actor."""
         return InferenceModelConfig._merge_runtime_envs(
             _DYNAMO_VLLM_RUNTIME_ENV,
             model_config.runtime_env or None,
@@ -689,11 +583,7 @@ class DynamoBackend(InferenceBackend):
 
     @staticmethod
     def _merge_model_runtime_envs(models: list[InferenceModelConfig]) -> dict[str, Any]:
-        """Merge ``runtime_env`` dicts from all model configs for the frontend.
-
-        Always includes ``ai-dynamo[vllm]`` as a base, then merges any
-        user-provided ``runtime_env`` from model configs on top.
-        """
+        """Merge ``runtime_env`` dicts from all model configs for the frontend."""
         from functools import reduce
 
         envs = [m.runtime_env for m in models if m.runtime_env]
@@ -707,15 +597,7 @@ class DynamoBackend(InferenceBackend):
     def _resolve_disagg_role_config(
         model_config: InferenceModelConfig,
     ) -> tuple[tuple[int, dict[str, Any]], tuple[int, dict[str, Any]]]:
-        """Resolve per-role replica count and engine_kwargs for disaggregated serving.
-
-        Reads ``dynamo_config["prefill"]`` and ``dynamo_config["decode"]`` dicts.
-        Each may contain ``num_replicas`` (default 1) and ``engine_kwargs``
-        (merged on top of model-level ``engine_kwargs``).
-
-        Returns:
-            ``((num_prefill, prefill_engine_kwargs), (num_decode, decode_engine_kwargs))``
-        """
+        """Resolve per-role replica count and engine_kwargs for disaggregated serving."""
         dynamo_cfg = model_config.dynamo_config
         base_ek = model_config.engine_kwargs
 
@@ -739,59 +621,67 @@ class DynamoBackend(InferenceBackend):
     # Infrastructure actors
     # ------------------------------------------------------------------
 
-    def _start_etcd(self, infra_node_id: str, port: int) -> ManagedSubprocess:
-        data_dir = os.path.join(self._runtime_dir, "etcd_data")
-        os.makedirs(data_dir, exist_ok=True)
-
-        peer_port = get_free_port_on_node(infra_node_id, port + 1)
-        command = [
-            "etcd",
-            "--listen-client-urls",
-            f"http://0.0.0.0:{port}",
-            "--advertise-client-urls",
-            f"http://{self._infra_ip}:{port}",
-            "--listen-peer-urls",
-            f"http://127.0.0.1:{peer_port}",
-            "--initial-advertise-peer-urls",
-            f"http://127.0.0.1:{peer_port}",
-            "--initial-cluster",
-            f"default=http://127.0.0.1:{peer_port}",
-            "--data-dir",
-            data_dir,
-        ]
-        node_alloc = NodeAllocation(node_id=infra_node_id, node_ip=self._infra_ip, num_gpus=0, node_rank=0)
+    def _start_infra_service(
+        self,
+        *,
+        label: str,
+        bundle_index: int,
+        port: int,
+        command: list[str],
+        subprocess_env: dict[str, str] | None = None,
+    ) -> ManagedSubprocess:
+        """Spawn an infra subprocess into ``_infra_pg`` and wait for its port."""
         proc = spawn_actor(
-            "Dynamo_ETCD",
-            node_alloc,
+            label,
+            self._infra_pg,
+            bundle_index,
+            num_gpus=0,
             command=command,
             runtime_dir=self._runtime_dir,
             actor_name_prefix=self._actor_name_prefix,
+            subprocess_env=subprocess_env,
+        )
+        short_label = label.rsplit("_", 1)[-1].lower()
+        logger.info(f"Starting {short_label} on port {port} via {self._infra_ip}")
+        _wait_for_port(self._infra_ip, port, timeout_s=30, label=short_label)
+        logger.info(f"{short_label} is ready")
+        return proc
+
+    def _start_etcd(self, port: int) -> ManagedSubprocess:
+        data_dir = os.path.join(self._runtime_dir, "etcd_data")
+        os.makedirs(data_dir, exist_ok=True)
+        peer_port = get_free_port_in_bundle(self._infra_pg, _INFRA_ETCD_BUNDLE, port + 1)
+        return self._start_infra_service(
+            label="Dynamo_ETCD",
+            bundle_index=_INFRA_ETCD_BUNDLE,
+            port=port,
+            command=[
+                "etcd",
+                "--listen-client-urls",
+                f"http://0.0.0.0:{port}",
+                "--advertise-client-urls",
+                f"http://{self._infra_ip}:{port}",
+                "--listen-peer-urls",
+                f"http://127.0.0.1:{peer_port}",
+                "--initial-advertise-peer-urls",
+                f"http://127.0.0.1:{peer_port}",
+                "--initial-cluster",
+                f"default=http://127.0.0.1:{peer_port}",
+                "--data-dir",
+                data_dir,
+            ],
             subprocess_env={"ALLOW_NONE_AUTHENTICATION": "yes"},
         )
 
-        logger.info(f"Starting etcd on port {port} via {self._infra_ip}")
-        _wait_for_port(self._infra_ip, port, timeout_s=30, label="etcd")
-        logger.info("etcd is ready")
-        return proc
-
-    def _start_nats(self, infra_node_id: str, port: int) -> ManagedSubprocess:
+    def _start_nats(self, port: int) -> ManagedSubprocess:
         store_dir = os.path.join(self._runtime_dir, "nats_data")
         os.makedirs(store_dir, exist_ok=True)
-
-        command = ["nats-server", "-p", str(port), "-js", "--store_dir", store_dir]
-        node_alloc = NodeAllocation(node_id=infra_node_id, node_ip=self._infra_ip, num_gpus=0, node_rank=0)
-        proc = spawn_actor(
-            "Dynamo_NATS",
-            node_alloc,
-            command=command,
-            runtime_dir=self._runtime_dir,
-            actor_name_prefix=self._actor_name_prefix,
+        return self._start_infra_service(
+            label="Dynamo_NATS",
+            bundle_index=_INFRA_NATS_BUNDLE,
+            port=port,
+            command=["nats-server", "-p", str(port), "-js", "--store_dir", store_dir],
         )
-
-        logger.info(f"Starting NATS on port {port} via {self._infra_ip}")
-        _wait_for_port(self._infra_ip, port, timeout_s=30, label="nats")
-        logger.info("NATS is ready")
-        return proc
 
     # ------------------------------------------------------------------
     # Worker / frontend actors
@@ -799,12 +689,7 @@ class DynamoBackend(InferenceBackend):
 
     @staticmethod
     def _aggregated_model_uses_exact_kv_events(model_config: InferenceModelConfig) -> bool:
-        """Return True if an aggregated model should publish ZMQ KV events.
-
-        True when the model opts into KV-aware routing (``router_mode="kv"``)
-        with exact event tracking (``router_kv_events`` defaults to True).
-        Disagg models are handled separately by ``_launch_disagg_workers``.
-        """
+        """Return True if an aggregated model should publish ZMQ KV events."""
         cfg = model_config.dynamo_config
         if cfg.get("mode") == "disagg":
             return False
@@ -816,13 +701,14 @@ class DynamoBackend(InferenceBackend):
     def _build_worker_kv_events_config(
         model_config: InferenceModelConfig,
         *,
-        node_id: str,
+        pg: PlacementGroup,
+        bundle_index: int,
         port_seed: int,
         enabled: bool,
     ) -> str:
         """Build a ``--kv-events-config`` JSON string for a Dynamo worker.
 
-        When *enabled*, allocates a unique port via ``get_free_port_on_node``
+        When *enabled*, allocates a unique port via ``get_free_port_in_bundle``
         and merges the user's optional ``kv_events_config`` template (but
         always owns ``endpoint`` and ``enable_kv_cache_events``).
 
@@ -836,7 +722,7 @@ class DynamoBackend(InferenceBackend):
             template.pop("endpoint", None)
             return json.dumps(template)
 
-        kv_events_port = get_free_port_on_node(node_id, port_seed)
+        kv_events_port = get_free_port_in_bundle(pg, bundle_index, port_seed)
         template.update(
             {
                 "publisher": "zmq",
@@ -852,102 +738,97 @@ class DynamoBackend(InferenceBackend):
         model_config: InferenceModelConfig,
         base_env: dict[str, str],
         *,
-        inventory: list[dict[str, Any]],
         num_replicas: int,
         namespace: str,
         request_plane: str,
         event_plane: str,
-    ) -> tuple[list[tuple[ReplicaPlan, str | None]], list[dict[str, Any]]]:
-        """Plan placement and launch all worker actors for a non-disagg model.
+        topology: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Plan PGs and launch all worker actors for a non-disagg model.
 
-        Returns:
-            Tuple of (list of (plan, role) pairs, remaining GPU inventory).
-            Role is always ``None`` for non-disaggregated models.
+        Returns a list of manifest entries (one per replica).
         """
         tp_size = model_config.engine_kwargs.get("tensor_parallel_size", 1)
-        replica_plans = plan_replica_placement(num_replicas, tp_size, _inventory=inventory)
+        model_name = model_config.model_name or model_config.model_identifier
+        entries: list[dict[str, Any]] = []
 
-        for plan in replica_plans:
-            if plan.is_multi_node:
+        for replica_index in range(num_replicas):
+            spec = plan_replica_bundle_shape(tp_size, _topology=topology)
+            pg_name = f"{self._actor_name_prefix}_pg_{_model_name_to_component(model_name)}_DP{replica_index}"
+            pg = build_replica_pg(spec, name=pg_name)
+            self._replica_pgs.append(pg)
+
+            master_addr = get_bundle_node_ip(pg, 0) if spec.is_multi_node else None
+            if spec.is_multi_node:
                 logger.info(
-                    f"Replica {plan.replica_index}: multi-node TP across {plan.nnodes} nodes "
-                    f"(total {plan.total_gpus} GPUs, master={plan.master_addr})"
+                    f"Replica {replica_index}: multi-node TP across {spec.nnodes} nodes "
+                    f"(total {spec.total_gpus} GPUs, master={master_addr})"
                 )
             else:
-                logger.info(f"Replica {plan.replica_index}: single-node, {plan.total_gpus} GPU(s)")
+                logger.info(f"Replica {replica_index}: single-node, {spec.total_gpus} GPU(s)")
 
-            for rank in plan.ranks:
-                if rank.node_rank == 0:
+            for bundle_index in range(spec.nnodes):
+                if bundle_index == 0:
                     proc = self._launch_worker(
-                        replica_index=plan.replica_index,
+                        replica_index=replica_index,
                         model_config=model_config,
                         base_env=base_env,
-                        node_alloc=rank,
+                        pg=pg,
+                        bundle_index=bundle_index,
+                        num_gpus=spec.per_node_gpus,
                         namespace=namespace,
                         request_plane=request_plane,
                         event_plane=event_plane,
-                        multi_node_plan=plan if plan.is_multi_node else None,
+                        spec=spec,
+                        master_addr=master_addr,
                     )
                 else:
                     proc = self._launch_headless_worker(
-                        replica_index=plan.replica_index,
+                        replica_index=replica_index,
                         model_config=model_config,
                         base_env=base_env,
-                        node_alloc=rank,
-                        plan=plan,
+                        pg=pg,
+                        bundle_index=bundle_index,
+                        num_gpus=spec.per_node_gpus,
+                        spec=spec,
+                        master_addr=master_addr,
                     )
                 self._worker_actors.append(proc)
 
-        remaining = self._subtract_placed_gpus(inventory, replica_plans)
-        return [(plan, None) for plan in replica_plans], remaining
+            entries.append(
+                {
+                    "model": model_name,
+                    "replica": replica_index,
+                    "nnodes": spec.nnodes,
+                    "gpus_per_node": spec.per_node_gpus,
+                    "multi_node": spec.is_multi_node,
+                    "master_addr": master_addr,
+                }
+            )
+
+        return entries
 
     def _launch_disagg_workers(  # noqa: PLR0913
         self,
         model_config: InferenceModelConfig,
         base_env: dict[str, str],
         *,
-        inventory: list[dict[str, Any]],
         namespace: str,
         request_plane: str,
         event_plane: str,
-    ) -> tuple[list[tuple[ReplicaPlan, str]], list[dict[str, Any]]]:
+        topology: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
         """Launch separate prefill and decode worker pools for disaggregated serving.
 
-        Each role can have its own ``num_replicas`` and ``engine_kwargs``
-        (including ``tensor_parallel_size``), configured via nested dicts
-        in ``dynamo_config["prefill"]`` and ``dynamo_config["decode"]``.
-        Role-level ``engine_kwargs`` are merged on top of the model-level
-        defaults.
-
-        Workers are placed greedily on available GPUs.  Prefill workers
-        additionally get ``--kv-events-config`` for ZMQ event publishing.
-
-        Multi-node tensor parallelism *within* a single disagg worker is not
-        yet supported — each worker's TP group must fit on one node.
-
-        Returns:
-            Tuple of (list of (plan, role) pairs, remaining GPU inventory).
-            Role is ``"decode"`` or ``"prefill"``.
+        Each role can have its own ``num_replicas`` and ``engine_kwargs``.
+        Each worker (prefill or decode) gets its own PG. Multi-node TP
+        within a disagg worker is not supported -- each worker's TP group
+        must fit on one node.
         """
         dynamo_cfg = model_config.dynamo_config
         (num_prefill, prefill_ek), (num_decode, decode_ek) = self._resolve_disagg_role_config(model_config)
         prefill_tp = prefill_ek.get("tensor_parallel_size", 1)
         decode_tp = decode_ek.get("tensor_parallel_size", 1)
-
-        # Plan placement separately per role (they may have different TP sizes).
-        decode_plans = plan_replica_placement(num_decode, decode_tp, _inventory=inventory) if num_decode else []
-        inventory = self._subtract_placed_gpus(inventory, decode_plans)
-
-        prefill_plans = plan_replica_placement(num_prefill, prefill_tp, _inventory=inventory) if num_prefill else []
-
-        for plan in [*decode_plans, *prefill_plans]:
-            if plan.is_multi_node:
-                msg = (
-                    f"Disaggregated serving does not yet support multi-node tensor parallelism. "
-                    f"Worker {plan.replica_index} requires {plan.total_gpus} GPUs across "
-                    f"{plan.nnodes} nodes. Reduce tensor_parallel_size to fit on a single node."
-                )
-                raise ValueError(msg)
 
         kv_transfer_config = json.dumps(
             dynamo_cfg.get(
@@ -958,99 +839,31 @@ class DynamoBackend(InferenceBackend):
 
         model_name = model_config.model_name or model_config.model_identifier
         component = _model_name_to_component(model_name)
+        entries: list[dict[str, Any]] = []
         worker_index = 0
 
-        # Launch decode workers first (matching Dynamo example convention)
-        for i, plan in enumerate(decode_plans):
-            rank0 = plan.ranks[0]
-            nixl_port = get_free_port_on_node(rank0.node_id, 20097 + worker_index)
-
-            python_args = [
-                "-m",
-                "dynamo.vllm",
-                "--model",
-                model_config.model_identifier,
-                "--served-model-name",
-                model_name,
-                "--endpoint",
-                _dynamo_endpoint(namespace, component, role="decode"),
-                "--discovery-backend",
-                "etcd",
-                "--request-plane",
-                request_plane,
-                "--event-plane",
-                event_plane,
-                "--disaggregation-mode",
-                "decode",
-                "--kv-transfer-config",
-                kv_transfer_config,
-                *_engine_kwargs_to_cli_flags(decode_ek),
-            ]
-
-            label = build_worker_actor_name(model_name, i, 0, decode_tp, role="decode")
-            logger.info(f"Disagg decode worker {i}: {rank0.num_gpus} GPU(s) on {rank0.node_ip}, nixl_port={nixl_port}")
-            proc = spawn_actor(
-                label,
-                rank0,
-                python_args=python_args,
-                runtime_dir=self._runtime_dir,
-                actor_name_prefix=self._actor_name_prefix,
-                subprocess_env={**base_env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port), "PYTHONHASHSEED": "0"},
-                runtime_env=self._dynamo_runtime_env(model_config),
-            )
-            self._worker_actors.append(proc)
-            worker_index += 1
-
-        # Launch prefill workers
-        for i, plan in enumerate(prefill_plans):
-            rank0 = plan.ranks[0]
-            nixl_port = get_free_port_on_node(rank0.node_id, 20097 + worker_index)
-            kv_events_config = self._build_worker_kv_events_config(
+        # Decode first (matching Dynamo example convention), then prefill.
+        # Prefill alone publishes KV events; decode does not.
+        for role, num_workers, engine_kwargs, publishes_kv_events in (
+            ("decode", num_decode, decode_ek, False),
+            ("prefill", num_prefill, prefill_ek, True),
+        ):
+            role_entries, worker_index = self._launch_disagg_role(
                 model_config,
-                node_id=rank0.node_id,
-                port_seed=20081 + i,
-                enabled=True,
+                base_env,
+                role=role,
+                num_workers=num_workers,
+                engine_kwargs=engine_kwargs,
+                publishes_kv_events=publishes_kv_events,
+                namespace=namespace,
+                request_plane=request_plane,
+                event_plane=event_plane,
+                component=component,
+                kv_transfer_config=kv_transfer_config,
+                worker_index_start=worker_index,
+                topology=topology,
             )
-
-            python_args = [
-                "-m",
-                "dynamo.vllm",
-                "--model",
-                model_config.model_identifier,
-                "--served-model-name",
-                model_name,
-                "--endpoint",
-                _dynamo_endpoint(namespace, component, role="prefill"),
-                "--discovery-backend",
-                "etcd",
-                "--request-plane",
-                request_plane,
-                "--event-plane",
-                event_plane,
-                "--disaggregation-mode",
-                "prefill",
-                "--kv-transfer-config",
-                kv_transfer_config,
-                "--kv-events-config",
-                kv_events_config,
-                *_engine_kwargs_to_cli_flags(prefill_ek),
-            ]
-
-            label = build_worker_actor_name(model_name, i, 0, prefill_tp, role="prefill")
-            logger.info(
-                f"Disagg prefill worker {i}: {rank0.num_gpus} GPU(s) on {rank0.node_ip}, nixl_port={nixl_port}"
-            )
-            proc = spawn_actor(
-                label,
-                rank0,
-                python_args=python_args,
-                runtime_dir=self._runtime_dir,
-                actor_name_prefix=self._actor_name_prefix,
-                subprocess_env={**base_env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port), "PYTHONHASHSEED": "0"},
-                runtime_env=self._dynamo_runtime_env(model_config),
-            )
-            self._worker_actors.append(proc)
-            worker_index += 1
+            entries.extend(role_entries)
 
         total_gpus = num_decode * decode_tp + num_prefill * prefill_tp
         tp_desc = f"TP={decode_tp}" if decode_tp == prefill_tp else f"prefill_TP={prefill_tp}, decode_TP={decode_tp}"
@@ -1058,11 +871,119 @@ class DynamoBackend(InferenceBackend):
             f"Disaggregated serving: {num_decode} decode + {num_prefill} prefill "
             f"workers launched ({total_gpus} GPUs total, {tp_desc})"
         )
-        all_plans = self._subtract_placed_gpus(inventory, prefill_plans)
-        plans_with_roles: list[tuple[ReplicaPlan, str]] = [(p, "decode") for p in decode_plans] + [
-            (p, "prefill") for p in prefill_plans
-        ]
-        return plans_with_roles, all_plans
+        return entries
+
+    def _launch_disagg_role(  # noqa: PLR0913
+        self,
+        model_config: InferenceModelConfig,
+        base_env: dict[str, str],
+        *,
+        role: Literal["decode", "prefill"],
+        num_workers: int,
+        engine_kwargs: dict[str, Any],
+        publishes_kv_events: bool,
+        namespace: str,
+        request_plane: str,
+        event_plane: str,
+        component: str,
+        kv_transfer_config: str,
+        worker_index_start: int,
+        topology: list[dict[str, Any]] | None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Launch the N workers for a single disagg role (decode or prefill)."""
+        tp_size = engine_kwargs.get("tensor_parallel_size", 1)
+        model_name = model_config.model_name or model_config.model_identifier
+        entries: list[dict[str, Any]] = []
+        worker_index = worker_index_start
+
+        for i in range(num_workers):
+            spec = self._plan_disagg_shape(
+                tp_size, role=role, worker_index=i, model_name=model_name, topology=topology
+            )
+            pg_name = f"{self._actor_name_prefix}_pg_{component}_{role}_{i}"
+            pg = build_replica_pg(spec, name=pg_name)
+            self._replica_pgs.append(pg)
+
+            nixl_port = get_free_port_in_bundle(pg, 0, 20097 + worker_index)
+
+            role_args: list[str] = []
+            if publishes_kv_events:
+                kv_events_config = self._build_worker_kv_events_config(
+                    model_config, pg=pg, bundle_index=0, port_seed=20081 + i, enabled=True
+                )
+                role_args.extend(["--kv-events-config", kv_events_config])
+
+            python_args = [
+                "-m",
+                "dynamo.vllm",
+                "--model",
+                model_config.model_identifier,
+                "--served-model-name",
+                model_name,
+                "--endpoint",
+                _dynamo_endpoint(namespace, component, role=role),
+                "--discovery-backend",
+                "etcd",
+                "--request-plane",
+                request_plane,
+                "--event-plane",
+                event_plane,
+                "--disaggregation-mode",
+                role,
+                "--kv-transfer-config",
+                kv_transfer_config,
+                *role_args,
+                *_engine_kwargs_to_cli_flags(engine_kwargs),
+            ]
+
+            label = build_worker_actor_name(model_name, i, 0, tp_size, role=role)
+            logger.info(f"Disagg {role} worker {i}: {spec.per_node_gpus} GPU(s), nixl_port={nixl_port}")
+            proc = spawn_actor(
+                label,
+                pg,
+                0,
+                num_gpus=spec.per_node_gpus,
+                python_args=python_args,
+                runtime_dir=self._runtime_dir,
+                actor_name_prefix=self._actor_name_prefix,
+                subprocess_env={**base_env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port), "PYTHONHASHSEED": "0"},
+                runtime_env=self._dynamo_runtime_env(model_config),
+            )
+            self._worker_actors.append(proc)
+            entries.append(
+                {
+                    "model": model_name,
+                    "replica": i,
+                    "mode": "disagg",
+                    "role": role,
+                    "gpus_per_node": spec.per_node_gpus,
+                }
+            )
+            worker_index += 1
+
+        return entries, worker_index
+
+    @staticmethod
+    def _plan_disagg_shape(
+        tp_size: int,
+        *,
+        role: str,
+        worker_index: int,
+        model_name: str,
+        topology: list[dict[str, Any]] | None = None,
+    ) -> ReplicaBundleSpec:
+        """Disagg workers don't support multi-node TP -- fail loudly if the
+        planner returns a multi-bundle spec.
+        """
+        spec = plan_replica_bundle_shape(tp_size, _topology=topology)
+        if spec.is_multi_node:
+            msg = (
+                f"Disaggregated serving does not support multi-node TP. "
+                f"Model '{model_name}' {role} worker {worker_index} requires TP={tp_size} "
+                f"which cannot fit on a single node. Reduce tensor_parallel_size for this role."
+            )
+            raise ValueError(msg)
+        return spec
 
     def _launch_worker(  # noqa: PLR0913
         self,
@@ -1070,29 +991,27 @@ class DynamoBackend(InferenceBackend):
         replica_index: int,
         model_config: InferenceModelConfig,
         base_env: dict[str, str],
-        node_alloc: NodeAllocation,
+        pg: PlacementGroup,
+        bundle_index: int,
+        num_gpus: int,
         namespace: str,
         request_plane: str,
         event_plane: str,
-        multi_node_plan: ReplicaPlan | None = None,
+        spec: ReplicaBundleSpec,
+        master_addr: str | None,
     ) -> ManagedSubprocess:
-        """Launch a full Dynamo vLLM worker (rank 0).
-
-        This worker creates a ``DistributedRuntime``, registers the model in
-        etcd, and serves inference requests.  For multi-node TP, it also
-        coordinates with headless workers via ``torch.distributed``.
-        """
         model_name = model_config.model_name or model_config.model_identifier
         component = _model_name_to_component(model_name)
 
-        # Always pass explicit --kv-events-config for aggregated workers.
-        # Without this, Dynamo's args.py auto-creates KVEventsConfig binding
-        # tcp://*:20080 when prefix_caching is enabled (default in vLLM >=0.16),
-        # causing all workers on the same node to fight over the same port.
+        # Always pass explicit --kv-events-config. Without this, Dynamo's
+        # args.py auto-creates KVEventsConfig binding tcp://*:20080 when
+        # prefix_caching is enabled (default in vLLM >=0.16), causing all
+        # workers on the same node to fight over the same port.
         kv_events_enabled = self._aggregated_model_uses_exact_kv_events(model_config)
         kv_events_config = self._build_worker_kv_events_config(
             model_config,
-            node_id=node_alloc.node_id,
+            pg=pg,
+            bundle_index=bundle_index,
             port_seed=20080 + replica_index,
             enabled=kv_events_enabled,
         )
@@ -1117,15 +1036,15 @@ class DynamoBackend(InferenceBackend):
             *_engine_kwargs_to_cli_flags(model_config.engine_kwargs),
         ]
 
-        if multi_node_plan is not None:
+        if spec.is_multi_node:
             python_args.extend(
                 [
                     "--nnodes",
-                    str(multi_node_plan.nnodes),
+                    str(spec.nnodes),
                     "--node-rank",
                     "0",
                     "--master-addr",
-                    multi_node_plan.master_addr,
+                    master_addr,
                 ]
             )
 
@@ -1133,7 +1052,9 @@ class DynamoBackend(InferenceBackend):
         label = build_worker_actor_name(model_name, replica_index, 0, tp_size)
         return spawn_actor(
             label,
-            node_alloc,
+            pg,
+            bundle_index,
+            num_gpus=num_gpus,
             python_args=python_args,
             runtime_dir=self._runtime_dir,
             actor_name_prefix=self._actor_name_prefix,
@@ -1141,30 +1062,26 @@ class DynamoBackend(InferenceBackend):
             runtime_env=self._dynamo_runtime_env(model_config),
         )
 
-    def _launch_headless_worker(
+    def _launch_headless_worker(  # noqa: PLR0913
         self,
         *,
         replica_index: int,
         model_config: InferenceModelConfig,
         base_env: dict[str, str],
-        node_alloc: NodeAllocation,
-        plan: ReplicaPlan,
+        pg: PlacementGroup,
+        bundle_index: int,
+        num_gpus: int,
+        spec: ReplicaBundleSpec,
+        master_addr: str,
     ) -> ManagedSubprocess:
-        """Launch a headless vLLM worker (rank > 0, multi-node TP).
-
-        Headless workers bypass Dynamo's ``DistributedRuntime`` entirely --
-        they run only vLLM workers coordinated with rank 0 via
-        ``torch.distributed`` (NCCL).  No model registration, no etcd/NATS.
-        KV events are explicitly disabled to prevent Dynamo's auto-config
-        from binding a conflicting default port.
-        """
         # Headless workers don't run the scheduler so they won't bind a KV
-        # events port.  Pass explicit disable defensively so that future
+        # events port. Pass explicit disable defensively so that future
         # Dynamo/vLLM versions can't auto-configure one.
         kv_events_config = self._build_worker_kv_events_config(
             model_config,
-            node_id=node_alloc.node_id,
-            port_seed=20080 + replica_index + node_alloc.node_rank,
+            pg=pg,
+            bundle_index=bundle_index,
+            port_seed=20080 + replica_index + bundle_index,
             enabled=False,
         )
 
@@ -1177,20 +1094,22 @@ class DynamoBackend(InferenceBackend):
             "--kv-events-config",
             kv_events_config,
             "--nnodes",
-            str(plan.nnodes),
+            str(spec.nnodes),
             "--node-rank",
-            str(node_alloc.node_rank),
+            str(bundle_index),
             "--master-addr",
-            plan.master_addr,
+            master_addr,
             *_engine_kwargs_to_cli_flags(model_config.engine_kwargs),
         ]
 
         tp_size = model_config.engine_kwargs.get("tensor_parallel_size", 1)
         model_name = model_config.model_name or model_config.model_identifier
-        label = build_worker_actor_name(model_name, replica_index, node_alloc.node_rank, tp_size)
+        label = build_worker_actor_name(model_name, replica_index, bundle_index, tp_size)
         return spawn_actor(
             label,
-            node_alloc,
+            pg,
+            bundle_index,
+            num_gpus=num_gpus,
             python_args=python_args,
             runtime_dir=self._runtime_dir,
             actor_name_prefix=self._actor_name_prefix,
@@ -1200,7 +1119,6 @@ class DynamoBackend(InferenceBackend):
 
     def _launch_frontend(  # noqa: PLR0913, C901
         self,
-        infra_node_id: str,
         port: int,
         base_env: dict[str, str],
         *,
@@ -1210,11 +1128,6 @@ class DynamoBackend(InferenceBackend):
         frontend_router_cfg: dict[str, Any],
         runtime_env: dict[str, Any] | None = None,
     ) -> ManagedSubprocess:
-        """Launch the Dynamo frontend (OpenAI-compatible HTTP proxy).
-
-        Translates *frontend_router_cfg* (from ``_resolve_frontend_router_config``)
-        into ``--router-*`` CLI flags for ``dynamo.frontend``.
-        """
         frontend_env = dict(base_env)
         router_mode = frontend_router_cfg.get("router_mode")
         if router_mode:
@@ -1238,11 +1151,9 @@ class DynamoBackend(InferenceBackend):
         if router_mode:
             python_args.extend(["--router-mode", router_mode])
 
-            # Exact vs approximate KV routing
             if not frontend_router_cfg.get("router_kv_events", True):
                 python_args.append("--no-router-kv-events")
 
-            # Tuning knobs — only pass when explicitly set (non-default)
             if frontend_router_cfg.get("router_kv_overlap_score_weight") is not None:
                 python_args.extend(
                     [
@@ -1255,8 +1166,7 @@ class DynamoBackend(InferenceBackend):
             if frontend_router_cfg.get("router_queue_threshold") is not None:
                 python_args.extend(["--router-queue-threshold", str(frontend_router_cfg["router_queue_threshold"])])
 
-            # Approximate-mode knobs (TTL, tree pruning) — only relevant when
-            # KV events are disabled so the router predicts cache state.
+            # Approximate-mode knobs only when KV events are disabled.
             if not frontend_router_cfg.get("router_kv_events", True):
                 if frontend_router_cfg.get("router_ttl_secs") is not None:
                     python_args.extend(["--router-ttl-secs", str(frontend_router_cfg["router_ttl_secs"])])
@@ -1273,11 +1183,12 @@ class DynamoBackend(InferenceBackend):
             if frontend_router_cfg.get("router_reset_states"):
                 python_args.append("--router-reset-states")
 
-        node_alloc = NodeAllocation(node_id=infra_node_id, node_ip=self._infra_ip, num_gpus=0, node_rank=0)
         logger.info(f"Starting Dynamo frontend on port {port}")
         return spawn_actor(
             "Dynamo_Frontend",
-            node_alloc,
+            self._infra_pg,
+            _INFRA_FRONTEND_BUNDLE,
+            num_gpus=0,
             python_args=python_args,
             runtime_dir=self._runtime_dir,
             actor_name_prefix=self._actor_name_prefix,
@@ -1292,15 +1203,12 @@ class DynamoBackend(InferenceBackend):
     def stop(self) -> None:
         import ray
 
-        actors_to_kill = self._collect_actors_for_shutdown()
-
         try:
-            with ray.init(ignore_reinit_error=True):
-                for label, actor in actors_to_kill:
-                    _kill_actor(ray, label, actor)
-                # atexit is unreliable in Jupyter — sweep by name to catch actors
-                # orphaned when the kernel was restarted without calling stop().
-                kill_orphaned_actors(ray, f"dynamo_{self._server.name}_")
+            with ray.init(namespace=NEMO_CURATOR_DYNAMO_NAMESPACE, ignore_reinit_error=True):
+                self._teardown_actors_and_pgs(ray)
+                # Safety net: reap anything still tagged with our prefix (e.g.
+                # from an atexit-bypassed Jupyter kernel restart).
+                remove_named_pgs_with_prefix(self._pg_name_prefix)
         except Exception:  # noqa: BLE001
             logger.debug("Could not connect to Ray during Dynamo shutdown (cluster may be gone)")
 
@@ -1308,8 +1216,14 @@ class DynamoBackend(InferenceBackend):
         self._server._host = "localhost"
         logger.info("Dynamo backend stopped")
 
-    def _collect_actors_for_shutdown(self) -> list[tuple[str, Any]]:
-        """Collect all actors in reverse-start order: frontend -> workers -> nats -> etcd."""
+    def _teardown_actors_and_pgs(self, ray_mod: Any) -> None:  # noqa: ANN401
+        """Stop all actors in parallel, then release their placement groups.
+
+        Subprocess teardown (``actor.stop.remote()``) runs concurrently so
+        shutdown is bounded by a single SIGTERM→SIGKILL window instead of
+        summing across N actors. ``remove_placement_group`` then releases
+        the reservations.
+        """
         actors: list[tuple[str, Any]] = []
 
         if self._frontend_actor is not None:
@@ -1328,7 +1242,17 @@ class DynamoBackend(InferenceBackend):
             actors.append((self._etcd_actor.label, self._etcd_actor.actor))
             self._etcd_actor = None
 
-        return actors
+        graceful_stop_actors(ray_mod, actors)
+
+        for pg in self._replica_pgs:
+            with contextlib.suppress(Exception):
+                ray_mod.util.remove_placement_group(pg)
+        self._replica_pgs.clear()
+
+        if self._infra_pg is not None:
+            with contextlib.suppress(Exception):
+                ray_mod.util.remove_placement_group(self._infra_pg)
+            self._infra_pg = None
 
     def _cleanup_runtime_dir(self) -> None:
         if self._runtime_dir:

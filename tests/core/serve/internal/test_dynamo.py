@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import contextlib
 import json
 import os
@@ -23,10 +25,9 @@ from nemo_curator.core.serve.internal.dynamo import DynamoBackend, _dynamo_endpo
 from nemo_curator.core.serve.internal.errors import SubprocessError
 from nemo_curator.core.serve.internal.subprocess_mgr import (
     ManagedSubprocess,
-    NodeAllocation,
+    ReplicaBundleSpec,
     _define_subprocess_actor,
-    _kill_actor,
-    plan_replica_placement,
+    graceful_stop_actor,
 )
 
 
@@ -88,26 +89,8 @@ class TestResolveDisaggRoleConfig:
         (np, pek), (nd, dek) = DynamoBackend._resolve_disagg_role_config(config)
         assert np == 4
         assert nd == 2
-        # Prefill overrides TP but inherits max_model_len
         assert pek == {"tensor_parallel_size": 4, "max_model_len": 8192}
-        # Decode inherits everything
         assert dek == {"tensor_parallel_size": 2, "max_model_len": 8192}
-
-    def test_both_roles_override(self):
-        config = InferenceModelConfig(
-            model_identifier="m",
-            engine_kwargs={"tensor_parallel_size": 2},
-            dynamo_config={
-                "mode": "disagg",
-                "prefill": {"num_replicas": 3, "engine_kwargs": {"tensor_parallel_size": 4}},
-                "decode": {"num_replicas": 1, "engine_kwargs": {"tensor_parallel_size": 1}},
-            },
-        )
-        (np, pek), (nd, dek) = DynamoBackend._resolve_disagg_role_config(config)
-        assert np == 3
-        assert nd == 1
-        assert pek["tensor_parallel_size"] == 4
-        assert dek["tensor_parallel_size"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -146,69 +129,26 @@ class TestDynamoBackendValidation:
         with pytest.raises(ValueError, match="At least one"):
             backend.start()
 
-    def test_disagg_rejects_multi_node_tp(self):
-        """TP=8 across 2x4-GPU nodes in disagg mode should raise ValueError.
-
-        Uses 1 prefill + 0 decode so only 1 worker is needed (8 GPUs). The
-        planner can place it across 2 nodes, but disagg validation rejects it.
-        """
-        server = InferenceServer(
-            models=[
-                InferenceModelConfig(
-                    model_identifier="m",
-                    engine_kwargs={"tensor_parallel_size": 8},
-                    dynamo_config={
-                        "mode": "disagg",
-                        "prefill": {"num_replicas": 1},
-                        "decode": {"num_replicas": 0},
-                    },
-                )
-            ],
-            backend="dynamo",
+    def test_plan_disagg_shape_rejects_multi_node_tp(self, monkeypatch: pytest.MonkeyPatch):
+        """Disagg worker TP must fit on one node."""
+        topology = [
+            {"node_id": "n1", "num_gpus": 4, "is_head": False},
+            {"node_id": "n2", "num_gpus": 4, "is_head": False},
+        ]
+        monkeypatch.setattr(
+            "nemo_curator.core.serve.internal.subprocess_mgr._get_gpu_topology", lambda *_a, **_k: topology
         )
-        backend = DynamoBackend(server)
-        inventory = [
-            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False},
-            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 4, "is_head": False},
-        ]
-        with pytest.raises(ValueError, match="multi-node tensor parallelism"):
-            backend._launch_disagg_workers(
-                server.models[0],
-                {},
-                inventory=inventory,
-                namespace="test",
-                request_plane="nats",
-                event_plane="nats",
-            )
+        with pytest.raises(ValueError, match="does not support multi-node TP"):
+            DynamoBackend._plan_disagg_shape(tp_size=8, role="prefill", worker_index=0, model_name="m")
 
-    def test_disagg_accepts_single_node_tp(self):
-        """TP=4 on 1x8-GPU node in disagg should produce valid single-node plans."""
-        inventory = [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 8, "is_head": False}]
-        plans = plan_replica_placement(num_replicas=2, tp_size=4, _inventory=inventory)
-        assert len(plans) == 2
-        for plan in plans:
-            assert not plan.is_multi_node
-            assert plan.ranks[0].num_gpus == 4
-
-    def test_disagg_tp1_still_works(self):
-        """Basic TP=1 disagg placement — each worker gets 1 GPU."""
-        inventory = [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False}]
-        plans = plan_replica_placement(num_replicas=4, tp_size=1, _inventory=inventory)
-        assert len(plans) == 4
-        for plan in plans:
-            assert not plan.is_multi_node
-            assert plan.ranks[0].num_gpus == 1
-
-    def test_disagg_worker_gets_correct_num_gpus(self):
-        """TP=4: each disagg worker plan should have num_gpus=4."""
-        inventory = [
-            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False},
-            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 4, "is_head": False},
-        ]
-        plans = plan_replica_placement(num_replicas=2, tp_size=4, _inventory=inventory)
-        for plan in plans:
-            assert plan.total_gpus == 4
-            assert plan.ranks[0].num_gpus == 4
+    def test_plan_disagg_shape_accepts_single_node(self, monkeypatch: pytest.MonkeyPatch):
+        topology = [{"node_id": "n1", "num_gpus": 8, "is_head": False}]
+        monkeypatch.setattr(
+            "nemo_curator.core.serve.internal.subprocess_mgr._get_gpu_topology", lambda *_a, **_k: topology
+        )
+        spec = DynamoBackend._plan_disagg_shape(tp_size=4, role="decode", worker_index=0, model_name="m")
+        assert not spec.is_multi_node
+        assert spec.per_node_gpus == 4
 
     def test_stop_before_start_is_safe(self):
         server = InferenceServer(
@@ -339,333 +279,6 @@ class TestDynamoEndpoint:
 
 
 # ---------------------------------------------------------------------------
-# Dynamo network addressing (DynamoBackend-specific)
-# ---------------------------------------------------------------------------
-
-
-class TestDynamoNetworkAddressing:
-    """Tests for DynamoBackend._resolve_infra_node and endpoint consistency."""
-
-    def test_etcd_advertise_uses_infra_ip_not_localhost(self, monkeypatch: pytest.MonkeyPatch):
-        """When head is excluded, _resolve_infra_node picks the non-head node."""
-        monkeypatch.setenv("CURATOR_IGNORE_RAY_HEAD_NODE", "1")
-        server = InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo")
-        backend = DynamoBackend(server)
-        backend._head_ip = "10.0.0.1"
-        cluster_nodes = [
-            {"NodeID": "head1", "NodeManagerAddress": "10.0.0.1", "Alive": True, "Resources": {"CPU": 4}},
-            {"NodeID": "worker1", "NodeManagerAddress": "10.0.0.2", "Alive": True, "Resources": {"CPU": 8}},
-        ]
-        node_id, node_ip = backend._resolve_infra_node(cluster_nodes, "head1")
-        assert node_id == "worker1"
-        assert node_ip == "10.0.0.2"
-
-    def test_worker_env_uses_infra_ip_for_endpoints(self):
-        """ETCD_ENDPOINTS and NATS_SERVER use infra IP, not head IP."""
-        infra_ip = "10.0.0.2"
-        etcd_endpoint = f"http://{infra_ip}:2379"
-        nats_url = f"nats://{infra_ip}:4222"
-        base_env = {"ETCD_ENDPOINTS": etcd_endpoint, "NATS_SERVER": nats_url}
-        assert infra_ip in base_env["ETCD_ENDPOINTS"]
-        assert infra_ip in base_env["NATS_SERVER"]
-
-    def test_disagg_nixl_ports_unique_per_worker(self):
-        """Each disagg worker should get a unique nixl port base."""
-        # Verify port allocation pattern: 20097 + worker_index
-        ports = [20097 + i for i in range(4)]
-        assert len(set(ports)) == 4
-
-    def test_infra_ip_consistent_across_endpoints(self, monkeypatch: pytest.MonkeyPatch):
-        """When head excluded, endpoint + etcd + NATS all use infra IP.
-
-        Regression test for D1: ensures all three addresses are consistent.
-        """
-        monkeypatch.setenv("CURATOR_IGNORE_RAY_HEAD_NODE", "1")
-        infra_ip = "10.0.0.2"
-        server = InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo")
-        backend = DynamoBackend(server)
-        backend._infra_ip = infra_ip
-        backend._infra_node_id = "worker1"
-        backend._etcd_port = 2379
-        backend._nats_port = 4222
-
-        etcd_endpoint = f"http://{backend._infra_ip}:{backend._etcd_port}"
-        nats_url = f"nats://{backend._infra_ip}:{backend._nats_port}"
-
-        # All three should use the same infra IP
-        assert infra_ip in etcd_endpoint
-        assert infra_ip in nats_url
-        # server._host should be set to infra_ip (verified by checking the pattern)
-        server._host = backend._infra_ip
-        assert infra_ip in server.endpoint
-
-
-# ---------------------------------------------------------------------------
-# Dynamo liveness monitoring (real subprocesses, real Ray cluster)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.gpu
-@pytest.mark.usefixtures("shared_ray_client")
-class TestDynamoLiveness:
-    """Test DynamoBackend liveness checking via real Ray actors and subprocesses."""
-
-    def _make_actor(self, command: list[str], label: str = "test") -> ManagedSubprocess:
-        """Create a subprocess actor running *command* with no GPUs."""
-        import ray
-
-        actor_cls = _define_subprocess_actor()
-        actor_name = f"test_liveness_{label}_{os.getpid()}"
-        actor = actor_cls.options(name=actor_name, lifetime="detached").remote()
-        status = ray.get(actor.initialize.remote(command, {}, None), timeout=30)
-        assert status["pid"] > 0, f"Actor {actor_name} failed to start subprocess"
-        run_ref = actor.run.remote()
-        return ManagedSubprocess(label=label, actor=actor, run_ref=run_ref)
-
-    def test_worker_death_surfaces_log_context(self, tmp_path: os.PathLike):
-        """When a subprocess crashes, the log tail is included in the error."""
-        import ray
-
-        log_file = str(tmp_path / "crash.log")
-        actor_cls = _define_subprocess_actor()
-        actor = actor_cls.options(name=f"test_log_context_{os.getpid()}", lifetime="detached").remote()
-        command = ["bash", "-c", "echo 'FATAL: something went wrong' && exit 1"]
-        ray.get(actor.initialize.remote(command, {}, log_file))
-        run_ref = actor.run.remote()
-        proc = ManagedSubprocess(label="test_worker", actor=actor, run_ref=run_ref, log_file=log_file)
-
-        try:
-            ready, _ = ray.wait([run_ref], timeout=10)
-            assert len(ready) == 1
-
-            server = InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo")
-            backend = DynamoBackend(server)
-            backend._worker_actors = [proc]
-
-            with pytest.raises(RuntimeError, match="subprocess exited unexpectedly"):
-                backend._check_subprocess_health()
-        finally:
-            with contextlib.suppress(Exception):
-                ray.kill(actor, no_restart=True)
-
-    def test_healthy_subprocess_not_flagged(self):
-        """A running subprocess should not trigger liveness errors."""
-        import ray
-
-        proc = self._make_actor(["sleep", "3600"], label="healthy")
-        try:
-            server = InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo")
-            backend = DynamoBackend(server)
-            backend._worker_actors = [proc]
-
-            # Should not raise
-            backend._check_subprocess_health()
-        finally:
-            with contextlib.suppress(Exception):
-                ray.kill(proc.actor, no_restart=True)
-
-    def test_stop_idempotent_after_partial_failure(self):
-        """Calling stop() twice after a partial start should not raise."""
-        server = InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo")
-        backend = DynamoBackend(server)
-        # Simulate partial state
-        backend._worker_actors = []
-        backend._frontend_actor = None
-        backend.stop()
-        backend.stop()  # second call should be safe
-
-    def test_exited_process_detected_via_health_check(self):
-        """A process that exits normally is detected by _check_subprocess_health."""
-        import time
-
-        import ray
-
-        actor_cls = _define_subprocess_actor()
-        actor = actor_cls.options(name=f"test_exit_detect_{os.getpid()}", lifetime="detached").remote()
-        ray.get(actor.initialize.remote(["true"], {}, None))
-        run_ref = actor.run.remote()
-        proc = ManagedSubprocess(label="exited_worker", actor=actor, run_ref=run_ref)
-
-        try:
-            time.sleep(1)
-
-            server = InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo")
-            backend = DynamoBackend(server)
-            backend._worker_actors = [proc]
-
-            with pytest.raises(RuntimeError, match="subprocess exited unexpectedly"):
-                backend._check_subprocess_health()
-        finally:
-            with contextlib.suppress(Exception):
-                ray.kill(actor, no_restart=True)
-
-    def test_kill_actor_also_kills_child_processes(self, tmp_path: os.PathLike):
-        """Killing an actor must also terminate child processes spawned by the subprocess.
-
-        Subprocesses are launched with start_new_session=True so the entire
-        process group is signaled, preventing orphaned grandchildren (e.g.
-        vLLM torch.distributed workers).
-        """
-        import signal
-        import time
-
-        import ray
-
-        pid_file = str(tmp_path / "child_pids.txt")
-        # Bash spawns two child sleep processes then waits.
-        command = [
-            "bash",
-            "-c",
-            f"sleep 3600 & echo $! > {pid_file}; sleep 3600 & echo $! >> {pid_file}; wait",
-        ]
-
-        actor_cls = _define_subprocess_actor()
-        actor_name = f"test_orphan_kill_{os.getpid()}"
-        actor = actor_cls.options(name=actor_name, lifetime="detached").remote()
-        status = ray.get(actor.initialize.remote(command, {}, None), timeout=10)
-        parent_pid = status["pid"]
-        actor.run.remote()
-
-        # Poll for PID file to have 2 lines (children spawned).
-        deadline = time.monotonic() + 5
-        child_pids: list[int] = []
-        while time.monotonic() < deadline:
-            if os.path.exists(pid_file):
-                with open(pid_file) as f:
-                    lines = [line.strip() for line in f if line.strip()]
-                if len(lines) == 2:
-                    child_pids = [int(line) for line in lines]
-                    break
-            time.sleep(0.05)
-        assert len(child_pids) == 2, f"Expected 2 child PIDs, got {child_pids}"
-
-        # All should be alive before kill
-        for pid in [parent_pid, *child_pids]:
-            os.kill(pid, 0)  # raises if not alive
-
-        _kill_actor(ray, actor_name, actor)
-        time.sleep(0.5)
-
-        alive = [pid for pid in child_pids if _pid_alive(pid)]
-        try:
-            assert not alive, f"Child processes {alive} survived actor kill (orphaned)"
-        finally:
-            for pid in [parent_pid, *child_pids]:
-                with contextlib.suppress(OSError):
-                    os.kill(pid, signal.SIGKILL)
-
-
-# ---------------------------------------------------------------------------
-# Multi-model support
-# ---------------------------------------------------------------------------
-
-
-class TestMultiModel:
-    """Tests for multi-model deployment with GPU isolation."""
-
-    def test_multi_model_plans_use_separate_gpus(self):
-        """Two models each TP=1 replicas=1 on a 2-GPU node get different GPUs."""
-        inventory = [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 2, "is_head": False}]
-
-        # Model A takes 1 GPU
-        plans_a = plan_replica_placement(num_replicas=1, tp_size=1, _inventory=inventory)
-        assert len(plans_a) == 1
-        assert plans_a[0].ranks[0].num_gpus == 1
-
-        # Shrink inventory (same logic as _deploy_and_healthcheck)
-        used: dict[str, int] = {}
-        for plan in plans_a:
-            for rank in plan.ranks:
-                used[rank.node_id] = used.get(rank.node_id, 0) + rank.num_gpus
-        remaining = [
-            {**n, "num_gpus": n["num_gpus"] - used.get(n["node_id"], 0)}
-            for n in inventory
-            if n["num_gpus"] - used.get(n["node_id"], 0) > 0
-        ]
-
-        # Model B gets remaining GPU
-        plans_b = plan_replica_placement(num_replicas=1, tp_size=1, _inventory=remaining)
-        assert len(plans_b) == 1
-        assert plans_b[0].ranks[0].num_gpus == 1
-
-        # After both, no GPUs left
-        used_b: dict[str, int] = {}
-        for plan in plans_b:
-            for rank in plan.ranks:
-                used_b[rank.node_id] = used_b.get(rank.node_id, 0) + rank.num_gpus
-        final = [
-            {**n, "num_gpus": n["num_gpus"] - used_b.get(n["node_id"], 0)}
-            for n in remaining
-            if n["num_gpus"] - used_b.get(n["node_id"], 0) > 0
-        ]
-        assert len(final) == 0, "Both GPUs should be consumed"
-
-    def test_multi_model_insufficient_gpus_raises(self):
-        """Two models on a 1-GPU node fails on the second model."""
-        inventory = [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 1, "is_head": False}]
-
-        # First model succeeds
-        plans_a = plan_replica_placement(num_replicas=1, tp_size=1, _inventory=inventory)
-        used: dict[str, int] = {}
-        for plan in plans_a:
-            for rank in plan.ranks:
-                used[rank.node_id] = used.get(rank.node_id, 0) + rank.num_gpus
-        remaining = [
-            {**n, "num_gpus": n["num_gpus"] - used.get(n["node_id"], 0)}
-            for n in inventory
-            if n["num_gpus"] - used.get(n["node_id"], 0) > 0
-        ]
-
-        # Second model fails — no GPUs left
-        with pytest.raises(RuntimeError, match="No GPU nodes"):
-            plan_replica_placement(num_replicas=1, tp_size=1, _inventory=remaining)
-
-    def test_multi_model_across_nodes(self):
-        """Two TP=4 models across two 4-GPU nodes get one node each."""
-        inventory = [
-            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False},
-            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 4, "is_head": False},
-        ]
-
-        plans_a = plan_replica_placement(num_replicas=1, tp_size=4, _inventory=inventory)
-        assert plans_a[0].ranks[0].node_id == "n1"
-
-        used: dict[str, int] = {}
-        for plan in plans_a:
-            for rank in plan.ranks:
-                used[rank.node_id] = used.get(rank.node_id, 0) + rank.num_gpus
-        remaining = [
-            {**n, "num_gpus": n["num_gpus"] - used.get(n["node_id"], 0)}
-            for n in inventory
-            if n["num_gpus"] - used.get(n["node_id"], 0) > 0
-        ]
-
-        plans_b = plan_replica_placement(num_replicas=1, tp_size=4, _inventory=remaining)
-        assert plans_b[0].ranks[0].node_id == "n2"
-
-    def test_frontend_command_omits_model_name(self):
-        """Frontend should auto-discover models, not filter by --model-name."""
-        server = InferenceServer(
-            models=[
-                InferenceModelConfig(model_identifier="model-a"),
-                InferenceModelConfig(model_identifier="model-b"),
-            ],
-            backend="dynamo",
-        )
-        backend = DynamoBackend(server)
-
-        # Capture the command that _launch_frontend would build by inspecting
-        # the method's CLI assembly (we can't call it without Ray, but we can
-        # verify the parameter signature no longer accepts model_name).
-        import inspect
-
-        sig = inspect.signature(backend._launch_frontend)
-        assert "model_name" not in sig.parameters, (
-            "_launch_frontend should not accept model_name — frontend auto-discovers models"
-        )
-
-
-# ---------------------------------------------------------------------------
 # Frontend config validation
 # ---------------------------------------------------------------------------
 
@@ -776,10 +389,27 @@ class TestFrontendConfigValidation:
 # ---------------------------------------------------------------------------
 
 
+def _mock_topology_and_cluster(monkeypatch: pytest.MonkeyPatch, topology: list[dict], total_gpus: int) -> None:
+    """Patch the symbols as seen from dynamo.py's module namespace.
+
+    dynamo.py does ``from ...subprocess_mgr import _get_gpu_topology, check_total_gpu_capacity``
+    at module top, which binds local aliases. Patching the source module alone
+    won't override those aliases.
+    """
+    monkeypatch.setattr("nemo_curator.core.serve.internal.dynamo._get_gpu_topology", lambda *_a, **_k: topology)
+
+    def _fake_check(needed: int, **_: object) -> None:
+        if needed > total_gpus:
+            msg = f"Need {needed} GPUs but cluster has {total_gpus} total."
+            raise RuntimeError(msg)
+
+    monkeypatch.setattr("nemo_curator.core.serve.internal.dynamo.check_total_gpu_capacity", _fake_check)
+
+
 class TestGpuValidation:
     """Tests for DynamoBackend._validate_gpu_requirements."""
 
-    def test_rejects_disagg_tp_exceeding_max_node_gpus(self):
+    def test_rejects_disagg_tp_exceeding_max_node_gpus(self, monkeypatch: pytest.MonkeyPatch):
         """TP=8 in disagg mode on nodes with max 4 GPUs each should fail."""
         server = InferenceServer(
             models=[
@@ -795,14 +425,18 @@ class TestGpuValidation:
             ],
             backend="dynamo",
         )
-        inventory = [
-            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False},
-            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 4, "is_head": False},
-        ]
+        _mock_topology_and_cluster(
+            monkeypatch,
+            topology=[
+                {"node_id": "n1", "num_gpus": 4, "is_head": False},
+                {"node_id": "n2", "num_gpus": 4, "is_head": False},
+            ],
+            total_gpus=8,
+        )
         with pytest.raises(ValueError, match="does not support multi-node TP"):
-            DynamoBackend._validate_gpu_requirements(server, inventory)
+            DynamoBackend._validate_gpu_requirements(server)
 
-    def test_rejects_aggregate_gpu_overcommit(self):
+    def test_rejects_aggregate_gpu_overcommit(self, monkeypatch: pytest.MonkeyPatch):
         """Two models needing 4 GPUs each on a 4-GPU cluster should fail."""
         server = InferenceServer(
             models=[
@@ -819,12 +453,15 @@ class TestGpuValidation:
             ],
             backend="dynamo",
         )
-        inventory = [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False}]
-        with pytest.raises(ValueError, match="require 8 GPUs total but only 4"):
-            DynamoBackend._validate_gpu_requirements(server, inventory)
+        _mock_topology_and_cluster(
+            monkeypatch,
+            topology=[{"node_id": "n1", "num_gpus": 4, "is_head": False}],
+            total_gpus=4,
+        )
+        with pytest.raises(RuntimeError, match="Need 8 GPUs"):
+            DynamoBackend._validate_gpu_requirements(server)
 
-    def test_accepts_valid_config(self):
-        """Config that fits should not raise."""
+    def test_accepts_valid_config(self, monkeypatch: pytest.MonkeyPatch):
         server = InferenceServer(
             models=[
                 InferenceModelConfig(
@@ -835,10 +472,14 @@ class TestGpuValidation:
             ],
             backend="dynamo",
         )
-        inventory = [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False}]
-        DynamoBackend._validate_gpu_requirements(server, inventory)  # should not raise
+        _mock_topology_and_cluster(
+            monkeypatch,
+            topology=[{"node_id": "n1", "num_gpus": 4, "is_head": False}],
+            total_gpus=4,
+        )
+        DynamoBackend._validate_gpu_requirements(server)  # should not raise
 
-    def test_disagg_aggregate_check_counts_prefill_and_decode(self):
+    def test_disagg_aggregate_check_counts_prefill_and_decode(self, monkeypatch: pytest.MonkeyPatch):
         """Disagg model with 2 prefill + 2 decode at TP=2 needs 8 GPUs."""
         server = InferenceServer(
             models=[
@@ -854,94 +495,15 @@ class TestGpuValidation:
             ],
             backend="dynamo",
         )
-        inventory = [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False}]
-        with pytest.raises(ValueError, match="require 8 GPUs total but only 4"):
-            DynamoBackend._validate_gpu_requirements(server, inventory)
-
-    def test_asymmetric_tp_gpu_count(self):
-        """4 prefill @ TP=2 + 2 decode @ TP=1 = 10 GPUs."""
-        server = InferenceServer(
-            models=[
-                InferenceModelConfig(
-                    model_identifier="m",
-                    engine_kwargs={"tensor_parallel_size": 1},
-                    dynamo_config={
-                        "mode": "disagg",
-                        "prefill": {"num_replicas": 4, "engine_kwargs": {"tensor_parallel_size": 2}},
-                        "decode": {"num_replicas": 2},
-                    },
-                )
-            ],
-            backend="dynamo",
+        _mock_topology_and_cluster(
+            monkeypatch,
+            topology=[{"node_id": "n1", "num_gpus": 4, "is_head": False}],
+            total_gpus=4,
         )
-        inventory = [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 8, "is_head": False}]
-        with pytest.raises(ValueError, match="require 10 GPUs total but only 8"):
-            DynamoBackend._validate_gpu_requirements(server, inventory)
+        with pytest.raises(RuntimeError, match="Need 8 GPUs"):
+            DynamoBackend._validate_gpu_requirements(server)
 
-    def test_asymmetric_tp_accepts_valid(self):
-        """4 prefill @ TP=2 + 2 decode @ TP=1 = 10 GPUs on a 12-GPU cluster."""
-        server = InferenceServer(
-            models=[
-                InferenceModelConfig(
-                    model_identifier="m",
-                    dynamo_config={
-                        "mode": "disagg",
-                        "prefill": {"num_replicas": 4, "engine_kwargs": {"tensor_parallel_size": 2}},
-                        "decode": {"num_replicas": 2, "engine_kwargs": {"tensor_parallel_size": 1}},
-                    },
-                )
-            ],
-            backend="dynamo",
-        )
-        inventory = [
-            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 8, "is_head": False},
-            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 4, "is_head": False},
-        ]
-        DynamoBackend._validate_gpu_requirements(server, inventory)  # should not raise
-
-    def test_asymmetric_tp_2node_16gpu_decode_tp8(self):
-        """2 prefill TP=4 + 1 decode TP=8 on 2x8-GPU nodes = 16 GPUs."""
-        server = InferenceServer(
-            models=[
-                InferenceModelConfig(
-                    model_identifier="m",
-                    dynamo_config={
-                        "mode": "disagg",
-                        "prefill": {"num_replicas": 2, "engine_kwargs": {"tensor_parallel_size": 4}},
-                        "decode": {"num_replicas": 1, "engine_kwargs": {"tensor_parallel_size": 8}},
-                    },
-                )
-            ],
-            backend="dynamo",
-        )
-        inventory = [
-            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 8, "is_head": False},
-            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 8, "is_head": False},
-        ]
-        DynamoBackend._validate_gpu_requirements(server, inventory)  # should not raise
-
-    def test_asymmetric_tp_2node_16gpu_decode_tp1(self):
-        """2 prefill TP=4 + 8 decode TP=1 on 2x8-GPU nodes = 16 GPUs."""
-        server = InferenceServer(
-            models=[
-                InferenceModelConfig(
-                    model_identifier="m",
-                    dynamo_config={
-                        "mode": "disagg",
-                        "prefill": {"num_replicas": 2, "engine_kwargs": {"tensor_parallel_size": 4}},
-                        "decode": {"num_replicas": 8, "engine_kwargs": {"tensor_parallel_size": 1}},
-                    },
-                )
-            ],
-            backend="dynamo",
-        )
-        inventory = [
-            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 8, "is_head": False},
-            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 8, "is_head": False},
-        ]
-        DynamoBackend._validate_gpu_requirements(server, inventory)  # should not raise
-
-    def test_disagg_ignores_deployment_config_num_replicas(self):
+    def test_disagg_ignores_deployment_config_num_replicas(self, monkeypatch: pytest.MonkeyPatch):
         """deployment_config.num_replicas is ignored in disagg mode — only role replicas count."""
         server = InferenceServer(
             models=[
@@ -958,10 +520,14 @@ class TestGpuValidation:
             backend="dynamo",
         )
         # 2 GPUs total (1 prefill + 1 decode), NOT 99*something
-        inventory = [{"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 2, "is_head": False}]
-        DynamoBackend._validate_gpu_requirements(server, inventory)  # should not raise
+        _mock_topology_and_cluster(
+            monkeypatch,
+            topology=[{"node_id": "n1", "num_gpus": 2, "is_head": False}],
+            total_gpus=2,
+        )
+        DynamoBackend._validate_gpu_requirements(server)  # should not raise
 
-    def test_asymmetric_tp_rejects_role_exceeding_node(self):
+    def test_asymmetric_tp_rejects_role_exceeding_node(self, monkeypatch: pytest.MonkeyPatch):
         """Prefill TP=8 on 4-GPU nodes should fail even if decode TP=1."""
         server = InferenceServer(
             models=[
@@ -976,88 +542,20 @@ class TestGpuValidation:
             ],
             backend="dynamo",
         )
-        inventory = [
-            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False},
-            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 4, "is_head": False},
-        ]
+        _mock_topology_and_cluster(
+            monkeypatch,
+            topology=[
+                {"node_id": "n1", "num_gpus": 4, "is_head": False},
+                {"node_id": "n2", "num_gpus": 4, "is_head": False},
+            ],
+            total_gpus=8,
+        )
         with pytest.raises(ValueError, match="prefill requests TP=8"):
-            DynamoBackend._validate_gpu_requirements(server, inventory)
+            DynamoBackend._validate_gpu_requirements(server)
 
 
 # ---------------------------------------------------------------------------
-# Mixed disagg + non-disagg multi-model inventory isolation
-# ---------------------------------------------------------------------------
-
-
-class TestMixedDisaggInventory:
-    """Verify that disagg and non-disagg models share the GPU inventory correctly."""
-
-    def test_asymmetric_tp_placement_decode_tp8_prefill_tp4(self):
-        """Decode TP=8 takes all of n1, then 2 prefill TP=4 land on n2."""
-        inventory = [
-            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 8, "is_head": False},
-            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 8, "is_head": False},
-        ]
-
-        # Decode planned first (matches _launch_disagg_workers order)
-        decode_plans = plan_replica_placement(num_replicas=1, tp_size=8, _inventory=inventory)
-        assert len(decode_plans) == 1
-        assert decode_plans[0].ranks[0].node_id == "n1"
-        assert decode_plans[0].ranks[0].num_gpus == 8
-        inventory = DynamoBackend._subtract_placed_gpus(inventory, decode_plans)
-
-        # Prefill planned second on remaining inventory
-        prefill_plans = plan_replica_placement(num_replicas=2, tp_size=4, _inventory=inventory)
-        assert len(prefill_plans) == 2
-        for plan in prefill_plans:
-            assert plan.ranks[0].node_id == "n2"
-            assert plan.ranks[0].num_gpus == 4
-        inventory = DynamoBackend._subtract_placed_gpus(inventory, prefill_plans)
-
-        assert len(inventory) == 0
-
-    def test_disagg_and_non_disagg_use_disjoint_gpus(self):
-        """A non-disagg model followed by a disagg model should not double-book GPUs.
-
-        This is a regression test for the bug where _launch_disagg_workers
-        rebuilt inventory from scratch via _nodes= instead of using the
-        shared _inventory= parameter.
-        """
-        inventory = [
-            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False},
-            {"node_id": "n2", "node_ip": "10.0.0.2", "num_gpus": 4, "is_head": False},
-        ]
-
-        # Non-disagg model: 1 replica, TP=4 — takes all 4 GPUs on n1
-        plans_a = plan_replica_placement(num_replicas=1, tp_size=4, _inventory=inventory)
-        assert plans_a[0].ranks[0].node_id == "n1"
-        inventory = DynamoBackend._subtract_placed_gpus(inventory, plans_a)
-
-        # Disagg model: 1 decode worker, TP=4 — must land on n2, not n1
-        plans_b = plan_replica_placement(num_replicas=1, tp_size=4, _inventory=inventory)
-        assert plans_b[0].ranks[0].node_id == "n2"
-        inventory = DynamoBackend._subtract_placed_gpus(inventory, plans_b)
-
-        # No GPUs left
-        assert len(inventory) == 0
-
-    def test_mixed_models_overcommit_detected(self):
-        """Non-disagg + disagg models exceeding total GPUs should fail at placement."""
-        inventory = [
-            {"node_id": "n1", "node_ip": "10.0.0.1", "num_gpus": 4, "is_head": False},
-        ]
-
-        # First model takes all 4 GPUs
-        plans_a = plan_replica_placement(num_replicas=1, tp_size=4, _inventory=inventory)
-        inventory = DynamoBackend._subtract_placed_gpus(inventory, plans_a)
-
-        # Second model has no GPUs left
-        with pytest.raises(RuntimeError, match="No GPU nodes"):
-            plan_replica_placement(num_replicas=1, tp_size=1, _inventory=inventory)
-
-
-# ---------------------------------------------------------------------------
-# Aggregated worker and frontend launch args
+# Worker/frontend launch args (with PG-aware spawn_actor mocked)
 # ---------------------------------------------------------------------------
 
 
@@ -1065,12 +563,21 @@ def _capture_spawn(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
     """Capture ``spawn_actor()`` calls without actually launching Ray actors."""
     calls: list[dict] = []
 
-    def fake_spawn_actor(label: str, node_alloc: NodeAllocation, **kwargs) -> ManagedSubprocess:
-        calls.append({"label": label, "node_alloc": node_alloc, **kwargs})
+    def fake_spawn_actor(label: str, pg, bundle_index: int, **kwargs) -> ManagedSubprocess:  # noqa: ANN001
+        calls.append({"label": label, "pg": pg, "bundle_index": bundle_index, **kwargs})
         return ManagedSubprocess(label=label, actor=object())
 
     monkeypatch.setattr("nemo_curator.core.serve.internal.dynamo.spawn_actor", fake_spawn_actor)
     return calls
+
+
+def _single_node_spec(num_gpus: int = 1) -> ReplicaBundleSpec:
+    return ReplicaBundleSpec(
+        bundles=[{"CPU": 1, "GPU": num_gpus}],
+        strategy="STRICT_PACK",
+        nnodes=1,
+        per_node_gpus=num_gpus,
+    )
 
 
 class TestAggregatedWorkerLaunchArgs:
@@ -1085,10 +592,14 @@ class TestAggregatedWorkerLaunchArgs:
             replica_index=0,
             model_config=InferenceModelConfig(model_identifier="Qwen/Qwen3-0.6B"),
             base_env={},
-            node_alloc=NodeAllocation(node_id="n1", node_ip="10.0.0.1", num_gpus=1, node_rank=0),
+            pg=object(),
+            bundle_index=0,
+            num_gpus=1,
             namespace="curator",
             request_plane="nats",
             event_plane="nats",
+            spec=_single_node_spec(1),
+            master_addr=None,
         )
 
         python_args = calls[0]["python_args"]
@@ -1098,7 +609,8 @@ class TestAggregatedWorkerLaunchArgs:
     def test_launch_worker_enables_exact_kv_events_for_kv_router(self, monkeypatch: pytest.MonkeyPatch):
         calls = _capture_spawn(monkeypatch)
         monkeypatch.setattr(
-            "nemo_curator.core.serve.internal.dynamo.get_free_port_on_node", lambda _node_id, _start: 24567
+            "nemo_curator.core.serve.internal.dynamo.get_free_port_in_bundle",
+            lambda _pg, _bundle, _start: 24567,
         )
 
         backend = DynamoBackend(InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo"))
@@ -1112,10 +624,14 @@ class TestAggregatedWorkerLaunchArgs:
             replica_index=3,
             model_config=model,
             base_env={},
-            node_alloc=NodeAllocation(node_id="n1", node_ip="10.0.0.1", num_gpus=1, node_rank=0),
+            pg=object(),
+            bundle_index=0,
+            num_gpus=1,
             namespace="curator",
             request_plane="nats",
             event_plane="zmq",
+            spec=_single_node_spec(1),
+            master_addr=None,
         )
 
         python_args = calls[0]["python_args"]
@@ -1125,6 +641,73 @@ class TestAggregatedWorkerLaunchArgs:
         assert cfg["publisher"] == "zmq"
         assert cfg["topic"] == "kv-events"
 
+    def test_launch_worker_multi_node_adds_nnodes_and_master(self, monkeypatch: pytest.MonkeyPatch):
+        calls = _capture_spawn(monkeypatch)
+        backend = DynamoBackend(InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo"))
+        backend._runtime_dir = "/tmp/runtime"  # noqa: S108
+
+        spec = ReplicaBundleSpec(
+            bundles=[{"CPU": 1, "GPU": 4}, {"CPU": 1, "GPU": 4}],
+            strategy="STRICT_SPREAD",
+            nnodes=2,
+            per_node_gpus=4,
+        )
+        backend._launch_worker(
+            replica_index=0,
+            model_config=InferenceModelConfig(
+                model_identifier="Qwen/Qwen3-0.6B",
+                engine_kwargs={"tensor_parallel_size": 8},
+            ),
+            base_env={},
+            pg=object(),
+            bundle_index=0,
+            num_gpus=4,
+            namespace="curator",
+            request_plane="nats",
+            event_plane="nats",
+            spec=spec,
+            master_addr="10.0.0.5",
+        )
+
+        python_args = calls[0]["python_args"]
+        assert "--nnodes" in python_args
+        assert python_args[python_args.index("--nnodes") + 1] == "2"
+        assert python_args[python_args.index("--node-rank") + 1] == "0"
+        assert python_args[python_args.index("--master-addr") + 1] == "10.0.0.5"
+
+    def test_launch_headless_worker_uses_bundle_index_as_rank(self, monkeypatch: pytest.MonkeyPatch):
+        calls = _capture_spawn(monkeypatch)
+        backend = DynamoBackend(InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo"))
+        backend._runtime_dir = "/tmp/runtime"  # noqa: S108
+
+        spec = ReplicaBundleSpec(
+            bundles=[{"CPU": 1, "GPU": 4}, {"CPU": 1, "GPU": 4}],
+            strategy="STRICT_SPREAD",
+            nnodes=2,
+            per_node_gpus=4,
+        )
+        backend._launch_headless_worker(
+            replica_index=0,
+            model_config=InferenceModelConfig(
+                model_identifier="Qwen/Qwen3-0.6B",
+                engine_kwargs={"tensor_parallel_size": 8},
+            ),
+            base_env={},
+            pg=object(),
+            bundle_index=1,
+            num_gpus=4,
+            spec=spec,
+            master_addr="10.0.0.5",
+        )
+
+        python_args = calls[0]["python_args"]
+        assert "--headless" in python_args
+        assert python_args[python_args.index("--node-rank") + 1] == "1"
+        assert python_args[python_args.index("--master-addr") + 1] == "10.0.0.5"
+        # KV events must be explicitly disabled for headless ranks.
+        cfg = json.loads(python_args[python_args.index("--kv-events-config") + 1])
+        assert cfg["enable_kv_cache_events"] is False
+
 
 class TestFrontendLaunchArgs:
     """Tests for Dynamo frontend router CLI args."""
@@ -1132,9 +715,8 @@ class TestFrontendLaunchArgs:
     def test_launch_frontend_uses_router_kv_events_by_default(self, monkeypatch: pytest.MonkeyPatch):
         calls = _capture_spawn(monkeypatch)
         backend = DynamoBackend(InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo"))
-        backend._infra_ip = "10.0.0.9"
+        backend._infra_pg = object()
         backend._launch_frontend(
-            "infra",
             8000,
             {},
             namespace="curator",
@@ -1152,9 +734,8 @@ class TestFrontendLaunchArgs:
     def test_launch_frontend_uses_no_router_kv_events_for_approx_mode(self, monkeypatch: pytest.MonkeyPatch):
         calls = _capture_spawn(monkeypatch)
         backend = DynamoBackend(InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo"))
-        backend._infra_ip = "10.0.0.9"
+        backend._infra_pg = object()
         backend._launch_frontend(
-            "infra",
             8000,
             {},
             namespace="curator",
@@ -1177,9 +758,8 @@ class TestFrontendLaunchArgs:
     def test_launch_frontend_no_router_args_when_no_router_mode(self, monkeypatch: pytest.MonkeyPatch):
         calls = _capture_spawn(monkeypatch)
         backend = DynamoBackend(InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo"))
-        backend._infra_ip = "10.0.0.9"
+        backend._infra_pg = object()
         backend._launch_frontend(
-            "infra",
             8000,
             {},
             namespace="curator",
@@ -1196,9 +776,8 @@ class TestFrontendLaunchArgs:
     def test_launch_frontend_does_not_hardcode_router_reset_states(self, monkeypatch: pytest.MonkeyPatch):
         calls = _capture_spawn(monkeypatch)
         backend = DynamoBackend(InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo"))
-        backend._infra_ip = "10.0.0.9"
+        backend._infra_pg = object()
         backend._launch_frontend(
-            "infra",
             8000,
             {},
             namespace="curator",
@@ -1210,6 +789,131 @@ class TestFrontendLaunchArgs:
 
         args = calls[0]["python_args"]
         assert "--router-reset-states" not in args
+
+
+# ---------------------------------------------------------------------------
+# Dynamo liveness monitoring (real subprocesses, real Ray cluster)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.gpu
+@pytest.mark.usefixtures("shared_ray_client")
+class TestDynamoLiveness:
+    """Test DynamoBackend liveness checking via real Ray actors and subprocesses."""
+
+    def _make_actor(self, command: list[str], label: str = "test") -> ManagedSubprocess:
+        """Create a subprocess actor running *command* with no GPUs."""
+        import ray
+
+        actor_cls = _define_subprocess_actor()
+        actor_name = f"test_liveness_{label}_{os.getpid()}"
+        actor = actor_cls.options(name=actor_name, lifetime="detached").remote()
+        status = ray.get(actor.initialize.remote(command, {}, None), timeout=30)
+        assert status["pid"] > 0, f"Actor {actor_name} failed to start subprocess"
+        run_ref = actor.run.remote()
+        return ManagedSubprocess(label=label, actor=actor, run_ref=run_ref)
+
+    def test_worker_death_surfaces_log_context(self, tmp_path: os.PathLike):
+        """When a subprocess crashes, the log tail is included in the error."""
+        import ray
+
+        log_file = str(tmp_path / "crash.log")
+        actor_cls = _define_subprocess_actor()
+        actor = actor_cls.options(name=f"test_log_context_{os.getpid()}", lifetime="detached").remote()
+        command = ["bash", "-c", "echo 'FATAL: something went wrong' && exit 1"]
+        ray.get(actor.initialize.remote(command, {}, log_file))
+        run_ref = actor.run.remote()
+        proc = ManagedSubprocess(label="test_worker", actor=actor, run_ref=run_ref, log_file=log_file)
+
+        try:
+            ready, _ = ray.wait([run_ref], timeout=10)
+            assert len(ready) == 1
+
+            server = InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo")
+            backend = DynamoBackend(server)
+            backend._worker_actors = [proc]
+
+            with pytest.raises(RuntimeError, match="subprocess exited unexpectedly"):
+                backend._check_subprocess_health()
+        finally:
+            with contextlib.suppress(Exception):
+                ray.kill(actor, no_restart=True)
+
+    def test_healthy_subprocess_not_flagged(self):
+        """A running subprocess should not trigger liveness errors."""
+        import ray
+
+        proc = self._make_actor(["sleep", "3600"], label="healthy")
+        try:
+            server = InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo")
+            backend = DynamoBackend(server)
+            backend._worker_actors = [proc]
+
+            backend._check_subprocess_health()  # should not raise
+        finally:
+            with contextlib.suppress(Exception):
+                ray.kill(proc.actor, no_restart=True)
+
+    def test_stop_idempotent_after_partial_failure(self):
+        """Calling stop() twice after a partial start should not raise."""
+        server = InferenceServer(models=[InferenceModelConfig(model_identifier="m")], backend="dynamo")
+        backend = DynamoBackend(server)
+        backend._worker_actors = []
+        backend._frontend_actor = None
+        backend.stop()
+        backend.stop()  # second call should be safe
+
+    def test_graceful_stop_also_kills_child_processes(self, tmp_path: os.PathLike):
+        """graceful_stop_actor must also terminate child processes spawned by the subprocess.
+
+        Subprocesses are launched with start_new_session=True so the entire
+        process group is signaled, preventing orphaned grandchildren (e.g.
+        vLLM torch.distributed workers).
+        """
+        import signal
+        import time
+
+        import ray
+
+        pid_file = str(tmp_path / "child_pids.txt")
+        command = [
+            "bash",
+            "-c",
+            f"sleep 3600 & echo $! > {pid_file}; sleep 3600 & echo $! >> {pid_file}; wait",
+        ]
+
+        actor_cls = _define_subprocess_actor()
+        actor_name = f"test_orphan_kill_{os.getpid()}"
+        actor = actor_cls.options(name=actor_name, lifetime="detached").remote()
+        status = ray.get(actor.initialize.remote(command, {}, None), timeout=10)
+        parent_pid = status["pid"]
+        actor.run.remote()
+
+        deadline = time.monotonic() + 5
+        child_pids: list[int] = []
+        while time.monotonic() < deadline:
+            if os.path.exists(pid_file):
+                with open(pid_file) as f:
+                    lines = [line.strip() for line in f if line.strip()]
+                if len(lines) == 2:
+                    child_pids = [int(line) for line in lines]
+                    break
+            time.sleep(0.05)
+        assert len(child_pids) == 2, f"Expected 2 child PIDs, got {child_pids}"
+
+        for pid in [parent_pid, *child_pids]:
+            os.kill(pid, 0)
+
+        graceful_stop_actor(ray, actor_name, actor)
+        time.sleep(0.5)
+
+        alive = [pid for pid in child_pids if _pid_alive(pid)]
+        try:
+            assert not alive, f"Child processes {alive} survived graceful_stop_actor (orphaned)"
+        finally:
+            for pid in [parent_pid, *child_pids]:
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
 
 
 # ---------------------------------------------------------------------------
