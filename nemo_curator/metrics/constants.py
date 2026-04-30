@@ -15,6 +15,11 @@
 import os
 
 DEFAULT_NEMO_CURATOR_METRICS_PATH = f"/tmp/nemo_curator_metrics_{os.getuid()}"  # noqa: S108
+
+# Env var an orchestrator can set to point all RayClient / metrics helpers at a shared
+# metrics directory without threading the path through every constructor.
+CURATOR_METRICS_DIR_ENV = "CURATOR_METRICS_DIR"
+
 GRAFANA_VERSION = "12.0.2"
 
 PROMETHEUS_YAML_TEMPLATE = """

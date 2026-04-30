@@ -21,6 +21,7 @@ from loguru import logger
 
 from nemo_curator.core.utils import get_free_port
 from nemo_curator.metrics.constants import (
+    CURATOR_METRICS_DIR_ENV,
     DEFAULT_GRAFANA_WEB_PORT,
     DEFAULT_NEMO_CURATOR_METRICS_PATH,
     DEFAULT_PROMETHEUS_WEB_PORT,
@@ -52,6 +53,7 @@ def start_prometheus_grafana(
     # Check if the prometheus or grafana is running. If yes we assume that they were setup using this script and skip the setup.
     if is_prometheus_running(metrics_dir) or is_grafana_running(metrics_dir):
         logger.info("Prometheus or Grafana is already running. Skipping the setup.")
+        os.environ[CURATOR_METRICS_DIR_ENV] = metrics_dir
         return
 
     # Touch our directory for nemo curator in case it doesn't exist
@@ -96,7 +98,11 @@ def start_prometheus_grafana(
         f"To stop prometheus and grafana, run: "
         f"kill $(cat {metrics_dir}/prometheus.pid) ; kill $(cat {metrics_dir}/grafana.pid)"
     )
-    logger.info("Prometheus stores persistent data inside its data/ directory.")
+    logger.info(f"Prometheus stores persistent data inside {metrics_dir}/prometheus_data.")
+
+    # Publish the metrics dir so any RayClient instantiated later (in this process or a child
+    # that inherits env) attaches its scrape targets to this Prometheus without manual plumbing.
+    os.environ[CURATOR_METRICS_DIR_ENV] = metrics_dir
     return
 
 

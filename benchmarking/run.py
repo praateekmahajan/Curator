@@ -22,6 +22,7 @@ import shutil
 import sys
 import time
 import traceback
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from typing import Any
 import yaml
 from loguru import logger
 
+from nemo_curator.metrics.start_prometheus_grafana import start_prometheus_grafana
 from nemo_curator.pipeline.workflow import WorkflowRunResult
 from nemo_curator.tasks.utils import TaskPerfUtils
 from nemo_curator.utils.file_utils import create_or_overwrite_dir
@@ -44,6 +46,7 @@ sys.path.insert(0, _this_script_dir)
 from runner.datasets import DatasetResolver
 from runner.entry import Entry
 from runner.env_capture import dump_env
+from runner.metrics import slice_session_tsdb_to_entry
 from runner.path_resolver import PathResolver
 from runner.process import run_command_with_timeout
 from runner.ray_cluster import (
@@ -211,17 +214,20 @@ def check_requirements_update_results(result_data: dict[str, Any], requirements:
     return meets_requirements
 
 
-def run_entry(
+def run_entry(  # noqa: PLR0913
     entry: Entry,
     path_resolver: PathResolver,
     dataset_resolver: DatasetResolver,
     session_entry_path: Path,
     result_data: dict[str, Any],
+    session_metrics_dir: str | None = None,
 ) -> bool:
     # session_entry_path : This is the directory where benchmark results are stored
     # scratch_path : This is the directory provided to users for saving scratch/temp data; it'll be cleaned up after the entry is done if delete_scratch is True
     # ray_cluster_path : This is the directory where Ray debug/log files are saved
     # logs_path : This is the directory where stdout/stderr and Ray startup logs are saved
+    # session_metrics_dir : root of the session's Prometheus install; used to slice this entry's
+    #                       time window out of the session-wide TSDB. None disables slicing.
     scratch_path, ray_cluster_path, logs_path = [
         (session_entry_path / d).absolute() for d in ["scratch", "ray_cluster", "logs"]
     ]
@@ -232,6 +238,7 @@ def run_entry(
     ray_num_cpus = entry.ray.get("num_cpus", os.cpu_count() or 1)
     ray_num_gpus = entry.ray.get("num_gpus", 0)
     ray_enable_object_spilling = bool(entry.ray.get("enable_object_spilling", False))
+    entry_start_ts = time.time()
 
     try:
         # Create subdirs individually. logs_path uses ensure_dir (not create_or_overwrite_dir)
@@ -328,12 +335,22 @@ def run_entry(
     finally:
         teardown_ray_cluster_and_env(ray_client, ray_temp_dir, ray_cluster_path)
 
+        # Carve this entry's time window out of the session-wide Prometheus TSDB into a
+        # self-contained per-entry TSDB. Best-effort: failures are logged but don't fail the entry.
+        if session_metrics_dir is not None:
+            slice_session_tsdb_to_entry(
+                session_tsdb_path=Path(session_metrics_dir) / "prometheus_data",
+                entry_metrics_dir=session_entry_path / "metrics",
+                start_ms=int(entry_start_ts * 1000),
+                end_ms=int(time.time() * 1000),
+            )
+
         # Clean up the scratch dir if configured to delete
         if entry.delete_scratch:
             shutil.rmtree(scratch_path, ignore_errors=True)
 
 
-def main() -> int:  # noqa: C901
+def main() -> int:  # noqa: C901, PLR0915
     parser = argparse.ArgumentParser(description="Runs the benchmarking application")
     parser.add_argument(
         "--config",
@@ -396,6 +413,18 @@ def main() -> int:  # noqa: C901
     logger.info(f"Started session {session_name}...")
     env_dict = dump_env(session_obj=session, output_path=session_path)
 
+    # Start a session-wide Prometheus + Grafana so each entry's RayClient can register its
+    # scrape target automatically. The metrics dir is local to this container/host (under /tmp),
+    # so nothing is persisted at the session level — per-entry slices are written into each
+    # entry's directory in run_entry's finally block. Best-effort: if startup fails, the
+    # benchmark proceeds without metrics capture.
+    session_metrics_dir: str | None = f"/tmp/nemo_curator_metrics_{uuid.uuid4().hex[:8]}"  # noqa: S108
+    try:
+        start_prometheus_grafana(metrics_dir=session_metrics_dir)
+    except Exception as exc:
+        logger.warning(f"Could not start Prometheus/Grafana; per-entry metrics will be skipped: {exc}")
+        session_metrics_dir = None
+
     for sink in session.sinks:
         sink.initialize(session_name=session_name, session=session, env_dict=env_dict)
 
@@ -432,6 +461,7 @@ def main() -> int:  # noqa: C901
                 dataset_resolver=session.dataset_resolver,
                 session_entry_path=session_entry_path,
                 result_data=result_data,
+                session_metrics_dir=session_metrics_dir,
             )
 
         except Exception as e:

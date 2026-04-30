@@ -27,6 +27,28 @@ RUN apt-get update \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
 
+# Install Prometheus and Grafana so the metrics tooling can skip its runtime download path.
+# Symlinks place them on $PATH; nemo_curator.metrics discovers them via shutil.which.
+ARG PROMETHEUS_VERSION=3.4.0
+ARG GRAFANA_VERSION=12.0.2
+
+RUN ARCH=$(dpkg --print-architecture) \
+ && curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-${ARCH}.tar.gz" \
+      -o /tmp/prom.tar.gz \
+ && mkdir -p /opt/prometheus \
+ && tar -xzf /tmp/prom.tar.gz -C /opt/prometheus --strip-components=1 \
+ && ln -s /opt/prometheus/prometheus /usr/local/bin/prometheus \
+ && ln -s /opt/prometheus/promtool   /usr/local/bin/promtool \
+ && rm /tmp/prom.tar.gz
+
+RUN ARCH=$(dpkg --print-architecture) \
+ && curl -fsSL "https://dl.grafana.com/enterprise/release/grafana-enterprise-${GRAFANA_VERSION}.linux-${ARCH}.tar.gz" \
+      -o /tmp/grafana.tar.gz \
+ && mkdir -p /opt/grafana \
+ && tar -xzf /tmp/grafana.tar.gz -C /opt/grafana --strip-components=1 \
+ && ln -s /opt/grafana/bin/grafana-server /usr/local/bin/grafana-server \
+ && rm /tmp/grafana.tar.gz
+
 # Ensure all extras and dependency groups (including test) are synced
 RUN cd /opt/Curator \
  && uv sync --extra all --all-groups \

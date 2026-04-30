@@ -30,6 +30,7 @@ from ray.dashboard.modules.metrics.install_and_start_prometheus import (
 )
 
 from nemo_curator.metrics.constants import (
+    CURATOR_METRICS_DIR_ENV,
     DEFAULT_NEMO_CURATOR_METRICS_PATH,
     GRAFANA_DASHBOARD_YAML_TEMPLATE,
     GRAFANA_DATASOURCE_YAML_TEMPLATE,
@@ -45,8 +46,16 @@ from nemo_curator.utils.file_utils import tar_safe_extract
 
 
 def _resolve_metrics_dir(metrics_dir: str | None) -> str:
-    """Resolve the metrics directory, defaulting to DEFAULT_NEMO_CURATOR_METRICS_PATH."""
-    return metrics_dir if metrics_dir is not None else DEFAULT_NEMO_CURATOR_METRICS_PATH
+    """Resolve the metrics directory.
+
+    Resolution priority: explicit argument, then ``CURATOR_METRICS_DIR`` env var (set by an
+    orchestrator that has already started Prometheus + Grafana), then the per-user default.
+    """
+    if metrics_dir is not None:
+        return metrics_dir
+    if env_value := os.environ.get(CURATOR_METRICS_DIR_ENV):
+        return env_value
+    return DEFAULT_NEMO_CURATOR_METRICS_PATH
 
 
 def _is_process_running_from_pidfile(pid_file_path: str) -> bool:
@@ -62,13 +71,42 @@ def _is_process_running_from_pidfile(pid_file_path: str) -> bool:
         return False
 
 
+def _find_preinstalled_prometheus_dir() -> str | None:
+    """Return the dir holding ``prometheus`` and ``promtool`` if both are on PATH, else None."""
+    prom_bin = shutil.which("prometheus")
+    if not prom_bin:
+        return None
+    prom_dir = os.path.dirname(os.path.realpath(prom_bin))
+    return prom_dir if os.path.isfile(os.path.join(prom_dir, "promtool")) else None
+
+
+def _find_preinstalled_grafana_dir() -> str | None:
+    """Return the Grafana home dir if ``grafana-server`` is on PATH and the dir layout is intact, else None.
+
+    Grafana needs ``--homepath=<dir>`` where ``<dir>/public`` and ``<dir>/conf`` exist; the binary lives at
+    ``<dir>/bin/grafana-server``, so the homepath is two ``dirname`` calls above the resolved binary.
+    """
+    grafana_bin = shutil.which("grafana-server")
+    if not grafana_bin:
+        return None
+    grafana_dir = os.path.dirname(os.path.dirname(os.path.realpath(grafana_bin)))
+    if os.path.isdir(os.path.join(grafana_dir, "public")) and os.path.isdir(os.path.join(grafana_dir, "conf")):
+        return grafana_dir
+    return None
+
+
 def download_and_extract_prometheus(
     metrics_dir: str | None = None,
     os_type=None,  # noqa: ANN001
     architecture=None,  # noqa: ANN001
     prometheus_version=None,  # noqa: ANN001
 ) -> str:
-    """Download the prometheus tarball and extract it to the metrics directory."""
+    """Download the prometheus tarball and extract it to the metrics directory.
+
+    Skips the download when a usable install is already on PATH.
+    """
+    if (preinstalled := _find_preinstalled_prometheus_dir()) is not None:
+        return preinstalled
     metrics_dir = _resolve_metrics_dir(metrics_dir)
     os.makedirs(metrics_dir, exist_ok=True)
     file_name, _ = get_prometheus_filename(os_type, architecture, prometheus_version)
@@ -115,7 +153,11 @@ def get_prometheus_port(metrics_dir: str | None = None) -> int:
 
 
 def run_prometheus(prometheus_dir: str, prometheus_web_port: int, metrics_dir: str | None = None) -> None:
-    """Run the prometheus server."""
+    """Run the prometheus server.
+
+    The TSDB is pinned under ``<metrics_dir>/prometheus_data`` so the data location is independent of
+    the caller's CWD (Prometheus's ``--storage.tsdb.path`` defaults to a CWD-relative ``data/``).
+    """
     metrics_dir = _resolve_metrics_dir(metrics_dir)
     os.makedirs(metrics_dir, exist_ok=True)
 
@@ -124,12 +166,16 @@ def run_prometheus(prometheus_dir: str, prometheus_web_port: int, metrics_dir: s
     with open(prometheus_config_path, "w") as f:
         f.write(PROMETHEUS_YAML_TEMPLATE)
 
+    tsdb_path = os.path.join(metrics_dir, "prometheus_data")
+    os.makedirs(tsdb_path, exist_ok=True)
+
     prometheus_cmd = [
         f"{prometheus_dir}/prometheus",
         "--config.file",
         str(prometheus_config_path),
         "--web.enable-lifecycle",
         f"--web.listen-address=:{prometheus_web_port}",
+        f"--storage.tsdb.path={tsdb_path}",
     ]
 
     try:
@@ -160,7 +206,13 @@ def run_prometheus(prometheus_dir: str, prometheus_web_port: int, metrics_dir: s
 
 
 def download_grafana(metrics_dir: str | None = None) -> str:
-    """Download the grafana tarball and extract it to the metrics directory."""
+    """Download the grafana tarball and extract it to the metrics directory.
+
+    Skips the download when a usable install is already on PATH.
+    """
+    if (preinstalled := _find_preinstalled_grafana_dir()) is not None:
+        return preinstalled
+
     metrics_dir = _resolve_metrics_dir(metrics_dir)
 
     # Determine download URL based on architecture
