@@ -60,7 +60,7 @@ overrides = [
     { name = "torchaudio", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform == 'darwin'", specifier = "==2.10.0", index = "https://pypi.org/simple" },
     { name = "torchaudio", marker = "(platform_machine == 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux') or (platform_machine == 'x86_64' and sys_platform != 'darwin' and sys_platform != 'linux')", specifier = "==2.10.0" },
     { name = "torchaudio", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==2.10.0", index = "https://download.pytorch.org/whl/cu129" },
-    { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", specifier = ">=0.9.0,<0.11", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", specifier = "~=0.10.0", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torchvision", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform == 'darwin'", specifier = "==0.25.0", index = "https://pypi.org/simple" },
     { name = "torchvision", marker = "(platform_machine == 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux') or (platform_machine == 'x86_64' and sys_platform != 'darwin' and sys_platform != 'linux')", specifier = "==0.25.0" },
     { name = "torchvision", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==0.25.0", index = "https://download.pytorch.org/whl/cu129" },
@@ -93,6 +93,40 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/4a/8e/ac2a9566747a93f8be36ee08532eb0160558b07630a081a6056a9f89bf1d/accelerate-1.12.0.tar.gz", hash = "sha256:70988c352feb481887077d2ab845125024b2a137a5090d6d7a32b57d03a45df6", size = 398399, upload-time = "2025-11-21T11:27:46.973Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9f/d2/c581486aa6c4fbd7394c23c47b83fa1a919d34194e16944241daf9e762dd/accelerate-1.12.0-py3-none-any.whl", hash = "sha256:3e2091cd341423207e2f084a6654b1efcd250dc326f2a37d6dde446e07cabb11", size = 380935, upload-time = "2025-11-21T11:27:44.522Z" },
+]
+
+[[package]]
+name = "ai-dynamo"
+version = "1.0.2"
+source = { registry = "https://pypi.nvidia.com/" }
+dependencies = [
+    { name = "ai-dynamo-runtime", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "click", version = "8.1.8", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "distro", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "fastapi", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "filelock", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "kubernetes", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "prometheus-client", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "pytest", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "setuptools", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "transformers", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "typer", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "types-psutil", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+]
+wheels = [
+    { url = "https://pypi.nvidia.com/ai-dynamo/ai_dynamo-1.0.2-py3-none-any.whl", hash = "sha256:e20aebe4fd2c8376d7688d5502c3df6e65288c92c229aa4d0e20baad62adfe82" },
+]
+
+[[package]]
+name = "ai-dynamo-runtime"
+version = "1.0.2"
+source = { registry = "https://pypi.nvidia.com/" }
+dependencies = [
+    { name = "pydantic", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "uvloop", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+]
+wheels = [
+    { url = "https://pypi.nvidia.com/ai-dynamo-runtime/ai_dynamo_runtime-1.0.2-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:be1a6838bf90001b52900be3dd2466a4874700f1b81fa5f3ab82688a94fb77d5" },
 ]
 
 [[package]]
@@ -937,10 +971,50 @@ wheels = [
 
 [[package]]
 name = "click"
+version = "8.1.8"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "python_full_version >= '3.13' and platform_machine == 'x86_64' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform != 'darwin' and sys_platform != 'linux'",
+]
+dependencies = [
+    { name = "colorama", marker = "platform_machine == 'x86_64' and sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b9/2e/0090cbf739cee7d23781ad4b89a9894a41538e4fcf4c31dcdd705b78eb8b/click-8.1.8.tar.gz", hash = "sha256:ed53c9d8990d83c2a27deae68e4ee337473f6330c040a31d4225c9574d16096a", size = 226593, upload-time = "2024-12-21T18:38:44.339Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7e/d4/7ebdbd03970677812aac39c869717059dbb71a4cfc033ca6e5221787892c/click-8.1.8-py3-none-any.whl", hash = "sha256:63c132bbbed01578a06712a2d1f497bb62d9c1c0d329b7903a866228027263b2", size = 98188, upload-time = "2024-12-21T18:38:41.666Z" },
+]
+
+[[package]]
+name = "click"
 version = "8.2.1"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'darwin'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'darwin'",
+    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version >= '3.13' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and platform_machine != 's390x' and platform_machine != 'x86_64'",
+    "python_full_version >= '3.13' and platform_machine == 's390x'",
+    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and platform_machine != 's390x' and platform_machine != 'x86_64'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x'",
+    "python_full_version < '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version < '3.12' and platform_machine == 'aarch64' and sys_platform == 'darwin'",
+    "python_full_version < '3.12' and platform_machine == 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version < '3.12' and platform_machine != 'aarch64' and platform_machine != 's390x' and platform_machine != 'x86_64'",
+    "python_full_version < '3.12' and platform_machine == 's390x'",
+]
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32'" },
+    { name = "colorama", marker = "platform_machine != 'x86_64' and sys_platform == 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/60/6c/8ca2efa64cf75a977a0d7fac081354553ebe483345c734fb6b6515d96bbc/click-8.2.1.tar.gz", hash = "sha256:27c491cc05d968d271d5a1db13e3b5a184636d9d930f148c50b038f0d0646202", size = 286342, upload-time = "2025-05-20T23:19:49.832Z" }
 wheels = [
@@ -1667,7 +1741,8 @@ name = "dask"
 version = "2025.9.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click" },
+    { name = "click", version = "8.1.8", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "click", version = "8.2.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform == 'darwin'" },
     { name = "cloudpickle" },
     { name = "fsspec" },
     { name = "importlib-metadata", marker = "python_full_version < '3.12'" },
@@ -1686,7 +1761,8 @@ name = "dask-cuda"
 version = "25.10.0"
 source = { registry = "https://pypi.nvidia.com/" }
 dependencies = [
-    { name = "click" },
+    { name = "click", version = "8.1.8", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "click", version = "8.2.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform == 'darwin'" },
     { name = "cuda-core" },
     { name = "numba-cuda" },
     { name = "numpy" },
@@ -1922,7 +1998,8 @@ name = "distributed"
 version = "2025.9.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click" },
+    { name = "click", version = "8.1.8", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "click", version = "8.2.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform == 'darwin'" },
     { name = "cloudpickle" },
     { name = "dask" },
     { name = "jinja2" },
@@ -2040,6 +2117,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/bd/21/d903cc63a5140c822b7b62b373a87dc557e60c29b321dfb435061c5e67cf/duckdb-1.5.2-cp313-cp313-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:70631c847ca918ee710ec874241b00cf9d2e5be90762cbb2a0389f17823c08f7", size = 21429837, upload-time = "2026-04-13T11:29:41.135Z" },
     { url = "https://files.pythonhosted.org/packages/e3/0a/b770d1f60c70597302130d6247f418549b7094251a02348fbaf1c7e147ae/duckdb-1.5.2-cp313-cp313-win_amd64.whl", hash = "sha256:52a21823f3fbb52f0f0e5425e20b07391ad882464b955879499b5ff0b45a376b", size = 13107699, upload-time = "2026-04-13T11:29:43.905Z" },
     { url = "https://files.pythonhosted.org/packages/d9/cf/e200fe431d700962d1a908d2ce89f53ccee1cc8db260174ae663ba09686b/duckdb-1.5.2-cp313-cp313-win_arm64.whl", hash = "sha256:411ad438bd4140f189a10e7f515781335962c5d18bd07837dc6d202e3985253d", size = 13927646, upload-time = "2026-04-13T11:29:46.598Z" },
+]
+
+[[package]]
+name = "durationpy"
+version = "0.10"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/9d/a4/e44218c2b394e31a6dd0d6b095c4e1f32d0be54c2a4b250032d717647bab/durationpy-0.10.tar.gz", hash = "sha256:1fa6893409a6e739c9c72334fc65cca1f355dbdd93405d30f726deb5bde42fba", size = 3335, upload-time = "2025-05-17T13:52:37.26Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b0/0d/9feae160378a3553fa9a339b0e9c1a048e147a4127210e286ef18b730f03/durationpy-0.10-py3-none-any.whl", hash = "sha256:3b41e1b601234296b4fb368338fdcd3e13e0b4fb5b67345948f4f2bf9868b286", size = 3922, upload-time = "2025-05-17T13:52:36.463Z" },
 ]
 
 [[package]]
@@ -2309,7 +2395,8 @@ version = "0.15.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "brotli" },
-    { name = "click" },
+    { name = "click", version = "8.1.8", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "click", version = "8.2.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform == 'darwin'" },
     { name = "tqdm" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/9f/75/6579b89c119ca75857d9fe328c0dcb05846350b16b456e9d40e91089ec75/fastwarc-0.15.2.tar.gz", hash = "sha256:529e5b58a9707d4e873e30bc63a9c05adfb80e49fe5154ea7c4569d2c217eb9c", size = 44884, upload-time = "2025-03-27T16:30:44.36Z" }
@@ -2372,7 +2459,8 @@ version = "0.6.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
-    { name = "click" },
+    { name = "click", version = "8.1.8", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "click", version = "8.2.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform == 'darwin'" },
     { name = "einops" },
     { name = "ninja" },
     { name = "numpy" },
@@ -3284,7 +3372,7 @@ name = "jiwer"
 version = "3.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "click", version = "8.1.8", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "rapidfuzz", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/85/3e/71b95cf0e2179fb5de8744a79fd36c8bd4e02e1803129a16d423884b6654/jiwer-3.1.0.tar.gz", hash = "sha256:dc492d09e570f1baba98c76aba09baf8e09c06e6808a4ba412dd4bde67fb79ac", size = 103187, upload-time = "2025-01-31T12:14:10.86Z" }
@@ -3760,6 +3848,28 @@ wheels = [
 ]
 
 [[package]]
+name = "kubernetes"
+version = "32.0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "certifi", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "durationpy", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "google-auth", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "oauthlib", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "python-dateutil", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "pyyaml", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "requests", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "requests-oauthlib", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "six", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "urllib3", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "websocket-client", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b7/e8/0598f0e8b4af37cd9b10d8b87386cf3173cb8045d834ab5f6ec347a758b3/kubernetes-32.0.1.tar.gz", hash = "sha256:42f43d49abd437ada79a79a16bd48a604d3471a117a8347e87db693f2ba0ba28", size = 946691, upload-time = "2025-02-18T21:06:34.148Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/08/10/9f8af3e6f569685ce3af7faab51c8dd9d93b9c38eba339ca31c746119447/kubernetes-32.0.1-py2.py3-none-any.whl", hash = "sha256:35282ab8493b938b08ab5526c7ce66588232df00ef5e1dbe88a419107dc10998", size = 1988070, upload-time = "2025-02-18T21:06:31.391Z" },
+]
+
+[[package]]
 name = "lark"
 version = "1.2.2"
 source = { registry = "https://pypi.org/simple" }
@@ -3786,7 +3896,7 @@ version = "1.33.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "audioread", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
-    { name = "click", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "click", version = "8.1.8", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "cytoolz", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "intervaltree", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "numpy", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
@@ -4777,6 +4887,7 @@ dependencies = [
 [package.optional-dependencies]
 all = [
     { name = "accelerate" },
+    { name = "ai-dynamo", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "albumentations" },
     { name = "av" },
     { name = "beautifulsoup4" },
@@ -4930,6 +5041,7 @@ image-cuda12 = [
     { name = "torchvision", version = "0.25.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
 inference-server = [
+    { name = "ai-dynamo", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "boto3" },
     { name = "gpustat" },
     { name = "nixl-cu12", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
@@ -5008,6 +5120,7 @@ sdg-cpu = [
     { name = "data-designer" },
 ]
 sdg-cuda12 = [
+    { name = "ai-dynamo", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "boto3" },
     { name = "data-designer" },
     { name = "gpustat" },
@@ -5126,6 +5239,7 @@ test = [
 requires-dist = [
     { name = "absl-py", specifier = ">=2.0.0,<3.0.0" },
     { name = "accelerate", marker = "extra == 'audio-common'" },
+    { name = "ai-dynamo", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'inference-server'", specifier = "==1.0.2" },
     { name = "albumentations", marker = "extra == 'interleaved-cpu'" },
     { name = "av", marker = "extra == 'video-cpu'", specifier = "==13.1.0" },
     { name = "beautifulsoup4", marker = "extra == 'text-cpu'" },
@@ -5440,7 +5554,7 @@ name = "nltk"
 version = "3.9.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "click", version = "8.1.8", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "joblib", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "regex", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "tqdm", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
@@ -6327,6 +6441,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/a6/7b/17244b1083e8e604bf154cf9b716aecd6388acd656dd01893d0d244c94d9/oauth2client-4.1.3.tar.gz", hash = "sha256:d486741e451287f69568a4d26d70d9acd73a2bbfa275746c535b4209891cccc6", size = 155910, upload-time = "2018-09-07T21:38:18.036Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/95/a9/4f25a14d23f0786b64875b91784607c2277eff25d48f915e39ff0cff505a/oauth2client-4.1.3-py2.py3-none-any.whl", hash = "sha256:b8a81cc5d60e2d364f0b1b98f958dbd472887acaf1a5b05e21c28c31a2d6d3ac", size = 98206, upload-time = "2018-09-07T21:38:16.742Z" },
+]
+
+[[package]]
+name = "oauthlib"
+version = "3.3.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0b/5f/19930f824ffeb0ad4372da4812c50edbd1434f678c90c2733e1188edfc63/oauthlib-3.3.1.tar.gz", hash = "sha256:0f0f8aa759826a193cf66c12ea1af1637f87b9b4622d46e866952bb022e538c9", size = 185918, upload-time = "2025-06-19T22:48:08.269Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/be/9c/92789c596b8df838baa98fa71844d84283302f7604ed565dafe5a6b5041a/oauthlib-3.3.1-py3-none-any.whl", hash = "sha256:88119c938d2b8fb88561af5f6ee0eec8cc8d552b7bb1f712743136eb7523b7a1", size = 160065, upload-time = "2025-06-19T22:48:06.508Z" },
 ]
 
 [[package]]
@@ -8335,7 +8458,8 @@ name = "ray"
 version = "2.55.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click" },
+    { name = "click", version = "8.1.8", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "click", version = "8.2.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform == 'darwin'" },
     { name = "filelock" },
     { name = "jsonschema" },
     { name = "msgpack" },
@@ -8529,6 +8653,19 @@ wheels = [
 ]
 
 [[package]]
+name = "requests-oauthlib"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "oauthlib", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "requests", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/42/f2/05f29bc3913aea15eb670be136045bf5c5bbf4b99ecb839da9b422bb2c85/requests-oauthlib-2.0.0.tar.gz", hash = "sha256:b3dffaebd884d8cd778494369603a9e7b58d29111bf6b41bdc2dcd87203af4e9", size = 55650, upload-time = "2024-03-22T20:32:29.939Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3b/5d/63d4ae3b9daea098d5d6f5da83984853c1bbacd5dc826764b249fe119d24/requests_oauthlib-2.0.0-py2.py3-none-any.whl", hash = "sha256:7dd8a5c40426b779b0868c404bdef9768deccf22749cde15852df527e6269b36", size = 24179, upload-time = "2024-03-22T20:32:28.055Z" },
+]
+
+[[package]]
 name = "resampy"
 version = "0.4.3"
 source = { registry = "https://pypi.org/simple" }
@@ -8618,7 +8755,8 @@ name = "rich-toolkit"
 version = "0.17.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click" },
+    { name = "click", version = "8.1.8", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "click", version = "8.2.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform == 'darwin'" },
     { name = "rich" },
     { name = "typing-extensions" },
 ]
@@ -8923,7 +9061,7 @@ name = "sacremoses"
 version = "0.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "click", version = "8.1.8", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "joblib", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "regex", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "tqdm", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
@@ -9430,7 +9568,8 @@ version = "3.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "chardet" },
-    { name = "click" },
+    { name = "click", version = "8.1.8", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "click", version = "8.2.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform == 'darwin'" },
     { name = "colorama" },
     { name = "diff-cover" },
     { name = "jinja2" },
@@ -10309,7 +10448,8 @@ name = "typer"
 version = "0.20.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click" },
+    { name = "click", version = "8.1.8", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "click", version = "8.2.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform == 'darwin'" },
     { name = "rich" },
     { name = "shellingham" },
     { name = "typing-extensions" },
@@ -10317,6 +10457,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/6d/c1/933d30fd7a123ed981e2a1eedafceab63cb379db0402e438a13bc51bbb15/typer-0.20.1.tar.gz", hash = "sha256:68585eb1b01203689c4199bc440d6be616f0851e9f0eb41e4a778845c5a0fd5b", size = 105968, upload-time = "2025-12-19T16:48:56.302Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c8/52/1f2df7e7d1be3d65ddc2936d820d4a3d9777a54f4204f5ca46b8513eff77/typer-0.20.1-py3-none-any.whl", hash = "sha256:4b3bde918a67c8e03d861aa02deca90a95bbac572e71b1b9be56ff49affdb5a8", size = 47381, upload-time = "2025-12-19T16:48:53.679Z" },
+]
+
+[[package]]
+name = "types-psutil"
+version = "7.2.2.20260408"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/44/14/279fd5defebbd560ede04aecd38f7651cccee7336f2264d0889d8c9a9d43/types_psutil-7.2.2.20260408.tar.gz", hash = "sha256:e8053450685965b8cd52afb62569073d00ea9967ae78bb45dff5f606847f97f2", size = 26556, upload-time = "2026-04-08T04:27:44.349Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/af/40/2fd92a4a1ee088c4dbcc44c977908d9869838d9cd2a2fa2e001352f56694/types_psutil-7.2.2.20260408-py3-none-any.whl", hash = "sha256:0c334f6f6bc9e9c24fca5c7d1f0b6971c961a0a2e3956dc5ce704722c01f9762", size = 32861, upload-time = "2026-04-08T04:27:42.929Z" },
 ]
 
 [[package]]
@@ -10413,7 +10562,8 @@ name = "uvicorn"
 version = "0.40.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click" },
+    { name = "click", version = "8.1.8", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "click", version = "8.2.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform == 'darwin'" },
     { name = "h11" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c3/d1/8f3c683c9561a4e6689dd3b1d345c815f10f86acd044ee1fb9a4dcd0b8c5/uvicorn-0.40.0.tar.gz", hash = "sha256:839676675e87e73694518b5574fd0f24c9d97b46bea16df7b8c05ea1a51071ea", size = 81761, upload-time = "2025-12-21T14:16:22.45Z" }
@@ -10565,7 +10715,7 @@ name = "wandb"
 version = "0.25.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "click", version = "8.1.8", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "gitpython", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "packaging", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "platformdirs", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },

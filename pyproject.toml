@@ -80,9 +80,7 @@ inference_server = [
     "nemo_curator[cuda12]",
     "nemo_curator[vllm]",
     "vllm<0.19; (platform_machine == 'x86_64' and platform_system != 'Darwin')", # Ray Serve LLM 2.55.1 isn't compatible with vllm 0.19+
-    # TODO: pin ``ai-dynamo==1.0.2`` here once Lightning-AI/pytorch-lightning#21691
-    # (PyPI quarantine) is resolved — re-resolving with ai-dynamo in scope can't
-    # currently find a satisfiable lightning version for nemo-toolkit + pyannote.
+    "ai-dynamo==1.0.2; (platform_machine == 'x86_64' and platform_system != 'Darwin')", # pin so the Dynamo actor venv resolves to the same release we test against; gated to x86_64 since vllm wheels are x86_64-only
     "boto3>=1.35", # Get rid once https://github.com/ray-project/ray/issues/61269 is fixed
     "nixl-cu12>=0.10.0; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "ray[serve,llm]>=2.55.1",
@@ -302,7 +300,7 @@ override-dependencies = [
     "torch==2.10.0", # Override whisperx's <2.9 cap to match cu129 / vllm 0.18.x
     "torchaudio==2.10.0", # Override whisperx's <2.9 cap to match cu129 / vllm 0.18.x
     "torchvision==0.25.0", # Match torch==2.10.0
-    "torchcodec>=0.9.0,<0.11; platform_machine == 'x86_64' and platform_system != 'Darwin'", # cap below torchcodec 0.11 (built for torch 2.11) to match our torch 2.10 ABI; override pyannote-audio's >=0.7.0 floor; gated since aarch64 lacks wheels
+    "torchcodec~=0.10.0; platform_machine == 'x86_64' and platform_system != 'Darwin'", # pin to torchcodec 0.10.x for torch 2.10 ABI compatibility — torchcodec doesn't declare a torch dep, so the resolver can't enforce the match; satisfies pyannote-audio's >=0.7.0 floor; x86_64-only since aarch64 lacks wheels
     "nixl-cu12>=0.10.0; (platform_machine == 'x86_64' and platform_system != 'Darwin')",  # Override ray[llm]'s unconditional nixl dep for ARM
     "xgrammar>=0.1.32", # Override vllm's ==0.1.29 pin to address CVE GHSA-7rgv-gqhr-fxg3 (DoS via multi-layer nesting)
 ]
