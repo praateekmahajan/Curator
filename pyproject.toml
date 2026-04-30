@@ -80,6 +80,9 @@ inference_server = [
     "nemo_curator[cuda12]",
     "nemo_curator[vllm]",
     "vllm<0.19; (platform_machine == 'x86_64' and platform_system != 'Darwin')", # Ray Serve LLM 2.55.1 isn't compatible with vllm 0.19+
+    # TODO: pin ``ai-dynamo==1.0.2`` here once Lightning-AI/pytorch-lightning#21691
+    # (PyPI quarantine) is resolved — re-resolving with ai-dynamo in scope can't
+    # currently find a satisfiable lightning version for nemo-toolkit + pyannote.
     "boto3>=1.35", # Get rid once https://github.com/ray-project/ray/issues/61269 is fixed
     "nixl-cu12>=0.10.0; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "ray[serve,llm]>=2.55.1",

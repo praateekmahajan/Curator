@@ -46,10 +46,24 @@ if TYPE_CHECKING:
     from nemo_curator.core.serve.placement import ReplicaBundleSpec
 
 
-# Installs ai-dynamo[vllm] to pin the exact vLLM release matching the
-# installed ai-dynamo — required because ai-dynamo's CLI surface tracks
-# a specific vLLM version.
-DYNAMO_VLLM_RUNTIME_ENV: dict[str, Any] = {"uv": ["ai-dynamo[vllm]"]}
+# Force flash-attn to rebuild against the actor venv's torch — its prebuilt
+# wheel has a torch-version-specific ABI and ai-dynamo[vllm] often pulls a
+# torch different from the base image's, so the prebuilt wheel's
+# ``c10::cuda::c10_cuda_check_implementation`` symbol misses at import.
+DYNAMO_VLLM_RUNTIME_ENV: dict[str, Any] = {
+    "uv": {
+        "packages": [
+            "ai-dynamo[vllm]",
+            "flash-attn",
+        ],
+        "uv_pip_install_options": [
+            "--reinstall-package",
+            "flash-attn",
+            "--no-build-isolation-package",
+            "flash-attn",
+        ],
+    }
+}
 
 # Default KV-cache transfer configuration for disagg — NixlConnector is the
 # production path; ``kv_both`` makes each worker both send and receive KV

@@ -23,7 +23,6 @@ user's ``env_vars``, ``pip``, ``uv``, or ``working_dir``.
 from __future__ import annotations
 
 from nemo_curator.core.serve import DynamoVLLMModelConfig
-from nemo_curator.core.serve.base import BaseModelConfig
 from nemo_curator.core.serve.dynamo.vllm import (
     DYNAMO_VLLM_RUNTIME_ENV,
     dynamo_runtime_env,
@@ -43,7 +42,11 @@ class TestDynamoRuntimeEnv:
             runtime_env={"uv": ["mypkg==1.0"]},
         )
         env = dynamo_runtime_env(mc)
-        assert env["uv"] == ["ai-dynamo[vllm]", "mypkg==1.0"]
+        # Dict-form ``DYNAMO_VLLM_RUNTIME_ENV["uv"]`` + list-form override:
+        # override packages append; base ``uv_pip_install_options`` survive.
+        expected_packages = [*DYNAMO_VLLM_RUNTIME_ENV["uv"]["packages"], "mypkg==1.0"]
+        assert env["uv"]["packages"] == expected_packages
+        assert env["uv"]["uv_pip_install_options"] == DYNAMO_VLLM_RUNTIME_ENV["uv"]["uv_pip_install_options"]
 
     def test_user_env_vars_are_preserved(self) -> None:
         mc = DynamoVLLMModelConfig(
@@ -51,7 +54,8 @@ class TestDynamoRuntimeEnv:
             runtime_env={"env_vars": {"HF_TOKEN": "abc", "TRANSFORMERS_OFFLINE": "1"}},
         )
         env = dynamo_runtime_env(mc)
-        assert env["uv"] == ["ai-dynamo[vllm]"]
+        # No ``uv`` override → base ``uv`` block is preserved verbatim.
+        assert env["uv"] == DYNAMO_VLLM_RUNTIME_ENV["uv"]
         assert env["env_vars"] == {"HF_TOKEN": "abc", "TRANSFORMERS_OFFLINE": "1"}
 
     def test_working_dir_is_passed_through(self) -> None:
@@ -61,6 +65,20 @@ class TestDynamoRuntimeEnv:
         )
         env = dynamo_runtime_env(mc)
         assert env["working_dir"] == "/workspace"
+
+    def test_default_carries_flash_attn_rebuild_flags(self) -> None:
+        # Regression guard: without ``--reinstall-package flash-attn`` +
+        # ``--no-build-isolation-package flash-attn`` the actor venv loads
+        # ai-dynamo[vllm]'s prebuilt flash-attn wheel against the wrong torch
+        # ABI and crashes with ``undefined symbol:
+        # c10::cuda::c10_cuda_check_implementation``.
+        env = dynamo_runtime_env(DynamoVLLMModelConfig(model_identifier="m"))
+        assert "flash-attn" in env["uv"]["packages"]
+        opts = env["uv"]["uv_pip_install_options"]
+        assert "--reinstall-package" in opts
+        assert opts[opts.index("--reinstall-package") + 1] == "flash-attn"
+        assert "--no-build-isolation-package" in opts
+        assert opts[opts.index("--no-build-isolation-package") + 1] == "flash-attn"
 
 
 class TestMergeModelRuntimeEnvs:
@@ -80,7 +98,8 @@ class TestMergeModelRuntimeEnvs:
         ]
         env = merge_model_runtime_envs(models)
         assert env["env_vars"] == {"A": "1", "B": "2"}
-        assert env["uv"] == ["ai-dynamo[vllm]", "userpkg"]
+        expected_packages = [*DYNAMO_VLLM_RUNTIME_ENV["uv"]["packages"], "userpkg"]
+        assert env["uv"]["packages"] == expected_packages
 
     def test_later_model_env_var_overrides_earlier(self) -> None:
         models = [
@@ -107,40 +126,23 @@ class TestMergeModelRuntimeEnvs:
         env = merge_model_runtime_envs(models)
         assert env["env_vars"] == {"A": "1"}
 
-
-class TestMergeRuntimeEnvsDictForm:
-    """Cover ``BaseModelConfig.merge_runtime_envs`` paths where ``pip`` / ``uv``
-    arrive in Ray's structured dict form (``{"packages": [...],
-    "uv_pip_install_options": [...]}``) rather than the legacy list form."""
-
-    def test_dict_base_list_override_preserves_install_options(self) -> None:
-        base = {"uv": {"packages": ["pkg-a"], "uv_pip_install_options": ["--no-cache"]}}
-        override = {"uv": ["pkg-b"]}
-        env = BaseModelConfig.merge_runtime_envs(base, override)
-
-        assert env["uv"]["packages"] == ["pkg-a", "pkg-b"]
-        assert env["uv"]["uv_pip_install_options"] == ["--no-cache"]
-
-    def test_list_base_dict_override_carries_extra_keys(self) -> None:
-        base = {"pip": ["pkg-a"]}
-        override = {"pip": {"packages": ["pkg-b"], "pip_check": True}}
-        env = BaseModelConfig.merge_runtime_envs(base, override)
-
-        assert env["pip"]["packages"] == ["pkg-a", "pkg-b"]
-        assert env["pip"]["pip_check"] is True
-
-    def test_dict_base_dict_override_concatenates_options(self) -> None:
-        base = {"pip": {"packages": ["pkg-a"], "pip_install_options": ["--no-cache"]}}
-        override = {"pip": {"packages": ["pkg-b"], "pip_install_options": ["--prefer-binary"]}}
-        env = BaseModelConfig.merge_runtime_envs(base, override)
-
-        assert env["pip"]["packages"] == ["pkg-a", "pkg-b"]
-        assert env["pip"]["pip_install_options"] == ["--no-cache", "--prefer-binary"]
-
-    def test_dict_form_base_alone_is_returned_verbatim(self) -> None:
-        # User did not override ``uv`` — base's installer options must survive.
-        base = {"uv": {"packages": ["pkg-a"], "uv_pip_install_options": ["--no-cache"]}}
-        env = BaseModelConfig.merge_runtime_envs(base, {"env_vars": {"X": "1"}})
-
-        assert env["uv"] == base["uv"]
-        assert env["env_vars"] == {"X": "1"}
+    def test_user_dict_form_uv_concatenates_install_options(self) -> None:
+        # User passes a dict-form ``uv`` override carrying its own
+        # ``uv_pip_install_options``; merger appends packages and concatenates
+        # options without dropping the Curator-owned flash-attn rebuild flags.
+        models = [
+            DynamoVLLMModelConfig(
+                model_identifier="m",
+                runtime_env={
+                    "uv": {
+                        "packages": ["userpkg"],
+                        "uv_pip_install_options": ["--prefer-binary"],
+                    },
+                },
+            ),
+        ]
+        env = merge_model_runtime_envs(models)
+        expected_packages = [*DYNAMO_VLLM_RUNTIME_ENV["uv"]["packages"], "userpkg"]
+        expected_options = [*DYNAMO_VLLM_RUNTIME_ENV["uv"]["uv_pip_install_options"], "--prefer-binary"]
+        assert env["uv"]["packages"] == expected_packages
+        assert env["uv"]["uv_pip_install_options"] == expected_options
