@@ -18,6 +18,10 @@ set -xeuo pipefail
 # Build HAProxy from source so Ray Serve's HAProxy ingress mode (RAY_SERVE_ENABLE_HA_PROXY=1)
 # has the binary on $PATH. Mirrors ray-project/ray docker/base-slim/Dockerfile (Ray 2.55+).
 #
+# TODO(ray>=2.56): drop this script (and its Dockerfile COPY/RUN) once we can
+# pull HAProxy from the bundled ray-project/ray-haproxy distribution instead of
+# compiling it ourselves.
+#
 # Fetched from ray-project/haproxy-release (a GitHub release mirror) because
 # www.haproxy.org's wildcard TLS cert expired 2026-04-17 and the release tarball
 # disappeared from the upstream download site. Switch back to www.haproxy.org once

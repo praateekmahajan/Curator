@@ -196,8 +196,10 @@ def init_cluster(  # noqa: PLR0913
     # RAY_SERVE_HAPROXY_STATS_PORT once that lands so multi-cluster hosts
     # don't collide on HAProxy's stats bind.
     if shutil.which("haproxy") is not None and shutil.which("socat") is not None:
+        haproxy_metrics_port = get_free_port(DEFAULT_RAY_SERVE_HAPROXY_METRICS_PORT)
         os.environ["RAY_SERVE_ENABLE_HA_PROXY"] = "1"
-        os.environ["RAY_SERVE_HAPROXY_METRICS_PORT"] = str(get_free_port(DEFAULT_RAY_SERVE_HAPROXY_METRICS_PORT))
+        os.environ["RAY_SERVE_HAPROXY_METRICS_PORT"] = str(haproxy_metrics_port)
+        logger.info(f"Ray Serve HAProxy ingress enabled (metrics port {haproxy_metrics_port}).")
     else:
         logger.debug("haproxy and/or socat not found on PATH; Ray Serve will use the default Python proxy.")
     if stdouterr_capture_file:
