@@ -1,0 +1,90 @@
+# Nemotron-CC SDG benchmark using NeMo Data Designer.
+#
+# Translates step_4-sdg.py (Nemotron repo) — AsyncOpenAIClient + GenerationConfig
+# replaced with NDD's ModelProvider + ModelConfig + ChatCompletionInferenceParams,
+# and per-task SDG stages from
+#   nemo_curator.stages.synthetic.nemotron_cc.nemo_data_designer.nemotron_cc
+#
+# Backends (mirrors ndd_benchmark.py):
+#   1. ray-serve  - Curator InferenceServer (Ray Serve + vLLM) - TP + autoscaling
+#   2. dynamo     - Curator InferenceServer (Dynamo + vLLM) - static replicas, no autoscaling
+#
+# Run with the shared paths.yaml (defines model_weights_path + datasets_path):
+#   bash benchmarking/tools/run.sh \
+#     --config /raid/curator-team/nightly/paths.yaml \
+#     --config benchmarking/nemotron_cc_sdg_ndd.yaml \
+#     --entries ray_serve
+#
+#   bash benchmarking/tools/run_dynamo.sh \
+#     --config /raid/curator-team/nightly/paths.yaml \
+#     --config benchmarking/nemotron_cc_sdg_ndd.yaml \
+#     --entries dynamo
+
+datasets:
+  # Bucket-18 (highest quality) Nemotron-CC quality_labeling output.
+  # 28 parquet files; --num-files=32 silently caps to 28.
+  - name: "nemotron_cc_quality_18"
+    formats:
+    - type: "parquet"
+      path: "{datasets_path}/adattagupta/Nemotron/src/nemotron/recipes/data_curation/nemotron-cc/data/quality_labeling/bucketed_results/ensemble-max-int=18"
+
+default_timeout_s: 7200
+
+delete_scratch: false
+object_store_size: 100000000000  # 100 GB
+
+entries:
+  # ---------------------------------------------------------------------
+  # Ray Serve DP=4 (4 replicas, TP=1) — extract_knowledge, 32 files
+  # ---------------------------------------------------------------------
+  - name: nemotron_cc_sdg_ndd_extract_knowledge_ray_serve_dp4
+    enabled: true
+    script: nemotron_cc_sdg_ndd_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={dataset:nemotron_cc_quality_18,parquet}
+      --output-path={session_entry_dir}/scratch/output
+      --task=extract_knowledge
+      --inference-server-type=ray-serve
+      --model-id=Qwen/Qwen3-30B-A3B-Instruct-2507
+      --model-path={model_weights_path}/text_model_weights/hf_cache/models--Qwen--Qwen3-30B-A3B-Instruct-2507/snapshots/0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe
+      --executor=ray_data
+      --engine-kwargs='{"tensor_parallel_size": 1, "max_model_len": 16384, "gpu_memory_utilization": 0.85}'
+      --autoscaling-config='{"min_replicas": 4, "max_replicas": 4}'
+      --server-port=8000
+      --max-parallel-requests=4
+      --ndd-timeout=600
+      --num-files=32
+    timeout_s: 7200
+    ray:
+      num_cpus: 32
+      num_gpus: 4
+      enable_object_spilling: false
+
+  # ---------------------------------------------------------------------
+  # Dynamo DP=4 (4 replicas, TP=1) — extract_knowledge, 32 files.
+  # Run inside dynamo Docker container via run_dynamo.sh.
+  # ---------------------------------------------------------------------
+  - name: nemotron_cc_sdg_ndd_extract_knowledge_dynamo_dp4
+    enabled: true
+    script: nemotron_cc_sdg_ndd_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={dataset:nemotron_cc_quality_18,parquet}
+      --output-path={session_entry_dir}/scratch/output
+      --task=extract_knowledge
+      --inference-server-type=dynamo
+      --model-id=Qwen/Qwen3-30B-A3B-Instruct-2507
+      --model-path={model_weights_path}/text_model_weights/hf_cache/models--Qwen--Qwen3-30B-A3B-Instruct-2507/snapshots/0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe
+      --executor=ray_data
+      --engine-kwargs='{"tensor_parallel_size": 1, "max_model_len": 16384, "gpu_memory_utilization": 0.85}'
+      --autoscaling-config='{"min_replicas": 4, "max_replicas": 4}'
+      --server-port=8001
+      --max-parallel-requests=4
+      --ndd-timeout=600
+      --num-files=32
+    timeout_s: 7200
+    ray:
+      num_cpus: 32
+      num_gpus: 4
+      enable_object_spilling: false
