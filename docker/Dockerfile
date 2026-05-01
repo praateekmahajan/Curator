@@ -91,6 +91,14 @@ COPY nemo_curator/__init__.py nemo_curator/package_info.py /opt/Curator/nemo_cur
 
 # Install Curator
 # Cap ninja parallelism for flash-attn's NVCC build at min(nproc, 16); default of nproc OOMs at ~2 GB/job.
+#
+# Folded into one RUN so the optional Dynamo actor venv (built below when
+# ai-dynamo is in the install set) lands on the same overlay layer as
+# /opt/venv. Both venvs install the same cu129 nvidia-* wheels (cuBLAS,
+# cuDNN, NCCL, cuSPARSE, cuSOLVER, …) plus same-version pure-Python wheels;
+# a final hardlink pass collapses ~5 GB of identical content. Cross-layer
+# hardlinks are blocked by overlayfs, so splitting this into a second RUN
+# would forfeit the saving.
 RUN export MAX_JOBS=$(( $(nproc) > 16 ? 16 : $(nproc) )) && \
     if [ -n "${CURATOR_EXTRA}" ]; then \
         uv sync --link-mode copy --locked --extra ${CURATOR_EXTRA} ${CURATOR_GROUPS} --no-cache; \
@@ -104,6 +112,27 @@ RUN export MAX_JOBS=$(( $(nproc) > 16 ? 16 : $(nproc) )) && \
     find /opt/venv -name "ray_dist.jar" -delete && \
     if find /opt/venv -name "ray_dist.jar" | grep -q .; then \
         echo "ERROR: GHSA-72hv-8253-57qq not fixed — ray_dist.jar still present after deletion" && exit 1; \
+    fi && \
+    # Prebuild the Dynamo actor venv when ai-dynamo is in the install set.
+    # ai-dynamo[vllm] pulls vllm 0.16 → torch==2.9.1, which conflicts with
+    # Curator's main torch 2.10 — two venvs are unavoidable. Without this
+    # prebuild every Dynamo cold-start pays a ~12 min flash-attn rebuild.
+    # Resolution must run from outside the project (cu129 [tool.uv.sources]
+    # would otherwise override vllm 0.16's torch pin); the venv must be
+    # source-activated so flash-attn's PEP 517 build picks the right python.
+    if /opt/venv/bin/python -c "import importlib.metadata as m; m.distribution('ai-dynamo')" >/dev/null 2>&1; then \
+        uv venv /opt/dynamo_vllm_venv --python /opt/venv/bin/python && \
+        ( cd /tmp && \
+          . /opt/dynamo_vllm_venv/bin/activate && \
+          uv pip install \
+              --python /opt/dynamo_vllm_venv/bin/python \
+              --no-cache \
+              --torch-backend=cu129 \
+              --reinstall-package flash-attn \
+              --no-build-isolation-package flash-attn \
+              "ai-dynamo[vllm]==1.0.2" \
+              "flash-attn" ) && \
+        hardlink --maximize /opt/venv /opt/dynamo_vllm_venv; \
     fi
 
 # Patch wandb-core: bump google.golang.org/grpc from 1.79.2 to 1.79.3 (CVE fix)

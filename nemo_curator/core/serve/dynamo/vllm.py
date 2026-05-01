@@ -17,7 +17,10 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from functools import reduce
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
@@ -54,13 +57,20 @@ if TYPE_CHECKING:
 # ``config.setup_timeout_seconds`` overrides Ray's 600s default — the
 # flash-attn from-source rebuild alone runs ~15 min, so the install would
 # otherwise be cancelled with ``RuntimeEnvSetupError`` before completing.
-DYNAMO_VLLM_RUNTIME_ENV: dict[str, Any] = {
+_DYNAMO_VLLM_RUNTIME_ENV_UV: dict[str, Any] = {
     "uv": {
         "packages": [
-            "ai-dynamo[vllm]",
+            # Pin matches [inference_server] in pyproject.toml so the actor
+            # venv resolves to the same release the project tests against.
+            "ai-dynamo[vllm]==1.0.2",
             "flash-attn",
         ],
         "uv_pip_install_options": [
+            # Route torch resolution through the cu* index that matches the
+            # host's nvidia driver. Without this, uv defaults to PyPI's torch
+            # 2.9.1 wheel (cu128) regardless of what the host actually runs;
+            # cu129 hosts then rely on cu128→cu129 forward-compat needlessly.
+            "--torch-backend=auto",
             "--reinstall-package",
             "flash-attn",
             "--no-build-isolation-package",
@@ -69,6 +79,26 @@ DYNAMO_VLLM_RUNTIME_ENV: dict[str, Any] = {
     },
     "config": {"setup_timeout_seconds": 1800},
 }
+
+# When a prebuilt actor venv exists on the node (baked into a Curator image,
+# or set up out-of-band), point the actor's PYTHONPATH at it instead of doing
+# the ~12 min runtime install. The prebuilt venv must contain the same
+# closure as the uv form: ai-dynamo[vllm] + flash-attn (rebuilt) +
+# nemo_curator (the actor imports nemo_curator.* during cloudpickle
+# deserialization). Path is overridable via DYNAMO_RUNTIME_VENV.
+_DEFAULT_DYNAMO_RUNTIME_VENV = "/opt/dynamo_vllm_venv"
+
+
+def _prebuilt_runtime_env() -> dict[str, Any] | None:
+    venv = os.environ.get("DYNAMO_RUNTIME_VENV", _DEFAULT_DYNAMO_RUNTIME_VENV)
+    site_packages = Path(venv) / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    if not site_packages.is_dir():
+        return None
+    logger.info(f"Using prebuilt Dynamo runtime venv at {venv} (PYTHONPATH={site_packages})")
+    return {"env_vars": {"PYTHONPATH": str(site_packages)}}
+
+
+DYNAMO_VLLM_RUNTIME_ENV: dict[str, Any] = _prebuilt_runtime_env() or _DYNAMO_VLLM_RUNTIME_ENV_UV
 
 # Default KV-cache transfer configuration for disagg — NixlConnector is the
 # production path; ``kv_both`` makes each worker both send and receive KV
