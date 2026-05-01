@@ -22,19 +22,41 @@ user's ``env_vars``, ``pip``, ``uv``, or ``working_dir``.
 
 from __future__ import annotations
 
+import sys
+from typing import TYPE_CHECKING
+
+import pytest
+
 from nemo_curator.core.serve import DynamoVLLMModelConfig
+from nemo_curator.core.serve.dynamo import vllm as _vllm_module
 from nemo_curator.core.serve.dynamo.vllm import (
-    DYNAMO_VLLM_RUNTIME_ENV,
+    _DEFAULT_DYNAMO_RUNTIME_VENV,
+    _DYNAMO_VLLM_RUNTIME_ENV_UV,
+    _prebuilt_runtime_env,
     dynamo_runtime_env,
     merge_model_runtime_envs,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from _pytest.monkeypatch import MonkeyPatch
+
+
+@pytest.fixture(autouse=True)
+def _force_uv_runtime_env(monkeypatch: MonkeyPatch) -> None:
+    # Pin ``DYNAMO_VLLM_RUNTIME_ENV`` to the uv form so the merge tests run
+    # the same on CI (no prebuilt venv) and dev hosts where
+    # ``/opt/dynamo_vllm_venv`` exists and would otherwise flip the module
+    # constant to the PYTHONPATH form.
+    monkeypatch.setattr(_vllm_module, "DYNAMO_VLLM_RUNTIME_ENV", _DYNAMO_VLLM_RUNTIME_ENV_UV)
 
 
 class TestDynamoRuntimeEnv:
     def test_default_runtime_env_only(self) -> None:
         mc = DynamoVLLMModelConfig(model_identifier="Qwen/Qwen3-0.6B")
         env = dynamo_runtime_env(mc)
-        assert env == DYNAMO_VLLM_RUNTIME_ENV
+        assert env == _DYNAMO_VLLM_RUNTIME_ENV_UV
 
     def test_user_runtime_env_merges_uv_packages(self) -> None:
         mc = DynamoVLLMModelConfig(
@@ -42,11 +64,11 @@ class TestDynamoRuntimeEnv:
             runtime_env={"uv": ["mypkg==1.0"]},
         )
         env = dynamo_runtime_env(mc)
-        # Dict-form ``DYNAMO_VLLM_RUNTIME_ENV["uv"]`` + list-form override:
-        # override packages append; base ``uv_pip_install_options`` survive.
-        expected_packages = [*DYNAMO_VLLM_RUNTIME_ENV["uv"]["packages"], "mypkg==1.0"]
+        # Dict-form uv block + list-form override: override packages append;
+        # base ``uv_pip_install_options`` survive.
+        expected_packages = [*_DYNAMO_VLLM_RUNTIME_ENV_UV["uv"]["packages"], "mypkg==1.0"]
         assert env["uv"]["packages"] == expected_packages
-        assert env["uv"]["uv_pip_install_options"] == DYNAMO_VLLM_RUNTIME_ENV["uv"]["uv_pip_install_options"]
+        assert env["uv"]["uv_pip_install_options"] == _DYNAMO_VLLM_RUNTIME_ENV_UV["uv"]["uv_pip_install_options"]
 
     def test_user_env_vars_are_preserved(self) -> None:
         mc = DynamoVLLMModelConfig(
@@ -55,7 +77,7 @@ class TestDynamoRuntimeEnv:
         )
         env = dynamo_runtime_env(mc)
         # No ``uv`` override → base ``uv`` block is preserved verbatim.
-        assert env["uv"] == DYNAMO_VLLM_RUNTIME_ENV["uv"]
+        assert env["uv"] == _DYNAMO_VLLM_RUNTIME_ENV_UV["uv"]
         assert env["env_vars"] == {"HF_TOKEN": "abc", "TRANSFORMERS_OFFLINE": "1"}
 
     def test_working_dir_is_passed_through(self) -> None:
@@ -88,10 +110,51 @@ class TestDynamoRuntimeEnv:
         assert "--no-build-isolation-package" in opts
         assert opts[opts.index("--no-build-isolation-package") + 1] == "flash-attn"
 
+    def test_default_carries_torch_backend_auto(self) -> None:
+        # Without this, uv defaults to PyPI's torch 2.9.1 build (cu128)
+        # regardless of the host's nvidia driver. cu129 hosts then run via
+        # cu128→cu129 forward-compat — works but is gratuitous.
+        opts = _DYNAMO_VLLM_RUNTIME_ENV_UV["uv"]["uv_pip_install_options"]
+        assert "--torch-backend=auto" in opts
+
+    def test_ai_dynamo_pin_matches_inference_server_extra(self) -> None:
+        # ``[inference_server]`` in pyproject.toml pins ``ai-dynamo==1.0.2``;
+        # the actor venv must match so docker-prebuild and bare-metal
+        # runtime_env paths converge on the same release.
+        packages = _DYNAMO_VLLM_RUNTIME_ENV_UV["uv"]["packages"]
+        assert "ai-dynamo[vllm]==1.0.2" in packages
+        assert "ai-dynamo[vllm]" not in packages, "Unpinned ai-dynamo[vllm] would float to whatever PyPI publishes"
+
+    def test_prebuilt_runtime_env_default_path(self) -> None:
+        # Documented contract with docker/Dockerfile's prebuild step.
+        assert _DEFAULT_DYNAMO_RUNTIME_VENV == "/opt/dynamo_vllm_venv"
+
+    def test_prebuilt_runtime_env_none_when_path_missing(self, tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+        monkeypatch.setenv("DYNAMO_RUNTIME_VENV", str(tmp_path / "does_not_exist"))
+        assert _prebuilt_runtime_env() is None
+
+    def test_prebuilt_runtime_env_returns_pythonpath_when_venv_exists(
+        self, tmp_path: Path, monkeypatch: MonkeyPatch
+    ) -> None:
+        # Mimic the layout produced by ``uv venv``: lib/python<X.Y>/site-packages.
+        site = tmp_path / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+        site.mkdir(parents=True)
+        monkeypatch.setenv("DYNAMO_RUNTIME_VENV", str(tmp_path))
+        env = _prebuilt_runtime_env()
+        assert env == {"env_vars": {"PYTHONPATH": str(site)}}
+
+    def test_prebuilt_runtime_env_none_when_site_packages_missing(
+        self, tmp_path: Path, monkeypatch: MonkeyPatch
+    ) -> None:
+        # An empty directory without the venv layout shouldn't be treated as
+        # a usable prebuilt — actors would crash on import.
+        monkeypatch.setenv("DYNAMO_RUNTIME_VENV", str(tmp_path))
+        assert _prebuilt_runtime_env() is None
+
 
 class TestMergeModelRuntimeEnvs:
     def test_no_models_yields_default_env(self) -> None:
-        assert merge_model_runtime_envs([]) == DYNAMO_VLLM_RUNTIME_ENV
+        assert merge_model_runtime_envs([]) == _DYNAMO_VLLM_RUNTIME_ENV_UV
 
     def test_merges_env_vars_across_models(self) -> None:
         models = [
@@ -106,7 +169,7 @@ class TestMergeModelRuntimeEnvs:
         ]
         env = merge_model_runtime_envs(models)
         assert env["env_vars"] == {"A": "1", "B": "2"}
-        expected_packages = [*DYNAMO_VLLM_RUNTIME_ENV["uv"]["packages"], "userpkg"]
+        expected_packages = [*_DYNAMO_VLLM_RUNTIME_ENV_UV["uv"]["packages"], "userpkg"]
         assert env["uv"]["packages"] == expected_packages
 
     def test_later_model_env_var_overrides_earlier(self) -> None:
@@ -150,7 +213,7 @@ class TestMergeModelRuntimeEnvs:
             ),
         ]
         env = merge_model_runtime_envs(models)
-        expected_packages = [*DYNAMO_VLLM_RUNTIME_ENV["uv"]["packages"], "userpkg"]
-        expected_options = [*DYNAMO_VLLM_RUNTIME_ENV["uv"]["uv_pip_install_options"], "--prefer-binary"]
+        expected_packages = [*_DYNAMO_VLLM_RUNTIME_ENV_UV["uv"]["packages"], "userpkg"]
+        expected_options = [*_DYNAMO_VLLM_RUNTIME_ENV_UV["uv"]["uv_pip_install_options"], "--prefer-binary"]
         assert env["uv"]["packages"] == expected_packages
         assert env["uv"]["uv_pip_install_options"] == expected_options
