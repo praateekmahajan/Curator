@@ -50,6 +50,10 @@ if TYPE_CHECKING:
 # wheel has a torch-version-specific ABI and ai-dynamo[vllm] often pulls a
 # torch different from the base image's, so the prebuilt wheel's
 # ``c10::cuda::c10_cuda_check_implementation`` symbol misses at import.
+#
+# ``config.setup_timeout_seconds`` overrides Ray's 600s default — the
+# flash-attn from-source rebuild alone runs ~15 min, so the install would
+# otherwise be cancelled with ``RuntimeEnvSetupError`` before completing.
 DYNAMO_VLLM_RUNTIME_ENV: dict[str, Any] = {
     "uv": {
         "packages": [
@@ -62,7 +66,8 @@ DYNAMO_VLLM_RUNTIME_ENV: dict[str, Any] = {
             "--no-build-isolation-package",
             "flash-attn",
         ],
-    }
+    },
+    "config": {"setup_timeout_seconds": 1800},
 }
 
 # Default KV-cache transfer configuration for disagg — NixlConnector is the
