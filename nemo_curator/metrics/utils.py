@@ -124,10 +124,16 @@ def run_prometheus(prometheus_dir: str, prometheus_web_port: int, metrics_dir: s
     with open(prometheus_config_path, "w") as f:
         f.write(PROMETHEUS_YAML_TEMPLATE)
 
+    # Pin the TSDB path under metrics_dir so concurrent containers (e.g. parallel
+    # benchmark runs sharing /opt/Curator via --use-host-curator) don't collide on
+    # Prometheus's default ./data/ lock file.
+    prometheus_data_path = os.path.join(metrics_dir, "prometheus_data")
+    os.makedirs(prometheus_data_path, exist_ok=True)
     prometheus_cmd = [
         f"{prometheus_dir}/prometheus",
         "--config.file",
         str(prometheus_config_path),
+        f"--storage.tsdb.path={prometheus_data_path}",
         "--web.enable-lifecycle",
         f"--web.listen-address=:{prometheus_web_port}",
     ]
