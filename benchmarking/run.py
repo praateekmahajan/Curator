@@ -148,12 +148,13 @@ def check_requirements_update_results(result_data: dict[str, Any], requirements:
     return meets_requirements
 
 
-def run_entry(
+def run_entry(  # noqa: PLR0913
     entry: Entry,
     path_resolver: PathResolver,
     dataset_resolver: DatasetResolver,
     session_entry_path: Path,
     result_data: dict[str, Any],
+    metrics_dir: str | None = None,
 ) -> bool:
     # session_entry_path : This is the directory where benchmark results are stored
     # scratch_path : This is the directory provided to users for saving scratch/temp data; it'll be cleaned up after the entry is done if delete_scratch is True
@@ -183,6 +184,7 @@ def run_entry(
             enable_object_spilling=ray_enable_object_spilling,
             ray_log_path=logs_path / "ray.log",
             object_store_size=None if entry.object_store_size == "default" else entry.object_store_size,
+            metrics_dir=metrics_dir,
         )
 
         # Prepopulate <session_entry_path>/params.json with entry params.
@@ -270,7 +272,7 @@ def run_entry(
             shutil.rmtree(scratch_path, ignore_errors=True)
 
 
-def main() -> int:  # noqa: C901
+def main() -> int:  # noqa: C901, PLR0915
     parser = argparse.ArgumentParser(description="Runs the benchmarking application")
     parser.add_argument(
         "--config",
@@ -333,6 +335,18 @@ def main() -> int:  # noqa: C901
     logger.info(f"Started session {session_name}...")
     env_dict = dump_env(session_obj=session, output_path=session_path)
 
+    # TEMPORARY: bring up Prometheus + Grafana so RayClient can hook them in.
+    # Failure here must not abort the benchmark — just log and continue without metrics.
+    from nemo_curator.metrics.constants import DEFAULT_NEMO_CURATOR_METRICS_PATH
+    from nemo_curator.metrics.start_prometheus_grafana import start_prometheus_grafana
+
+    metrics_dir: str | None = DEFAULT_NEMO_CURATOR_METRICS_PATH
+    try:
+        start_prometheus_grafana(metrics_dir=metrics_dir)
+    except Exception as e:
+        logger.warning(f"start_prometheus_grafana failed; continuing without metrics: {e}")
+        metrics_dir = None
+
     for sink in session.sinks:
         sink.initialize(session_name=session_name, session=session, env_dict=env_dict)
 
@@ -369,6 +383,7 @@ def main() -> int:  # noqa: C901
                 dataset_resolver=session.dataset_resolver,
                 session_entry_path=session_entry_path,
                 result_data=result_data,
+                metrics_dir=metrics_dir,
             )
 
         except Exception as e:

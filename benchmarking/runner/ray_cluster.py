@@ -51,6 +51,7 @@ def setup_ray_cluster_and_env(  # noqa: PLR0913
     ray_log_path: Path,
     object_store_size: int | None = None,
     include_dashboard: bool = True,
+    metrics_dir: str | None = None,
 ) -> tuple[RayClient, Path]:
     """Setup a Ray cluster and set the RAY_ADDRESS environment variable and return the Ray client and temp dir."""
     # Create a short temp dir to avoid Unix socket path length limits
@@ -90,6 +91,7 @@ def setup_ray_cluster_and_env(  # noqa: PLR0913
             ray_dashboard_host="0.0.0.0",  # noqa: S104
             ray_stdouterr_capture_file=ray_stdouterr_capture_file,
             object_store_memory=object_store_size,
+            metrics_dir=metrics_dir,
         )
 
         try:
