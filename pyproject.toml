@@ -69,32 +69,31 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cuda12 = [
+cuda13 = [
     "gpustat",
     "nvidia-ml-py",
 ]
-vllm = ["vllm>=0.14.1; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
+vllm = ["vllm>=0.20; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
 
 # Inference Server (Ray Serve + vLLM) - for serving LLMs alongside Curator pipelines
 inference_server = [
-    "nemo_curator[cuda12]",
+    "nemo_curator[cuda13]",
     "nemo_curator[vllm]",
-    "vllm<0.19; (platform_machine == 'x86_64' and platform_system != 'Darwin')", # Ray Serve LLM 2.55.1 isn't compatible with vllm 0.19+
-    "ai-dynamo==1.1.0; (platform_machine == 'x86_64' and platform_system != 'Darwin')", # pin so the Dynamo actor venv resolves to the same release we test against; gated to x86_64 since vllm wheels are x86_64-only
+    "ai-dynamo>=1.1.0; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "boto3>=1.35", # Get rid once https://github.com/ray-project/ray/issues/61269 is fixed
-    "nixl-cu12>=0.10.0; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+    "nixl-cu13>=1.0; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "ray[serve,llm]>=2.55.1",
 ]
 
 # Installs CPU + GPU text curation modules
-deduplication_cuda12 = [
-    "cudf-cu12==25.10.*",
-    "cuml-cu12==25.10.*",
-    "scikit-learn<1.8.0",  # cuml 25.10.0 is incompatible with scikit-learn 1.8.0
-    "pylibcugraph-cu12==25.10.*",
-    "pylibraft-cu12==25.10.*",
-    "raft-dask-cu12==25.10.*",
-    "rapidsmpf-cu12==25.10.*",
+deduplication_cuda13 = [
+    "cudf-cu13>=26.4,<26.5",
+    "cuml-cu13>=26.4,<26.5",
+    "scikit-learn>=1.5",  # cuml 26.04 requires >=1.5
+    "pylibcugraph-cu13>=26.4,<26.5",
+    "pylibraft-cu13>=26.4,<26.5",
+    "raft-dask-cu13>=26.4,<26.5",
+    "rapidsmpf-cu13>=26.4,<26.5",
 ]
 
 audio_common = [
@@ -117,11 +116,11 @@ audio_cpu = [
     "onnxruntime>=1.20.1,<1.24",
 ]
 
-audio_cuda12 = [
-    "cuda-python>=12.3",
+audio_cuda13 = [
+    "cuda-python>=13.0",
     "nemo_curator[audio_common]",
-    "nemo_curator[cuda12]",
-    "nvidia-cudnn-cu12",
+    "nemo_curator[cuda13]",
+    "nvidia-cudnn-cu13",
     "onnxruntime-gpu>=1.20.1,<1.24; platform_machine == 'x86_64'",
     "torchcodec; platform_machine == 'x86_64' and platform_system != 'Darwin'",
 ]
@@ -132,11 +131,11 @@ image_cpu = [
 ]
 
 # NVIDIA DALI (simplified; update the package to match your CUDA version if needed)
-image_cuda12 = [
+image_cuda13 = [
     "nemo_curator[image_cpu]",
-    "nemo_curator[cuda12]",
-    "nemo_curator[deduplication_cuda12]",
-    "nvidia-dali-cuda120",
+    "nemo_curator[cuda13]",
+    "nemo_curator[deduplication_cuda13]",
+    "nvidia-dali-cuda130",
 ]
 
 # Translation Dependencies
@@ -201,9 +200,9 @@ text_cpu = [
     "sentence-transformers",
 ]
 
-text_cuda12 = [
-    "nemo_curator[cuda12]",
-    "nemo_curator[deduplication_cuda12]",
+text_cuda13 = [
+    "nemo_curator[cuda13]",
+    "nemo_curator[deduplication_cuda13]",
     "nemo_curator[text_cpu]",
     "nemo_curator[vllm]",
 ]
@@ -217,15 +216,14 @@ video_cpu = [
     "easydict",
 ]
 
-video_cuda12 = [
+video_cuda13 = [
     "nemo_curator[video_cpu]",
-    "nemo_curator[cuda12]",
+    "nemo_curator[cuda13]",
     "nemo_curator[vllm]",
-    "cvcuda_cu12",
-    "flash-attn<=2.8.3; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+    "cvcuda_cu13>=0.16.0",
+    "flash-attn; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "pycuda",
-    "PyNvVideoCodec==2.0.2; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
-    "torch<=2.10.0",
+    "PyNvVideoCodec>=2.0.2; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "torchaudio",
 ]
 
@@ -235,11 +233,11 @@ math_cpu = [
     "boto3>=1.35",  # S3 range requests for Common Crawl WARC fetching
 ]
 
-math_cuda12 = [
+math_cuda13 = [
     "nemo_curator[math_cpu]",
-    "nemo_curator[cuda12]",
-    "nemo_curator[deduplication_cuda12]",
-    "vllm>=0.13; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+    "nemo_curator[cuda13]",
+    "nemo_curator[deduplication_cuda13]",
+    "vllm>=0.20; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
 ]
 
 # Multimodal / Interleaved Dependencies
@@ -254,9 +252,9 @@ interleaved_cpu = [
     "timm",
 ]
 
-interleaved_cuda12 = [
+interleaved_cuda13 = [
     "nemo_curator[interleaved_cpu]",
-    "nemo_curator[cuda12]",
+    "nemo_curator[cuda13]",
     "nemo_curator[vllm]",
 ]
 
@@ -265,27 +263,27 @@ sdg_cpu = [
     "data-designer==0.5.5",
 ]
 
-sdg_cuda12 = [
-    "nemo_curator[cuda12]",
+sdg_cuda13 = [
+    "nemo_curator[cuda13]",
     "nemo_curator[sdg_cpu]",
     "nemo_curator[inference_server]",
 ]
 
 # All dependencies
 all = [
-    "nemo_curator[audio_cuda12]",
-    "nemo_curator[image_cuda12]",
+    "nemo_curator[audio_cuda13]",
+    "nemo_curator[image_cuda13]",
     "nemo_curator[inference_server]",
-    "nemo_curator[interleaved_cuda12]",
-    "nemo_curator[math_cuda12]",
-    "nemo_curator[sdg_cuda12]",
-    "nemo_curator[text_cuda12]",
+    "nemo_curator[interleaved_cuda13]",
+    "nemo_curator[math_cuda13]",
+    "nemo_curator[sdg_cuda13]",
+    "nemo_curator[text_cuda13]",
     "nemo_curator[translation_all]",
-    "nemo_curator[video_cuda12]",
+    "nemo_curator[video_cuda13]",
 ]
 
 [dependency-groups]
-build = ["setuptools", "torch<=2.10.0", "Cython", "packaging"]
+build = ["setuptools", "torch", "Cython", "packaging"]
 dev = ["jupyter"]
 linting = ["pre-commit", "ruff==0.14.10"]
 test = [
@@ -325,24 +323,31 @@ constraint-dependencies = [
     "starlette>=0.49.1", # Address CVE GHSA-7f5h-v6xp-fcq8
     "urllib3>=2.6.3", # Address CVE GHSA-38jv-5279-wg99
     "wheel>=0.46.2", # Address CVE GHSA-8rrh-rw8j-w5fx
-    "transformers>=4.56.0,<5.0", # tranfomers>5 breaks with hf_hub<1.0 added in override
 ]
 override-dependencies = [
     "fsspec>=2025.3.0", # required for nemo-toolkit[asr]==2.7.2 (fsspec==2024.12.0), override due to data-designer-engine==0.5.5 requires >=2025.3.0
     "apex; sys_platform == 'never'",
     "distance; sys_platform == 'never'",
-    "huggingface-hub>=0.34,<1.0", # Override huggingface-hub, transformers and data-designer require two different versions of hugging-face hub
     "kaldiio;  sys_platform == 'never'",
     "levenshtein;  sys_platform == 'never'",
     "numpy>=2.0.0,<=2.2.0", # Override nemo-toolkits constraint of <2.0.0, upperbounds for Numba compatibility
     "protobuf>=5.29.5,<7.0",  # Override nemo-toolkits constraint of ~=5.29.5; <7.0 due to ray serve FieldDescriptor API breakage
     "setuptools>=80.10.1", # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
-    "torch==2.10.0", # Override whisperx's <2.9 cap to match cu129 / vllm 0.18.x
-    "torchaudio==2.10.0", # Override whisperx's <2.9 cap to match cu129 / vllm 0.18.x
-    "torchvision==0.25.0", # Match torch==2.10.0
-    "torchcodec~=0.10.0; platform_machine == 'x86_64' and platform_system != 'Darwin'", # pin to torchcodec 0.10.x for torch 2.10 ABI compatibility — torchcodec doesn't declare a torch dep, so the resolver can't enforce the match; satisfies pyannote-audio's >=0.7.0 floor; x86_64-only since aarch64 lacks wheels
-    "nixl-cu12>=0.10.0; (platform_machine == 'x86_64' and platform_system != 'Darwin')",  # Override ray[llm]'s unconditional nixl dep for ARM
+    "nixl-cu13>=1.0; (platform_machine == 'x86_64' and platform_system != 'Darwin')",  # Override ray[llm]'s unconditional nixl dep for ARM
     "xgrammar>=0.1.32", # Override vllm's ==0.1.29 pin to address CVE GHSA-7rgv-gqhr-fxg3 (DoS via multi-layer nesting)
+    # cu13 path: cudf/cuml/rmm cap numba<0.65 in dependencies.yaml; vllm 0.20 pins ==0.65.
+    # Empirically both stacks import fine at numba 0.65.1 — RAPIDS-team feedback in flight.
+    "numba>=0.65,<1",
+    # nemo-toolkit pins transformers<4.58 (which transitively caps hf-hub<1.0); data-designer 0.5.5
+    # and vllm 0.20 both want transformers 5.x + hf-hub 1.x. Force the modern stack.
+    "transformers>=5.0,<6",
+    "huggingface-hub>=1.0,<2",
+    # whisperx 3.8.5 (latest) caps torch<2.9 / torchaudio<2.9; vllm 0.20 needs torch 2.11.
+    # Force the modern torch — whisperx uses standard torch APIs that haven't changed,
+    # so empirically it imports fine, but runtime VAD path needs verification.
+    "torch>=2.11,<2.12",
+    "torchaudio>=2.11,<2.12",
+    "torchvision>=0.26,<0.27",
 ]
 
 
@@ -357,7 +362,7 @@ explicit = true
 
 [[tool.uv.index]]
 name = "pytorch"
-url = "https://download.pytorch.org/whl/cu129"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
@@ -378,7 +383,7 @@ torchcodec = [
     { index = "pypi", marker = "platform_machine != 'x86_64' or sys_platform == 'darwin'" },
 ]
 nixl = { index = "pypi" }
-nixl-cu12 = { index = "pypi" }
+nixl-cu13 = { index = "pypi" }
 
 [tool.coverage.paths]
 source = ["nemo_curator", "/opt/Curator/nemo_curator", "/home/runner/work/Curator/Curator/nemo_curator"]
