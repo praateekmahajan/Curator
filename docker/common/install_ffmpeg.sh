@@ -71,7 +71,7 @@ PATH="/usr/local/cuda/bin:$PATH" ./configure \
     --prefix=/usr/local \
     --enable-nonfree \
     --enable-cuda-nvcc \
-    --enable-libnpp \
+    --nvccflags="-gencode arch=compute_75,code=sm_75 -gencode arch=compute_75,code=compute_75 -O2" \
     --enable-libopenh264 \
     --enable-libaom \
     --enable-libdav1d \

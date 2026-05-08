@@ -103,7 +103,7 @@ class TestGetFramesFromFfmpeg:
             "-i",
             self.video_file.as_posix(),
             "-vf",
-            f"scale_npp={self.width}:{self.height},hwdownload,format=nv12",
+            f"scale_cuda={self.width}:{self.height},hwdownload,format=nv12",
             "-f",
             "rawvideo",
             "-pix_fmt",

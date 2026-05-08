@@ -51,7 +51,7 @@ def get_frames_from_ffmpeg(
             "-i",
             video_file.as_posix(),
             "-vf",
-            f"scale_npp={width}:{height},hwdownload,format=nv12",
+            f"scale_cuda={width}:{height},hwdownload,format=nv12",
             "-f",
             "rawvideo",
             "-pix_fmt",
