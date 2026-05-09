@@ -1,0 +1,60 @@
+{
+  "data_designer": {
+    "columns": [
+      {
+        "name": "physician_notes",
+        "drop": false,
+        "column_type": "llm-text",
+        "prompt": "You are a primary-care physician. A patient reports the following symptoms:\n\n{{ patient_summary }}\n\nThe working diagnosis is: {{ diagnosis }}.\n\nWrite concise visit notes with assessment and plan. Respond only with the notes.",
+        "model_alias": "note_writer",
+        "system_prompt": null,
+        "multi_modal_context": null
+      },
+      {
+        "name": "patient_explanation",
+        "drop": false,
+        "column_type": "llm-text",
+        "prompt": "Convert the physician notes below into a short, plain-language explanation for the patient. Do not add medical facts not present in the note.\n\n<physician_notes>\n{{ physician_notes }}\n</physician_notes>",
+        "model_alias": "patient_explainer",
+        "system_prompt": null,
+        "multi_modal_context": null
+      }
+    ],
+    "model_configs": [
+      {
+        "alias": "note_writer",
+        "model": "Qwen/Qwen2.5-0.5B-Instruct",
+        "inference_parameters": {
+          "generation_type": "chat-completion",
+          "max_parallel_requests": 32,
+          "timeout": null,
+          "extra_body": null,
+          "temperature": 0.2,
+          "top_p": 0.9,
+          "max_tokens": 512
+        },
+        "provider": null,
+        "skip_health_check": true
+      },
+      {
+        "alias": "patient_explainer",
+        "model": "Qwen/Qwen3-0.6B",
+        "inference_parameters": {
+          "generation_type": "chat-completion",
+          "max_parallel_requests": 32,
+          "timeout": null,
+          "extra_body": null,
+          "temperature": 0.2,
+          "top_p": 0.9,
+          "max_tokens": 512
+        },
+        "provider": null,
+        "skip_health_check": true
+      }
+    ],
+    "seed_config": null,
+    "constraints": null,
+    "profilers": null,
+    "processors": null
+  }
+}

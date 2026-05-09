@@ -1,0 +1,18 @@
+[
+  {
+    "model": "openai/gpt-oss-20b",
+    "served_model_name": "openai/gpt-oss-20b",
+    "tp": 1,
+    "replicas": "auto",
+    "alias": "summarizer",
+    "max_model_len": 4096
+  },
+  {
+    "model": "openai/gpt-oss-120b",
+    "served_model_name": "openai/gpt-oss-120b",
+    "tp": 2,
+    "replicas": "auto",
+    "alias": "critic",
+    "max_model_len": 4096
+  }
+]

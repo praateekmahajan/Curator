@@ -1,0 +1,82 @@
+{
+  "data_designer": {
+    "columns": [
+      {
+        "name": "number_of_sentences",
+        "drop": false,
+        "column_type": "sampler",
+        "sampler_type": "category",
+        "params": {
+          "values": [
+            1,
+            2,
+            3,
+            5
+          ],
+          "weights": null,
+          "sampler_type": "category"
+        },
+        "conditional_params": {},
+        "convert_to": null
+      },
+      {
+        "name": "summary",
+        "drop": false,
+        "column_type": "llm-text",
+        "prompt": "Write a summary of the following text in {{ number_of_sentences }} sentences for the Wikipedia article below.\n\n# {{ wikipedia_article_title }}\n\n{{ wikipedia_article_content }}",
+        "model_alias": "summarizer",
+        "system_prompt": null,
+        "multi_modal_context": null
+      },
+      {
+        "name": "critique",
+        "drop": false,
+        "column_type": "llm-text",
+        "prompt": "Given the summary below, write a concise critique of what the summary misses or could make clearer.\n\n<summary>\n{{ summary }}\n</summary>\n\n# {{ wikipedia_article_title }}\n\n{{ wikipedia_article_content }}",
+        "model_alias": "critic",
+        "system_prompt": null,
+        "multi_modal_context": null
+      }
+    ],
+    "model_configs": [
+      {
+        "alias": "summarizer",
+        "model": "openai/gpt-oss-20b",
+        "inference_parameters": {
+          "generation_type": "chat-completion",
+          "max_parallel_requests": 64,
+          "timeout": null,
+          "extra_body": {
+            "reasoning_effort": "low"
+          },
+          "temperature": null,
+          "top_p": null,
+          "max_tokens": 1024
+        },
+        "provider": null,
+        "skip_health_check": true
+      },
+      {
+        "alias": "critic",
+        "model": "openai/gpt-oss-120b",
+        "inference_parameters": {
+          "generation_type": "chat-completion",
+          "max_parallel_requests": 64,
+          "timeout": null,
+          "extra_body": {
+            "reasoning_effort": "low"
+          },
+          "temperature": null,
+          "top_p": null,
+          "max_tokens": 1024
+        },
+        "provider": null,
+        "skip_health_check": true
+      }
+    ],
+    "seed_config": null,
+    "constraints": null,
+    "profilers": null,
+    "processors": null
+  }
+}

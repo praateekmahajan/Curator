@@ -1,0 +1,24 @@
+[
+  {
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "served_model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+    "tp": 1,
+    "replicas": "auto",
+    "aliases": [
+      "note_writer",
+      "summarizer"
+    ],
+    "max_model_len": 2048
+  },
+  {
+    "model": "Qwen/Qwen3-0.6B",
+    "served_model_name": "Qwen/Qwen3-0.6B",
+    "tp": 1,
+    "replicas": "auto",
+    "aliases": [
+      "patient_explainer",
+      "critic"
+    ],
+    "max_model_len": 2048
+  }
+]

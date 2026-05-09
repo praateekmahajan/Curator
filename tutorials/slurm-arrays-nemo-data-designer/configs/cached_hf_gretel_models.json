@@ -1,0 +1,18 @@
+[
+  {
+    "model": "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/praateekm/tools_cache/hf_cache/hub/models--Qwen--Qwen3-30B-A3B-Instruct-2507/snapshots/0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe",
+    "served_model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+    "tp": 2,
+    "replicas": "auto",
+    "alias": "note_writer",
+    "max_model_len": 2048
+  },
+  {
+    "model": "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/praateekm/tools_cache/hf_cache/hub/models--openai--gpt-oss-120b/snapshots/b5c939de8f754692c1647ca79fbf85e8c1e70f8a",
+    "served_model_name": "openai/gpt-oss-120b",
+    "tp": 2,
+    "replicas": "auto",
+    "alias": "patient_explainer",
+    "max_model_len": 2048
+  }
+]
