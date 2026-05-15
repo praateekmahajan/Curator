@@ -1,157 +1,151 @@
-# SLURM Arrays For NeMo Data Designer
+# SLURM Arrays For NeMo Data Designer (advanced reference)
 
-This tutorial-local prototype runs a seeded NeMo Data Designer pipeline as a
-SLURM array. Each array element owns one deterministic shard of the input files,
-can reserve multiple nodes, starts one or more model endpoints through Curator's
-`InferenceServer`, and writes an independent completion marker for retry.
+> **Just want a quickstart?** See `tutorials/slurm-datadesigner/` — single
+> model, JSONL only, ~600 LOC total. This tutorial is the advanced reference
+> that adds multi-model serving, Dynamo backend, Parquet I/O, by-shard
+> output, and rich per-shard metrics.
 
-## What It Demonstrates
+Two independent concepts:
 
-| Requirement | Tutorial implementation |
+1. **SLURM-array support for Curator** (`slurm_array_support.py`). Four
+   pieces, reusable in any pipeline:
+   - `Shard` — namespace of static helpers: `env()`, `data_path()`,
+     `marker_path()`, `has_marker()`, `completed()`, `missing()`,
+     `write_marker()`. All static methods; no instance state.
+   - `SlurmArrayFilePartitioningStage` — `FilePartitioningStage` subclass.
+     Filters parent-class output through two checks: shard ownership by
+     hash, and deterministic output already on disk. Runs as a normal
+     pipeline stage on the worker — no driver-side filesystem walks, so
+     the host that submits the pipeline doesn't need lustre access or
+     curator-container permissions.
+   - `enable_slurm_array_partitioning(reader, ...)` — one-line swap of the
+     first `FilePartitioningStage` inside any reader composite (JsonlReader,
+     ParquetReader, …).
+   - `SlurmArrayPipeline` — `Pipeline` subclass. Short-circuits on an
+     existing `_SUCCESS/shard_*.json` marker and writes that marker on
+     clean completion (pipeline name + output file list + run time;
+     anything else goes through the caller-supplied `success_payload`).
+
+2. **The demo SDG pipeline** (`seeded_sdg_pipeline.py`). Loads a Data Designer
+   config from JSON/YAML, brings up one or more model endpoints through
+   `InferenceServer` (Dynamo or Ray Serve), and runs the seeded pipeline
+   over this shard's slice of input files.
+
+| File | What it adds |
 | --- | --- |
-| Horizontal fanout across `H` array jobs | `SlurmArrayFilePartitioningStage` assigns file groups by stable hash modulo `CURATOR_NUM_SHARDS`. |
-| Vertical scale per array job | `submit_array.sh` sets `NODES`, `GPUS_PER_NODE`, and starts Ray through `SlurmRayClient`. |
-| Multiple model endpoints per shard | `MODELS_JSON` or `MODELS_JSON_FILE` expands into multiple Curator `InferenceServer` model configs. |
-| Resumability | Output writers create `<output>.done` sidecars; the partitioner skips only sidecar-complete outputs. |
-| Retry only unfinished shards | `submit_array.sh retry-missing` resubmits shards that do not have `_SUCCESS/shard_*.json`. |
-| Empty shard fast path | The pipeline computes the partition plan before Ray or model startup and exits immediately for empty or complete shards. |
-| Per-shard metrics | `_SUCCESS/shard_*.json` includes partition counts, served models, output files, bytes, timings, and task performance data. |
+| `slurm_array_support.py` | The three pieces above. |
+| `seeded_sdg_pipeline.py` | The SDG pipeline + multi-model serving. |
+| `submit_array.sh` | `submit` / `status` / `retry-missing` / `worker`. |
+| `configs/*.json` | Data Designer configs and example models specs. |
 
-The helpers intentionally live under `tutorials/slurm-arrays-nemo-data-designer`
-so the workflow can be reviewed without changing Curator core APIs.
+## Env-var contract
 
-## Files
+| Var | Meaning |
+| --- | --- |
+| `CURATOR_SHARD_INDEX` | This shard's index. Defaults to `SLURM_ARRAY_TASK_ID - CURATOR_SHARD_OFFSET`. |
+| `CURATOR_NUM_SHARDS` | Original shard count. Preferred over `SLURM_ARRAY_TASK_COUNT` so sparse retries (e.g. `--array=3,5,9`) keep the original count. |
+| `CURATOR_ORIGINAL_ARRAY_SIZE` | Fallback set by `submit_array.sh` on the first submission. |
 
-- `slurm_array_support.py`: `SlurmArrayFilePartitioningStage`, sidecar-aware writers, and `SlurmArrayPipeline`.
-- `seeded_sdg_pipeline.py`: seeded JSONL or Parquet Data Designer pipeline with preflight partition planning.
-- `submit_array.sh`: submit, status, retry, and worker entrypoint for SLURM arrays.
-- `prepare_seed_dataset.py`: prepares sharded JSONL and Parquet seed datasets.
-- `configs/gretel_medical_two_model.sdg.json`: Data Designer config for the Gretel symptoms dataset.
-- `configs/cached_hf_gretel_models.json`: two cached local HF model specs for endpoint testing.
-- `configs/wiki_summarizer_two_model.sdg.json`: Data Designer config for a Wikipedia summarization seed dataset.
-- `configs/wiki_gpt_oss_models.json`: two-model GPT-OSS-style endpoint config.
-
-## Dataset Layout
-
-The Gretel seed dataset is prepared outside the tutorial tree:
+## Output layout
 
 ```text
-datasets/ndd_gretel_symptoms/
-  jsonl/part_00000.jsonl
-  parquet/part_00000.parquet
-  manifest.json
-```
-
-Regenerate it from the workspace root:
-
-```bash
-uv run --with pandas --with pyarrow \
-  python Curator/tutorials/slurm-arrays-nemo-data-designer/prepare_seed_dataset.py \
-  --dataset ndd_gretel_symptoms \
-  --rows-per-file 25 \
-  --force
-```
-
-## Output Layout
-
-Use a run root under `datasets/slurm-arrays-nemo-data-designer/runs`:
-
-```text
-datasets/slurm-arrays-nemo-data-designer/runs/<run-name>/
-  data/*.jsonl
-  data/*.jsonl.done
-  _SUCCESS/shard_00000.json
+<OUTPUT_PATH>/
+  data/                            # OUTPUT_LAYOUT=flat (default)
+    <hash>.jsonl                   # filename = get_deterministic_hash(source_files, task_id)
+    ...
+  data/shard_00000/                # OUTPUT_LAYOUT=by_shard
+    <hash>.jsonl
+  _SUCCESS/
+    shard_00000.json               # per-shard marker w/ metrics
+    shard_00002.json
   _logs/*.out
   _logs/*.err
 ```
 
-`OUTPUT_LAYOUT=flat` writes all completed files under `data/`. Use
-`OUTPUT_LAYOUT=by_shard` to write under `data/shard_00000/`,
-`data/shard_00001/`, and so on.
+Filenames are content-hashed, so flat layout never collides across shards.
 
-## Submit A Single-Node Run
+## Submit a single-node run
 
-`MODEL=...` is a single-model shorthand. For multiple endpoints, use
-`MODELS_JSON` or `MODELS_JSON_FILE`.
+Model serving is configured by `MODELS_JSON_FILE` (path) or `MODELS_JSON`
+(inline JSON). Always a JSON list, even for one model — see
+`configs/cached_hf_gretel_models.json` for the schema.
 
 ```bash
-INPUT_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/praateekm/datasets/ndd_gretel_symptoms/jsonl \
-OUTPUT_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/praateekm/datasets/slurm-arrays-nemo-data-designer/runs/ndd_gretel_v1_h1 \
-DD_CONFIG=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/praateekm/Curator/tutorials/slurm-arrays-nemo-data-designer/configs/gretel_medical_two_model.sdg.json \
-MODELS_JSON_FILE=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/praateekm/Curator/tutorials/slurm-arrays-nemo-data-designer/configs/cached_hf_gretel_models.json \
-INPUT_FORMAT=jsonl \
-OUTPUT_FORMAT=jsonl \
-ARRAY_SIZE=1 \
-MAX_CONCURRENT=1 \
-NODES=1 \
-GPUS_PER_NODE=8 \
-PARTITION=batch_short \
-TIME_LIMIT=02:00:00 \
+INPUT_PATH=/path/to/seed/jsonl_dir \
+OUTPUT_PATH=/path/to/output_root \
+DD_CONFIG=Curator/tutorials/slurm-arrays-nemo-data-designer/configs/gretel_medical_two_model.sdg.json \
+MODELS_JSON_FILE=Curator/tutorials/slurm-arrays-nemo-data-designer/configs/cached_hf_gretel_models.json \
+INPUT_FORMAT=jsonl OUTPUT_FORMAT=jsonl \
+ARRAY_SIZE=1 MAX_CONCURRENT=1 NODES=1 GPUS_PER_NODE=8 \
+PARTITION=batch_short TIME_LIMIT=02:00:00 \
 Curator/tutorials/slurm-arrays-nemo-data-designer/submit_array.sh submit
 ```
 
-Recommended scale checks:
+Recommended scale checks: H=1×V=1 → H=1×V=2 → H=2×V=1 → H=2×V=2.
 
-```bash
-# H=1, V=1
-ARRAY_SIZE=1 MAX_CONCURRENT=1 NODES=1 ...
-
-# H=1, V=2
-ARRAY_SIZE=1 MAX_CONCURRENT=1 NODES=2 ...
-
-# H=2, V=1
-ARRAY_SIZE=2 MAX_CONCURRENT=2 NODES=1 ...
-
-# H=2, V=2
-ARRAY_SIZE=2 MAX_CONCURRENT=2 NODES=2 ...
-```
-
-## Multi-Model Config
-
-`MODELS_JSON_FILE` points at JSON shaped like:
+## Model spec JSON
 
 ```json
 [
-  {
-    "model": "/path/to/model-a",
-    "served_model_name": "model-a",
-    "alias": "diagnosis_model",
-    "tp": 1,
-    "replicas": "auto"
-  },
-  {
-    "model": "/path/to/model-b",
-    "served_model_name": "model-b",
-    "alias": "review_model",
-    "tp": 1,
-    "replicas": "auto"
-  }
+  {"model": "/path/to/a", "served_model_name": "model-a", "tp": 1, "replicas": "auto"},
+  {"model": "/path/to/b", "served_model_name": "model-b", "tp": 1, "replicas": "auto"}
 ]
 ```
 
-Aliases are used to retarget matching model names in the Data Designer config.
-With `replicas=auto`, the pipeline divides available GPUs across the configured
-models after accounting for tensor parallelism.
+Required per entry: `model`, `tp`. Optional: `served_model_name` (defaults
+to `model`), `replicas` (defaults to `"auto"`), `engine_kwargs`,
+`max_model_len`.
 
-## Status And Retry
+With `replicas=auto`, the pipeline divides the GPUs Ray sees across
+auto-sized models, using as many as possible.
+
+**Wiring to your Data Designer config:** the DD config's `model_configs`
+entries must set `model: "<served_model_name>"` and `provider: "<your
+provider name>"` (default `"local"`) so each LLM column hits the local
+inference server. See `configs/gretel_medical_two_model.sdg.json` for an
+example.
+
+## Status and retry
 
 ```bash
-INPUT_PATH=... OUTPUT_PATH=... DD_CONFIG=... MODELS_JSON_FILE=... ARRAY_SIZE=2 \
-  Curator/tutorials/slurm-arrays-nemo-data-designer/submit_array.sh status
+INPUT_PATH=... OUTPUT_PATH=... DD_CONFIG=... ARRAY_SIZE=2 \
+  submit_array.sh status
 
-INPUT_PATH=... OUTPUT_PATH=... DD_CONFIG=... MODELS_JSON_FILE=... ARRAY_SIZE=2 \
-  Curator/tutorials/slurm-arrays-nemo-data-designer/submit_array.sh retry-missing
+INPUT_PATH=... OUTPUT_PATH=... DD_CONFIG=... ARRAY_SIZE=2 \
+  submit_array.sh retry-missing
 ```
 
-`status` checks `_SUCCESS/shard_*.json`. `retry-missing` submits only the shard
-indices that do not have success markers.
+`status` reads `_SUCCESS/shard_*.json`. `retry-missing` resubmits only the
+shard indices missing a marker, preserving `CURATOR_ORIGINAL_ARRAY_SIZE`
+so the hash-based partitioning stays consistent across retries.
 
-## Core Follow-Ups
+## Seed data
 
-- Promote sidecar-complete output detection into Curator writer APIs instead of
-  tutorial-only writer subclasses.
-- Promote `SlurmArrayFilePartitioningStage` or a generic indexed-shard
-  partitioning stage into Curator core.
-- Add a core success-marker hook to `Pipeline` so per-shard metrics and retry
-  metadata are emitted consistently.
-- Add a record-range equivalent for pure non-seed generation.
+This tutorial assumes you already have seeded data (JSONL or Parquet) at
+`INPUT_PATH`. For a one-line download + chunk into JSONL, see the
+quickstart at `tutorials/slurm-datadesigner/pipeline.py`, which reuses
+`download_and_convert_seed_data` from
+`tutorials/synthetic/nemo_data_designer/`. For Parquet, convert with
+`pandas`/`pyarrow`.
+
+## Promoting upstream
+
+1. Move `SlurmArrayFilePartitioningStage` into `nemo_curator/stages/file_partitioning.py`.
+2. Add `output_path` + shard params to `FilePartitioningStage` directly — the
+   monkey-patch in `enable_slurm_array_partitioning` then goes away.
+3. Move `SlurmArrayPipeline` into `nemo_curator/pipeline/slurm.py`.
+4. Port `submit_array.sh` to a Python entry point.
+
+## Limitations
+
+- **Dynamo backend** doesn't handle simultaneous HF model pulls; pre-stage
+  weights to a local path (Ray Serve does handle it).
+- **Image/video/audio readers** aren't covered by `enable_slurm_array_partitioning`'s
+  detection — it walks the composite's stages until it finds a
+  `FilePartitioningStage`, so any reader that decomposes that way works.
+- **Adding files between runs:** if a shard already has its marker,
+  `SlurmArrayPipeline.run()` short-circuits and won't pick up new files
+  for that shard. Delete the marker to force a re-run (data is preserved
+  because filenames are deterministic).
+- **Pure-`num_records` SDG (no input files):** needs a record-range
+  partitioning stage; not yet written.

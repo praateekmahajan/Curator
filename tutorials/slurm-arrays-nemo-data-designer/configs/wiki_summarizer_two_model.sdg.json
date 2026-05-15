@@ -53,7 +53,7 @@
           "top_p": null,
           "max_tokens": 1024
         },
-        "provider": null,
+        "provider": "local",
         "skip_health_check": true
       },
       {
@@ -70,7 +70,7 @@
           "top_p": null,
           "max_tokens": 1024
         },
-        "provider": null,
+        "provider": "local",
         "skip_health_check": true
       }
     ],

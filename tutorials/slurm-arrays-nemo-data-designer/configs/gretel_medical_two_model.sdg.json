@@ -23,7 +23,7 @@
     "model_configs": [
       {
         "alias": "note_writer",
-        "model": "Qwen/Qwen2.5-0.5B-Instruct",
+        "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
         "inference_parameters": {
           "generation_type": "chat-completion",
           "max_parallel_requests": 32,
@@ -33,12 +33,12 @@
           "top_p": 0.9,
           "max_tokens": 512
         },
-        "provider": null,
+        "provider": "local",
         "skip_health_check": true
       },
       {
         "alias": "patient_explainer",
-        "model": "Qwen/Qwen3-0.6B",
+        "model": "openai/gpt-oss-120b",
         "inference_parameters": {
           "generation_type": "chat-completion",
           "max_parallel_requests": 32,
@@ -48,7 +48,7 @@
           "top_p": 0.9,
           "max_tokens": 512
         },
-        "provider": null,
+        "provider": "local",
         "skip_health_check": true
       }
     ],
