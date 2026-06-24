@@ -1,0 +1,55 @@
+paths:
+  - name: "results_path"
+    host_path: "/lustre/fsw/datascience_rapids_cugraphgnn/praateekm/benchmark_results"
+  - name: "datasets_path"
+    host_path: "/lustre/fsw/coreai_dlalgo_ci/curator_ci/datasets"
+  - name: "hf_cache_path"
+    host_path: "/lustre/fsw/datascience_rapids_cugraphgnn/praateekm/hf_cache/hub"
+
+gpu_stats_recorder:
+  interval_s: 5.0
+
+object_store_size: 536870912000  # 500 GiB per Ray node
+delete_scratch: false
+default_timeout_s: 14000
+
+ray:
+  num_cpus: 224
+  num_gpus: 8
+  start_prometheus_grafana: true
+  metrics_dir: "/lustre/fsw/datascience_rapids_cugraphgnn/praateekm/tmp_codex/fineweb-embedding/metrics"
+
+datasets:
+  - name: "fineweb_edu_fortified"
+    formats:
+      - type: "parquet"
+        path: "{datasets_path}/fineweb-edu-fortified"
+  - name: "text_models_hf_cache"
+    formats:
+      - type: "files"
+        path: "{hf_cache_path}"
+
+entries:
+  - name: fineweb_edu_fortified_embedding_raydata_slurm
+    script: embedding_generation_full_columns_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={dataset:fineweb_edu_fortified,parquet}
+      --output-path=/lustre/fsw/datascience_rapids_cugraphgnn/praateekm/pipeline_output/fineweb_edu_fortified_embeddinggemma_4n32g
+      --executor=ray_data
+      --model-identifier=google/embeddinggemma-300m
+      --model-variation=vllm_text
+      --cache-dir={dataset:text_models_hf_cache,files}
+      --files-per-partition=1
+      --embedding-gpus-per-worker=0.249
+      --embedding-cpus-per-worker=1
+      --embedding-num-workers=128
+      --vllm-gpu-memory-utilization=0.23
+      --vllm-max-port-retries=8
+      --old-embedding-field=embedding
+      --embedding-field=embedding
+      --writer-mode=overwrite
+    timeout_s: 14000
+    requirements:
+      - metric: num_documents_processed
+        exact_value: 322250000

@@ -43,7 +43,7 @@ sys.path.insert(0, _this_script_dir)
 from runner.datasets import DatasetResolver
 from runner.entry import Entry
 from runner.env_capture import dump_env
-from runner.gpu_stats_recorder import GPUStatsRecorder
+from runner.gpu_stats_recorder import RayGPUStatsRecorder
 from runner.path_resolver import PathResolver
 from runner.process import run_command_with_timeout
 from runner.ray_cluster import (
@@ -64,9 +64,41 @@ from runner.utils import (
 )
 
 
+def _is_slurm_head_process() -> bool:
+    """Return True for non-SLURM and SLURM node 0 processes."""
+    return int(os.environ.get("SLURM_NODEID", "0")) == 0
+
+
 def ensure_dir(dir_path: Path) -> None:
     """Ensure dir_path and parents exists, creating them if necessary."""
     dir_path.mkdir(parents=True, exist_ok=True)
+
+
+def _resolve_ray_metrics_dir(entry: Entry, session_entry_path: Path) -> Path:
+    """Resolve the Prometheus/Grafana metrics directory for this entry."""
+    metrics_dir = entry.ray.get("metrics_dir") or os.environ.get("CURATOR_BENCHMARK_METRICS_DIR")
+    if metrics_dir:
+        return Path(metrics_dir).absolute()
+    return (session_entry_path / "metrics_services").absolute()
+
+
+def _maybe_start_prometheus_grafana(entry: Entry, metrics_dir: Path) -> None:
+    """Start monitoring services once on the head process when requested."""
+    if not entry.ray.get("start_prometheus_grafana", False):
+        return
+    if not _is_slurm_head_process():
+        return
+
+    from nemo_curator.metrics.start_prometheus_grafana import start_prometheus_grafana
+
+    prometheus_port = int(entry.ray.get("prometheus_web_port", 9090))
+    grafana_port = int(entry.ray.get("grafana_web_port", 3000))
+    ensure_dir(metrics_dir)
+    start_prometheus_grafana(
+        prometheus_web_port=prometheus_port,
+        grafana_web_port=grafana_port,
+        metrics_dir=str(metrics_dir),
+    )
 
 
 def get_entry_script_persisted_data(session_entry_path: Path) -> dict[str, Any]:
@@ -172,13 +204,11 @@ def run_entry(  # noqa: PLR0913
     ray_num_cpus = entry.ray.get("num_cpus", os.cpu_count() or 1)
     ray_num_gpus = entry.ray.get("num_gpus", 0)
     ray_enable_object_spilling = bool(entry.ray.get("enable_object_spilling", False))
+    ray_metrics_dir = _resolve_ray_metrics_dir(entry, session_entry_path)
 
     try:
-        # Create subdirs individually. logs_path uses ensure_dir (not create_or_overwrite_dir)
-        # to preserve any log output already written before run_entry() was called.
-        for directory in [scratch_path, ray_cluster_path]:
-            create_or_overwrite_dir(directory)
         ensure_dir(logs_path)
+        _maybe_start_prometheus_grafana(entry, ray_metrics_dir)
 
         ray_client, ray_temp_dir = setup_ray_cluster_and_env(
             num_cpus=ray_num_cpus,
@@ -186,7 +216,13 @@ def run_entry(  # noqa: PLR0913
             enable_object_spilling=ray_enable_object_spilling,
             ray_log_path=logs_path / "ray.log",
             object_store_size=None if entry.object_store_size == "default" else entry.object_store_size,
+            metrics_dir=ray_metrics_dir,
         )
+        # In multi-node SLURM, non-head processes block inside SlurmRayClient.start()
+        # and never reach this point. Keep destructive shared-directory cleanup on
+        # the head process only.
+        for directory in [scratch_path, ray_cluster_path]:
+            create_or_overwrite_dir(directory)
 
         # Prepopulate <session_entry_path>/params.json with entry params.
         # These will be appended with the benchmark params by the benchmark script.
@@ -197,6 +233,8 @@ def run_entry(  # noqa: PLR0913
                     "ray_num_cpus": ray_num_cpus,
                     "ray_num_gpus": ray_num_gpus,
                     "ray_enable_object_spilling": ray_enable_object_spilling,
+                    "ray_metrics_dir": str(ray_metrics_dir),
+                    "ray_start_prometheus_grafana": bool(entry.ray.get("start_prometheus_grafana", False)),
                     "entry_timeout_s": entry.timeout_s,
                 },
                 default=get_obj_for_json,
@@ -215,11 +253,13 @@ def run_entry(  # noqa: PLR0913
             warning_threshold_msg="used before benchmark started",
         )
         logger.info(f"\tRunning command {' '.join(cmd) if isinstance(cmd, list) else cmd}")
-        # Background poller writes per-GPU stats (utilization, memory, temperature, processes) to
-        # gpustats.csv every gpu_stats_recorder_interval_s seconds. Set to 0 in YAML to disable.
+        # Background pollers write per-GPU stats from every Ray node to per-node CSVs,
+        # then merge them into gpustats.csv using the original single-node schema.
+        # Set gpu_stats_recorder.interval_s to 0 in YAML to disable.
         gpu_stats_recorder_ctx = (
-            GPUStatsRecorder(
+            RayGPUStatsRecorder(
                 output_path=session_entry_path / "gpustats.csv",
+                per_node_dir=session_entry_path / "gpustats_nodes",
                 interval_s=gpu_stats_recorder_interval_s,
             )
             if gpu_stats_recorder_interval_s > 0

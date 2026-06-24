@@ -15,6 +15,7 @@
 
 import os
 import shutil
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -24,7 +25,7 @@ import ray
 from loguru import logger
 from runner.utils import get_shm_usage
 
-from nemo_curator.core.client import RayClient
+from nemo_curator.core.client import RayClient, SlurmRayClient
 from nemo_curator.core.utils import check_ray_responsive
 
 ray_client_start_timeout_s = 30
@@ -32,6 +33,38 @@ ray_client_start_poll_interval_s = 0.5
 
 
 _RAY_CLEANUP_WAIT_S = 10
+
+
+def _slurm_num_nodes() -> int:
+    """Return the SLURM allocation node count, or 1 outside SLURM."""
+    for env_name in ("SLURM_JOB_NUM_NODES", "SLURM_NNODES", "SLURM_STEP_NUM_NODES"):
+        value = os.environ.get(env_name)
+        if value:
+            return int(value)
+
+    nodelist = os.environ.get("SLURM_JOB_NODELIST") or os.environ.get("SLURM_NODELIST")
+    if nodelist:
+        try:
+            scontrol = shutil.which("scontrol")
+            if scontrol:
+                result = subprocess.run(  # noqa: S603
+                    [scontrol, "show", "hostnames", nodelist],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                nodes = [line for line in result.stdout.strip().splitlines() if line]
+                if nodes:
+                    return len(nodes)
+        except Exception:
+            logger.debug("Failed to derive SLURM node count from node list", exc_info=True)
+
+    return 1
+
+
+def _use_slurm_ray_client() -> bool:
+    """Return whether this process should bootstrap Ray through SlurmRayClient."""
+    return bool(os.environ.get("SLURM_JOB_ID")) and _slurm_num_nodes() > 1
 
 
 def _wait_for_ray_cleanup() -> None:
@@ -51,6 +84,7 @@ def setup_ray_cluster_and_env(  # noqa: PLR0913
     ray_log_path: Path,
     object_store_size: int | None = None,
     include_dashboard: bool = True,
+    metrics_dir: Path | None = None,
 ) -> tuple[RayClient, Path]:
     """Setup a Ray cluster and set the RAY_ADDRESS environment variable and return the Ray client and temp dir."""
     # Create a short temp dir to avoid Unix socket path length limits
@@ -59,6 +93,14 @@ def setup_ray_cluster_and_env(  # noqa: PLR0913
 
     # Capture stdout/stderr to a file if provided, otherwise suppress it
     ray_stdouterr_capture_file = str(ray_log_path) if ray_log_path else os.devnull
+
+    if _use_slurm_ray_client() and ray_log_path:
+        # SlurmRayClient broadcasts the head port through a shared file.  /tmp is
+        # usually node-local on SLURM clusters, so put this beside benchmark logs.
+        port_broadcast_dir = ray_log_path.parent / "ray_ports"
+        port_broadcast_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["RAY_PORT_BROADCAST_DIR"] = str(port_broadcast_dir)
+        logger.info(f"Using SlurmRayClient port broadcast dir: {port_broadcast_dir}")
 
     # Check environment variables that might interfere
     ray_address_env = os.environ.get("RAY_ADDRESS")
@@ -80,16 +122,24 @@ def setup_ray_cluster_and_env(  # noqa: PLR0913
         if ray_log_path and retries > 0:
             ray_stdouterr_capture_file = f"{ray_log_path!s}-{retries + 1}"
 
-        # Create and start the Ray client
-        client = RayClient(
+        # Create and start the Ray client.  In multi-node SLURM, worker
+        # processes block inside SlurmRayClient.start(); only the head returns.
+        client_cls = SlurmRayClient if _use_slurm_ray_client() else RayClient
+        capture_file = ray_stdouterr_capture_file
+        if _use_slurm_ray_client() and ray_log_path:
+            node_id = int(os.environ.get("SLURM_NODEID", "0"))
+            if node_id != 0:
+                capture_file = str(ray_log_path.with_name(f"{ray_log_path.stem}.rank{node_id}{ray_log_path.suffix}"))
+        client = client_cls(
             ray_temp_dir=str(short_temp_path),
             include_dashboard=include_dashboard,
             num_gpus=num_gpus,
             num_cpus=num_cpus,
             enable_object_spilling=enable_object_spilling,
             ray_dashboard_host="0.0.0.0",  # noqa: S104
-            ray_stdouterr_capture_file=ray_stdouterr_capture_file,
+            ray_stdouterr_capture_file=capture_file,
             object_store_memory=object_store_size,
+            metrics_dir=str(metrics_dir) if metrics_dir is not None else None,
         )
 
         try:
@@ -114,7 +164,8 @@ def setup_ray_cluster_and_env(  # noqa: PLR0913
         msg = f"Failed to start Ray cluster after {max_retries} attempts"
         raise RuntimeError(msg)
 
-    logger.info(f"RayClient started successfully: pid={client.ray_process.pid}, port={client.ray_port}")
+    pid = client.ray_process.pid if client.ray_process else None
+    logger.info(f"{client.__class__.__name__} started successfully: pid={pid}, port={client.ray_port}")
     return client, short_temp_path
 
 

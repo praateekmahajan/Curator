@@ -518,6 +518,8 @@ class SlurmRayClient(RayClient):
             cmd.extend(["--num-gpus", str(self.num_gpus)])
         if self.num_cpus is not None:
             cmd.extend(["--num-cpus", str(self.num_cpus)])
+        if self.object_store_memory is not None:
+            cmd.extend(["--object-store-memory", str(self.object_store_memory)])
 
         logger.info(f"Ray worker starting: {' '.join(cmd)}")
         result = subprocess.run(cmd, check=False)  # noqa: S603

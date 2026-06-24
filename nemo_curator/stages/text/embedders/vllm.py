@@ -18,16 +18,17 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from huggingface_hub import snapshot_download
-from vllm import LLM
 
 from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.stages.text.models.utils import format_name_with_suffix
 from nemo_curator.tasks import DocumentBatch
+from nemo_curator.utils.vllm_utils import create_vllm_llm
 
 if TYPE_CHECKING:
     from transformers import AutoTokenizer
+    from vllm import LLM
 
 
 class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
@@ -101,7 +102,23 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         if not self.verbose and "disable_log_stats" not in vllm_init_kwargs:
             vllm_init_kwargs["disable_log_stats"] = True
 
-        self.model = LLM(model=model_path, **vllm_init_kwargs)
+        enforce_eager = vllm_init_kwargs.pop("enforce_eager")
+        max_num_seqs = vllm_init_kwargs.pop("max_num_seqs", 64)
+        dtype = vllm_init_kwargs.pop("dtype", "bfloat16")
+        trust_remote_code = vllm_init_kwargs.pop("trust_remote_code", False)
+        limit_mm_per_prompt = vllm_init_kwargs.pop("limit_mm_per_prompt", {})
+        max_port_retries = vllm_init_kwargs.pop("max_port_retries", 3)
+
+        self.model = create_vllm_llm(
+            model_path,
+            max_num_seqs=max_num_seqs,
+            enforce_eager=enforce_eager,
+            dtype=dtype,
+            trust_remote_code=trust_remote_code,
+            limit_mm_per_prompt=limit_mm_per_prompt,
+            max_port_retries=max_port_retries,
+            **vllm_init_kwargs,
+        )
 
     def setup_on_node(self, node_info: NodeInfo | None = None, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
         if not self.verbose:
