@@ -69,6 +69,13 @@ Local commits made for this investigation:
 - `f8a7400c` - recorded the successful corrected Ray Serve direct-handle i22 result.
 - `d97e3165` - raised the Docker `nofile` limit in `benchmarking/tools/run.sh` to test Ray Serve HTTP without the default fd cap.
 - `e307cf23` - prepared the corrected Ray Serve HTTP i23 rerun entry using the raised Docker fd limit.
+- `45c963d7` - recorded the successful corrected Ray Serve HTTP i23 result.
+- `12e7d2e1` - prepared the first Dynamo HTTP text-input rerun.
+- `8f4c2669` - prepared the clean-GPU Dynamo HTTP text-input retry.
+- `1f80e5e4` - recorded the Dynamo HTTP text-input retry result and blocker.
+- `3da95dd8` - prepared the corrected Ray Serve HTTP text-input run.
+- `f27e5123` - prepared the corrected Ray Serve direct-handle text-input run.
+- `00619858` - prepared the Ray Serve direct-handle text retry and explicit 500 GB object store cap.
 
 Previous agent diffs were not discarded. They were preserved in:
 
@@ -146,6 +153,13 @@ Latest Dynamo HTTP text-input status:
 - The server-side cause was a backend `VLLMValidationError`: a prompt reached vLLM with at least 2049 input tokens for the 2048-token `google/embeddinggemma-300m` context.
 - The benchmark script did send `extra_body.truncate_prompt_tokens=2048`, but Dynamo's embedding handler creates `PoolingParams()` and calls `engine_client.encode(prompt=raw_string, ...)` without propagating embedding truncation. Code search in Dynamo found no `truncate_prompt_tokens` handling in the embeddings path.
 - Conclusion: Dynamo HTTP text input is included in the matrix, but it has no valid throughput on uncapped real documents until Dynamo propagates/tokenizes truncation correctly. The working Dynamo endpoint path remains `token_ids` plus base64, with i8 as the best token-input Dynamo result so far.
+
+Latest Ray Serve text-input status:
+
+- `embedding_generation_ray_serve_haproxy_http_text_1f80e5e4_i26` succeeded with Ray Serve HTTP, HAProxy, RayExecutorV2, text input, base64 responses, no character caps, request batch size 8, 16 HTTP clients, 64 concurrent requests per client, and 4 replicas. It processed 1,023,449 docs from 262 files in 883.79s, with 62.84s startup and 1158.02 docs/s startup-inclusive. Excluding startup: `1023449 / (883.7902 - 62.8370) = 1246.65 docs/s`. Ray Data DAG-only: `1023449 / 784.93 = 1303.87 docs/s`.
+- `embedding_generation_ray_serve_haproxy_handle_text_3da95dd8_i27` was an invalid startup attempt. No benchmark traffic ran because the previous run left 1.27 MiB in `/dev/shm`, and Ray refused the default exactly-1 TiB object store size because available `/dev/shm` was slightly smaller.
+- `embedding_generation_ray_serve_haproxy_handle_text_08600985_i28` succeeded after adding top-level `object_store_size: 536870912000`. It used the same text/base64/no-cap geometry as i26, but `endpoint_client_mode=ray_handle`. It processed 1,023,449 docs from 262 files in 721.08s, with 74.17s startup and 1419.33 docs/s startup-inclusive. Excluding startup: `1023449 / (721.0789 - 74.1726) = 1582.07 docs/s`. Ray Data DAG-only: `1023449 / 611.12 = 1674.71 docs/s`. Normalizing summed endpoint embedding time by 16 handle clients gives `1023449 / (9434.0826 / 16) = 1735.75 docs/s`.
+- Text-input conclusion: Ray Serve direct handle is clearly faster than Ray Serve HTTP for text input under the same server/client geometry, but both text-input paths trail the token_ids direct-handle path (`i22`: 2011.39 docs/s startup-inclusive, 2358.18 docs/s excluding startup).
 
 The stopped capped run was:
 
@@ -228,7 +242,7 @@ The i5 endpoint rerun is complete and the tmux session was killed for hygiene:
 - Dynamo end-to-end metric: 504.61s total, 92.19s service startup, 2028.21 docs/s.
 - Dynamo steady-state pipeline rate excluding service startup: about 2481.61 docs/s.
 
-Current successful uncapped ranking by end-to-end benchmark throughput, including the corrected Ray Serve direct-handle i22 run, the corrected raised-`nofile` Ray Serve HTTP i23 run, and excluding old Ray Serve runs that did not enable HAProxy:
+Current successful uncapped ranking by end-to-end benchmark throughput, including the corrected Ray Serve direct-handle i22 run, the corrected raised-`nofile` Ray Serve HTTP i23 run, the corrected Ray Serve text-input i26/i28 runs, and excluding old Ray Serve runs that did not enable HAProxy:
 
 1. Xenna in-process pretokenized vLLM, 16 fractional workers at 0.249 GPU: 2865.16 docs/s.
 2. Ray Data in-process pretokenized vLLM, 16 fractional workers at 0.249 GPU: 2732.02 docs/s.
@@ -242,9 +256,11 @@ Current successful uncapped ranking by end-to-end benchmark throughput, includin
 10. Dynamo endpoint token_ids/base64, request batch size 32: 2041.99 docs/s, including service startup.
 11. Dynamo endpoint token_ids/base64, request batch size 8: 2028.21 docs/s, including service startup.
 12. Ray Serve direct handle with HAProxy enabled, token_ids/base64, request batch size 8: 2011.39 docs/s, including service startup.
-13. Ray Serve HTTP with HAProxy enabled, raised Docker `nofile`, token_ids/base64, request batch size 8: 1021.70 docs/s, including service startup.
+13. Ray Serve direct handle with HAProxy enabled, text/base64, request batch size 8: 1419.33 docs/s, including service startup.
+14. Ray Serve HTTP with HAProxy enabled, raised Docker `nofile`, text/base64, request batch size 8: 1158.02 docs/s, including service startup.
+15. Ray Serve HTTP with HAProxy enabled, raised Docker `nofile`, token_ids/base64, request batch size 8: 1021.70 docs/s, including service startup.
 
-Current successful uncapped ranking by persistent-service steady-state throughput, including the corrected Ray Serve direct-handle i22 run, the corrected raised-`nofile` Ray Serve HTTP i23 run, and excluding old Ray Serve runs that did not enable HAProxy:
+Current successful uncapped ranking by persistent-service steady-state throughput, including the corrected Ray Serve direct-handle i22 run, the corrected raised-`nofile` Ray Serve HTTP i23 run, the corrected Ray Serve text-input i26/i28 runs, and excluding old Ray Serve runs that did not enable HAProxy:
 
 1. Xenna in-process pretokenized vLLM, 16 fractional workers at 0.249 GPU: 2865.16 docs/s.
 2. Ray Data in-process pretokenized vLLM, 16 fractional workers at 0.249 GPU: 2732.02 docs/s.
@@ -258,7 +274,9 @@ Current successful uncapped ranking by persistent-service steady-state throughpu
 10. Ray Data in-process pretokenized vLLM, inert CLI batch value 64: 2215.38 docs/s.
 11. Ray Data in-process pretokenized vLLM, inert CLI batch value 128: 2205.00 docs/s.
 12. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
-13. Ray Serve HTTP with HAProxy enabled, raised Docker `nofile`, token_ids/base64, request batch size 8: about 1100.87 docs/s after excluding service startup.
+13. Ray Serve direct handle with HAProxy enabled, text/base64, request batch size 8: about 1582.07 docs/s after excluding service startup.
+14. Ray Serve HTTP with HAProxy enabled, raised Docker `nofile`, text/base64, request batch size 8: about 1246.65 docs/s after excluding service startup.
+15. Ray Serve HTTP with HAProxy enabled, raised Docker `nofile`, token_ids/base64, request batch size 8: about 1100.87 docs/s after excluding service startup.
 
 Do not collapse these two rankings into one claim. Batch jobs pay startup; already-running services do not. Current endpoint tuning says Dynamo request batch size 16 is the best tested endpoint point. For in-process vLLM, do not run more `--model-inference-batch-size` sweeps unless the script first adds a real vLLM-stage batching control. Previous Ray Serve HTTP entries remain diagnostic unless their logs verify HAProxy and RayExecutorV2; i23 is the first valid corrected HTTP datapoint.
 
@@ -281,6 +299,8 @@ embedding_generation_ray_serve_haproxy_http_db6443b4_i20
 embedding_generation_ray_serve_haproxy_handle_db6443b4_i21
 embedding_generation_ray_serve_haproxy_handle_4fb16baf_i22
 embedding_generation_ray_serve_haproxy_http_d97e3165_i23
+embedding_generation_ray_serve_haproxy_http_text_1f80e5e4_i26
+embedding_generation_ray_serve_haproxy_handle_text_08600985_i28
 ```
 
 The i20 HTTP entry failed after startup, before throughput:
@@ -331,7 +351,35 @@ The i22 corrected direct-handle entry succeeded:
 - Main embedding client stage sum: 6079.54s process time, 6053.78s endpoint embedding time, 180.03s endpoint tokenization time, 128,118 endpoint requests.
 - The run showed repeated Ray Serve queue-length deadline warnings from the direct-handle router. This points to Serve router/scheduler/backpressure overhead, not HTTP ingress overhead.
 
-Current corrected Ray Serve conclusion: direct handle is the faster Ray Serve client path, but it is still slower than fractional Xenna, fractional Ray Data, and Dynamo batch16. Raising Docker `nofile` makes Ray Serve HTTP+HAProxy complete at the i20 pressure point, but HTTP remains much slower than direct handle: about 1100.87 docs/s post-startup for HTTP versus about 2358.18 docs/s post-startup for direct handle.
+The i26 HTTP text entry succeeded:
+
+- 1,023,449 docs, 262 input files.
+- No character caps: `max_chars=null`, `endpoint_max_chars=null`.
+- `endpoint_input_format=text`, `endpoint_encoding_format=base64`, `endpoint_client_mode=tasks`.
+- 4 replicas, 16 HTTP clients, 64 concurrent requests per client, 1024 aggregate max in-flight requests, request batch size 8.
+- Endpoint token truncation resolved to 2048 model-context tokens.
+- HAProxy was enabled and started successfully, and all four vLLM replicas logged `vllm.v1.executor.ray_executor_v2.RayExecutorV2`.
+- End-to-end: 883.79s, 1158.02 docs/s.
+- Startup: 62.84s.
+- Post-startup service rate: `1023449 / (883.7902 - 62.8370) = 1246.65 docs/s`.
+- Ray Data stage execution time: 784.93s, or 1303.87 docs/s over the processing DAG.
+- The run emitted repeated non-fatal `httpx.AsyncClient.aclose()` cleanup warnings on closed TCP transports.
+
+The i28 direct-handle text entry succeeded:
+
+- 1,023,449 docs, 262 input files.
+- No character caps: `max_chars=null`, `endpoint_max_chars=null`.
+- `endpoint_input_format=text`, `endpoint_encoding_format=base64`, `endpoint_client_mode=ray_handle`.
+- 4 replicas, 16 handle clients, 64 concurrent requests per client, 1024 aggregate max in-flight requests, request batch size 8.
+- Endpoint token truncation resolved to 2048 model-context tokens.
+- HAProxy was enabled and started successfully, and all four vLLM replicas logged `vllm.v1.executor.ray_executor_v2.RayExecutorV2`.
+- End-to-end: 721.08s, 1419.33 docs/s.
+- Startup: 74.17s.
+- Post-startup service rate: `1023449 / (721.0789 - 74.1726) = 1582.07 docs/s`.
+- Ray Data stage execution time: 611.12s, or 1674.71 docs/s over the processing DAG.
+- Normalized endpoint embedding time across 16 handle clients: `1023449 / (9434.0826 / 16) = 1735.75 docs/s`.
+
+Current corrected Ray Serve conclusion: direct handle is the faster Ray Serve client path for both token IDs and raw text, but it is still slower than fractional Xenna, fractional Ray Data, and Dynamo batch16. Raising Docker `nofile` makes Ray Serve HTTP+HAProxy complete at the i20 pressure point, but HTTP remains much slower than direct handle. For token_ids/base64, direct handle is about 2358.18 docs/s post-startup versus HTTP at about 1100.87 docs/s. For text/base64, direct handle is about 1582.07 docs/s post-startup versus HTTP at about 1246.65 docs/s. The token_ids direct-handle path remains much faster than the text direct-handle path.
 
 Latest Dynamo text-input status:
 
@@ -462,7 +510,7 @@ Use Docker through `benchmarking/tools/run.sh`. Do not run the benchmark script 
 
 This image does not have the benchmark runner as its default Docker command, so use `run.sh --shell` and invoke `python benchmarking/run.py ...` inside the container.
 
-Last i23 launch shape:
+Last i28 launch shape:
 
 ```bash
 tmux has-session -t embedding_sota_investigation 2>/dev/null && tmux kill-session -t embedding_sota_investigation || true
@@ -472,13 +520,12 @@ source /raid/praateekm/NeMo-Curator/.venv/bin/activate
 
 export CURATOR_BENCHMARKING_IMAGE=nemo_curator_nightly_ray_256_dynamo_130_20260615:20260623
 export HOST_CURATOR_DIR=/raid/praateekm/NeMo-Curator/.worktrees/embedding-benchmarks
-export GPUS='"device=3,4,5,6"'
+export GPUS='"device=0,1,2,3"'
 
 benchmarking/tools/run.sh \
   --use-host-curator \
-  --config benchmarking/nightly-benchmark.yaml \
   --config benchmarking/local-embedding-endpoint.yaml \
-  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_ray_serve_haproxy_http_d97e3165_i23 --reason ray-serve-haproxy-http-ulimit-d97e3165-i23"
+  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_ray_serve_haproxy_handle_text_08600985_i28"
 ```
 
 If running through tmux, pipe output to:
@@ -493,7 +540,7 @@ benchmarking/embedding_sota_investigation_tmux.log
 - Docker runs as root in the current workflow. Files created by Docker root may need Docker root for cleanup.
 - Do not delete the restored historical note files.
 - Do not run unit tests while focusing on benchmark execution unless the user explicitly asks.
-- Do not push.
+- Do not push unless the user explicitly asks. The current branch has been pushed through `00619858`.
 - Make incremental commits for source/config/tracking changes.
 - Keep appending to `benchmarking/embedding_sota_tracking.md`.
 - Use the same benchmark session name so all results land under one result session.
