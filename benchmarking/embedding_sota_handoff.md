@@ -60,8 +60,11 @@ Local commits made for this investigation:
 - `7eacfdfe` - recorded fractional Ray Data result and reran Xenna.
 - `de4ab6b8` - recorded fractional Xenna result.
 - `ca31a35e` - enabled Ray 2.56 `ray-haproxy`, forced Ray Serve vLLM RayExecutorV2, and added Ray Serve direct-handle client mode.
+- `f1c2d269` - prepared first Ray Serve HAProxy HTTP and direct-handle entries.
 - `233d9e42` - avoided Ray Serve HAProxy metrics port collisions.
 - `db6443b4` - moved the HAProxy metrics wildcard bind check into the shared `get_free_port` helper via `bind_host`.
+- `1e5553e1` - prepared corrected Ray Serve HAProxy port rerun entries.
+- `4fb16baf` - fixed the Ray Serve direct-handle client to request a streaming `DeploymentResponseGenerator`.
 
 Previous agent diffs were not discarded. They were preserved in:
 
@@ -247,17 +250,38 @@ Latest fractional GPU status:
 - `embedding_generation_xenna_fracgpu_f7a9ad75_i16` is invalid/incomplete. It was killed before writing metrics; logs reached 94/262 VLLM blocks.
 - `embedding_generation_xenna_fracgpu_9453a1a9_i17` succeeded: 1,023,449 docs, 262 files, no char caps, 16 workers, 0.249 GPU per worker, vLLM `gpu_memory_utilization=0.22`, 357.20s, 2865.16 docs/s. Stage sums: VLLM stage process 3887.66s, embedding 3664.67s, tokenization 144.57s.
 
-Current intended next work:
+Latest corrected Ray Serve HAProxy status:
 
 ```bash
-run-corrected-ray-serve-haproxy-http-plus-handle
+run-corrected-ray-serve-haproxy-handle-i22
 ```
 
-Exact entries prepared in `benchmarking/local-embedding-endpoint.yaml`:
+Completed corrected HAProxy entries:
 
 ```text
 embedding_generation_ray_serve_haproxy_http_db6443b4_i20
 embedding_generation_ray_serve_haproxy_handle_db6443b4_i21
+```
+
+The i20 HTTP entry failed after startup, before throughput:
+
+- HAProxy was enabled and started successfully (`HAProxy is enabled in ServeController`; packaged `ray-haproxy` binary).
+- Endpoint was ready with 65.8s startup.
+- All four vLLM replicas used `vllm.v1.executor.ray_executor_v2.RayExecutorV2`.
+- The Ray Data client then hit OpenAI `InternalServerError`; the OpenAI ingress logged `Too many open files` from gRPC socket creation.
+- This is failure evidence for 16 HTTP clients * 64 concurrent requests = 1024 aggregate in-flight requests. Do not treat it as a throughput datapoint.
+
+The i21 direct-handle entry also failed after startup, before throughput:
+
+- HAProxy was enabled and endpoint was ready with 62.3s startup.
+- All four vLLM replicas used RayExecutorV2.
+- The benchmark script incorrectly did `async for` over `handle.embeddings.remote(request)`, which returned a non-streaming `DeploymentResponse`.
+- Commit `4fb16baf` fixed this by using `handle.options(method_name="embeddings", stream=True).remote(request)`.
+
+Exact corrected handle entry prepared in `benchmarking/local-embedding-endpoint.yaml`:
+
+```text
+embedding_generation_ray_serve_haproxy_handle_4fb16baf_i22
 ```
 
 The previous corrected Ray Serve attempts failed before throughput:
@@ -362,7 +386,7 @@ Use Docker through `benchmarking/tools/run.sh`. Do not run the benchmark script 
 
 This image does not have the benchmark runner as its default Docker command, so use `run.sh --shell` and invoke `python benchmarking/run.py ...` inside the container.
 
-Current i18/i19 launch shape:
+Current i22 launch shape:
 
 ```bash
 tmux has-session -t embedding_sota_investigation 2>/dev/null && tmux kill-session -t embedding_sota_investigation || true
@@ -378,7 +402,7 @@ benchmarking/tools/run.sh \
   --use-host-curator \
   --config benchmarking/nightly-benchmark.yaml \
   --config benchmarking/local-embedding-endpoint.yaml \
-  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_ray_serve_haproxy_http_db6443b4_i20,embedding_generation_ray_serve_haproxy_handle_db6443b4_i21 --reason ray-serve-haproxy-http-handle-db6443b4-i20-i21"
+  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_ray_serve_haproxy_handle_4fb16baf_i22 --reason ray-serve-haproxy-handle-4fb16baf-i22"
 ```
 
 If running through tmux, pipe output to:
