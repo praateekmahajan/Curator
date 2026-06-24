@@ -203,34 +203,36 @@ Current successful uncapped ranking by end-to-end benchmark throughput:
 1. Xenna in-process pretokenized vLLM: 2394.53 docs/s.
 2. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
 3. Dynamo endpoint token_ids/base64, request batch size 16: 2061.27 docs/s, including service startup.
-4. Dynamo endpoint token_ids/base64, request batch size 8: 2028.21 docs/s, including service startup.
-5. Ray Serve endpoint token_ids/base64 at aggregate concurrency 128: 913.45 docs/s, including service startup.
-6. Ray Serve endpoint token_ids/base64 at aggregate concurrency 512: 870.98 docs/s, including service startup.
+4. Dynamo endpoint token_ids/base64, request batch size 32: 2041.99 docs/s, including service startup.
+5. Dynamo endpoint token_ids/base64, request batch size 8: 2028.21 docs/s, including service startup.
+6. Ray Serve endpoint token_ids/base64 at aggregate concurrency 128: 913.45 docs/s, including service startup.
+7. Ray Serve endpoint token_ids/base64 at aggregate concurrency 512: 870.98 docs/s, including service startup.
 
 Current successful uncapped ranking by persistent-service steady-state throughput:
 
 1. Dynamo endpoint token_ids/base64, request batch size 16: about 2515.39 docs/s after excluding service startup.
-2. Dynamo endpoint token_ids/base64, request batch size 8: about 2481.61 docs/s after excluding service startup.
-3. Xenna in-process pretokenized vLLM: 2394.53 docs/s.
-4. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
-5. Ray Serve endpoint token_ids/base64 at aggregate concurrency 128: about 968.72 docs/s after excluding service startup.
-6. Ray Serve endpoint token_ids/base64 at aggregate concurrency 512: about 920.58 docs/s after excluding service startup.
+2. Dynamo endpoint token_ids/base64, request batch size 32: about 2506.17 docs/s after excluding service startup.
+3. Dynamo endpoint token_ids/base64, request batch size 8: about 2481.61 docs/s after excluding service startup.
+4. Xenna in-process pretokenized vLLM: 2394.53 docs/s.
+5. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
+6. Ray Serve endpoint token_ids/base64 at aggregate concurrency 128: about 968.72 docs/s after excluding service startup.
+7. Ray Serve endpoint token_ids/base64 at aggregate concurrency 512: about 920.58 docs/s after excluding service startup.
 
-Do not collapse these two rankings into one claim. Batch jobs pay startup; already-running services do not. The next experiment should either make Ray Serve correct under lower pressure or tune Dynamo request batch/concurrency to see whether its steady-state advantage is robust.
+Do not collapse these two rankings into one claim. Batch jobs pay startup; already-running services do not. Current endpoint tuning says Dynamo request batch size 16 is the best tested endpoint point; the next higher-value experiment is tuning the in-process winner.
 
 Current intended next run/reason:
 
 ```bash
-dynamo-tokenids-base64-batch32-24aa9d10-i9
+xenna-inprocess-pretokenized-batch64-24448ba2-i10
 ```
 
 Current exact entry:
 
 ```text
-embedding_generation_dynamo_endpoint_24aa9d10_i9
+embedding_generation_xenna_24448ba2_i10
 ```
 
-This keeps Dynamo on token_ids/base64/no char caps/model-context token truncation, 16 client tasks, 64 concurrent requests per client, and 4 replicas. It changes only `--endpoint-request-batch-size` from 16 to 32. The purpose is to test whether larger request batches continue to reduce endpoint transport overhead or start hurting due to payload size/backpressure.
+This should keep Xenna in-process vLLM on `vllm_text_pretokenized`, no character caps, 4 model workers, the same 262-file dataset slice, and change only `--model-inference-batch-size` from 32 to 64. The purpose is to test whether the current end-to-end winner can improve by better feeding each vLLM worker, or whether batch size 32 is already near the latency/throughput sweet spot.
 
 The i6 Ray Serve lower-concurrency run succeeded:
 
@@ -259,7 +261,17 @@ The i8 Dynamo request-batch-size 16 run succeeded and modestly beat the previous
 - Persistent-service steady state excluding startup: about 2515.39 docs/s.
 - `pretokenized=true`, `endpoint_pretokenized=true`, no char caps, endpoint token truncation 2048, token_ids/base64.
 
-Current Dynamo conclusion: request batch size 16 is the best tested Dynamo point and the best steady-state point overall, but still loses to Xenna for startup-inclusive batch-job throughput. Next Dynamo experiment should try request batch size 32.
+At this point, request batch size 16 was the best tested Dynamo point and the best steady-state point overall, but still lost to Xenna for startup-inclusive batch-job throughput. The i9 run below tested request batch size 32.
+
+The i9 Dynamo request-batch-size 32 run succeeded but regressed slightly:
+
+- 1,023,449 docs, 262 input files.
+- End-to-end: 501.20s, 2041.99 docs/s.
+- Startup: 92.83s.
+- Persistent-service steady state excluding startup: about 2506.17 docs/s.
+- `pretokenized=true`, `endpoint_pretokenized=true`, no char caps, endpoint token truncation 2048, token_ids/base64.
+
+Current Dynamo conclusion: request batch size 16 is the best tested Dynamo point. Batch size 32 stayed correct but was slower than 16, so larger request payload/backpressure appears to offset the reduced request count. Do not try batch size 64 unless the goal is explicitly to map the full Dynamo curve; the higher-value next step is tuning the in-process winner.
 
 ## How To Run
 
@@ -267,7 +279,7 @@ Use Docker through `benchmarking/tools/run.sh`. Do not run the benchmark script 
 
 This image does not have the benchmark runner as its default Docker command, so use `run.sh --shell` and invoke `python benchmarking/run.py ...` inside the container.
 
-Current i9 launch shape:
+Current i10 launch shape:
 
 ```bash
 tmux has-session -t embedding_sota_investigation 2>/dev/null && tmux kill-session -t embedding_sota_investigation || true
@@ -283,7 +295,7 @@ benchmarking/tools/run.sh \
   --use-host-curator \
   --config benchmarking/nightly-benchmark.yaml \
   --config benchmarking/local-embedding-endpoint.yaml \
-  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_dynamo_endpoint_24aa9d10_i9 --reason dynamo-tokenids-base64-batch32-24aa9d10-i9"
+  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_xenna_24448ba2_i10 --reason xenna-inprocess-pretokenized-batch64-24448ba2-i10"
 ```
 
 If running through tmux, pipe output to:
