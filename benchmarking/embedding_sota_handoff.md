@@ -68,6 +68,7 @@ Local commits made for this investigation:
 - `a487e4da` - prepared the corrected Ray Serve direct-handle i22 rerun entry.
 - `f8a7400c` - recorded the successful corrected Ray Serve direct-handle i22 result.
 - `d97e3165` - raised the Docker `nofile` limit in `benchmarking/tools/run.sh` to test Ray Serve HTTP without the default fd cap.
+- `e307cf23` - prepared the corrected Ray Serve HTTP i23 rerun entry using the raised Docker fd limit.
 
 Previous agent diffs were not discarded. They were preserved in:
 
@@ -217,7 +218,7 @@ The i5 endpoint rerun is complete and the tmux session was killed for hygiene:
 - Dynamo end-to-end metric: 504.61s total, 92.19s service startup, 2028.21 docs/s.
 - Dynamo steady-state pipeline rate excluding service startup: about 2481.61 docs/s.
 
-Current successful uncapped ranking by end-to-end benchmark throughput, including the corrected Ray Serve direct-handle i22 run and excluding old Ray Serve runs that did not enable HAProxy:
+Current successful uncapped ranking by end-to-end benchmark throughput, including the corrected Ray Serve direct-handle i22 run, the corrected raised-`nofile` Ray Serve HTTP i23 run, and excluding old Ray Serve runs that did not enable HAProxy:
 
 1. Xenna in-process pretokenized vLLM, 16 fractional workers at 0.249 GPU: 2865.16 docs/s.
 2. Ray Data in-process pretokenized vLLM, 16 fractional workers at 0.249 GPU: 2732.02 docs/s.
@@ -231,8 +232,9 @@ Current successful uncapped ranking by end-to-end benchmark throughput, includin
 10. Dynamo endpoint token_ids/base64, request batch size 32: 2041.99 docs/s, including service startup.
 11. Dynamo endpoint token_ids/base64, request batch size 8: 2028.21 docs/s, including service startup.
 12. Ray Serve direct handle with HAProxy enabled, token_ids/base64, request batch size 8: 2011.39 docs/s, including service startup.
+13. Ray Serve HTTP with HAProxy enabled, raised Docker `nofile`, token_ids/base64, request batch size 8: 1021.70 docs/s, including service startup.
 
-Current successful uncapped ranking by persistent-service steady-state throughput, including the corrected Ray Serve direct-handle i22 run and excluding old Ray Serve runs that did not enable HAProxy:
+Current successful uncapped ranking by persistent-service steady-state throughput, including the corrected Ray Serve direct-handle i22 run, the corrected raised-`nofile` Ray Serve HTTP i23 run, and excluding old Ray Serve runs that did not enable HAProxy:
 
 1. Xenna in-process pretokenized vLLM, 16 fractional workers at 0.249 GPU: 2865.16 docs/s.
 2. Ray Data in-process pretokenized vLLM, 16 fractional workers at 0.249 GPU: 2732.02 docs/s.
@@ -246,8 +248,9 @@ Current successful uncapped ranking by persistent-service steady-state throughpu
 10. Ray Data in-process pretokenized vLLM, inert CLI batch value 64: 2215.38 docs/s.
 11. Ray Data in-process pretokenized vLLM, inert CLI batch value 128: 2205.00 docs/s.
 12. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
+13. Ray Serve HTTP with HAProxy enabled, raised Docker `nofile`, token_ids/base64, request batch size 8: about 1100.87 docs/s after excluding service startup.
 
-Do not collapse these two rankings into one claim. Batch jobs pay startup; already-running services do not. Current endpoint tuning says Dynamo request batch size 16 is the best tested endpoint point. For in-process vLLM, do not run more `--model-inference-batch-size` sweeps unless the script first adds a real vLLM-stage batching control. Previous Ray Serve HTTP entries are diagnostic only until rerun with HAProxy enabled and verified in logs.
+Do not collapse these two rankings into one claim. Batch jobs pay startup; already-running services do not. Current endpoint tuning says Dynamo request batch size 16 is the best tested endpoint point. For in-process vLLM, do not run more `--model-inference-batch-size` sweeps unless the script first adds a real vLLM-stage batching control. Previous Ray Serve HTTP entries remain diagnostic unless their logs verify HAProxy and RayExecutorV2; i23 is the first valid corrected HTTP datapoint.
 
 Latest fractional GPU status:
 
@@ -267,11 +270,6 @@ Completed corrected HAProxy entries:
 embedding_generation_ray_serve_haproxy_http_db6443b4_i20
 embedding_generation_ray_serve_haproxy_handle_db6443b4_i21
 embedding_generation_ray_serve_haproxy_handle_4fb16baf_i22
-```
-
-Prepared next corrected HAProxy entry:
-
-```text
 embedding_generation_ray_serve_haproxy_http_d97e3165_i23
 ```
 
@@ -283,12 +281,21 @@ The i20 HTTP entry failed after startup, before throughput:
 - The Ray Data client then hit OpenAI `InternalServerError`; the OpenAI ingress logged `Too many open files` from gRPC socket creation.
 - This is failure evidence for 16 HTTP clients * 64 concurrent requests = 1024 aggregate in-flight requests. Do not treat it as a throughput datapoint.
 
-The i23 HTTP entry intentionally reruns the i20 geometry with only Docker's fd limit raised:
+The i23 HTTP entry intentionally reran the i20 geometry with only Docker's fd limit raised:
 
 - `benchmarking/tools/run.sh` passes `--ulimit nofile=1048576:1048576` to `docker run`.
+- Docker HostConfig and container PID 1 both showed `nofile=1048576`.
+- Live fd counts reached about 1552 for HAProxy and 1057 for one Serve replica, which explains why the default fd cap could fail.
 - Server/client geometry remains 4 replicas, 16 HTTP clients, 64 concurrent requests per client, 1024 aggregate max in-flight requests, request batch size 8.
 - Endpoint payload remains token_ids/base64, no character caps, model-context token truncation 2048.
-- The result is valid only if logs again prove HAProxy and RayExecutorV2, and metrics show `max_chars=null`, `endpoint_max_chars=null`, and `endpoint_client_mode=tasks`.
+- Logs proved HAProxy enabled/started and all four vLLM replicas used `vllm.v1.executor.ray_executor_v2.RayExecutorV2`.
+- Metrics confirmed `max_chars=null`, `endpoint_max_chars=null`, `endpoint_client_mode=tasks`, `pretokenized=true`, `endpoint_pretokenized=true`, 262 input files, and 1,023,449 documents.
+- End-to-end: 1001.71s, 1021.70 docs/s.
+- Startup: 72.04s.
+- Post-startup service rate: `1023449 / (1001.7103 - 72.0361) = 1100.87 docs/s`.
+- Ray Data stage execution time: 893.58s.
+- Main embedding client stage sum: 14056.81s process time, 13560.74s endpoint embedding time, 205.87s endpoint tokenization time, 128,118 endpoint requests.
+- The run emitted repeated non-fatal `httpx.AsyncClient.aclose()` cleanup warnings on closed TCP transports.
 
 The i21 direct-handle entry also failed after startup, before throughput:
 
@@ -314,7 +321,7 @@ The i22 corrected direct-handle entry succeeded:
 - Main embedding client stage sum: 6079.54s process time, 6053.78s endpoint embedding time, 180.03s endpoint tokenization time, 128,118 endpoint requests.
 - The run showed repeated Ray Serve queue-length deadline warnings from the direct-handle router. This points to Serve router/scheduler/backpressure overhead, not HTTP ingress overhead.
 
-Current corrected Ray Serve conclusion: direct handle avoids the HTTP/OpenAI ingress `Too many open files` failure and is a valid throughput datapoint, but it is still slower than fractional Xenna, fractional Ray Data, and Dynamo batch16. The next Ray Serve HTTP experiment should change exactly one pressure variable from i20, probably lower aggregate HTTP concurrency or raise fd limits.
+Current corrected Ray Serve conclusion: direct handle is the faster Ray Serve client path, but it is still slower than fractional Xenna, fractional Ray Data, and Dynamo batch16. Raising Docker `nofile` makes Ray Serve HTTP+HAProxy complete at the i20 pressure point, but HTTP remains much slower than direct handle: about 1100.87 docs/s post-startup for HTTP versus about 2358.18 docs/s post-startup for direct handle.
 
 The previous corrected Ray Serve attempts failed before throughput:
 
@@ -329,7 +336,7 @@ Ray Serve requirements before any new Ray Serve result is trusted:
 - Logs must show `HAProxy is enabled in ServeController, replacing Serve proxy with HAProxy.`
 - Logs should show the packaged HAProxy binary path or `HAProxyManager` evidence.
 - Ray Serve vLLM engine must force/verify `distributed_executor_backend="ray"` and `VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1`.
-- Previous Ray Serve endpoint results are diagnostic only because the logs showed the default Python proxy path. The i22 direct-handle result is valid because the logs verified HAProxy and RayExecutorV2, but direct-handle traffic bypasses HTTP/HAProxy on the client path.
+- Previous Ray Serve endpoint results are diagnostic only if their logs showed the default Python proxy path or failed before throughput. The i22 direct-handle result is valid because logs verified HAProxy and RayExecutorV2, but direct-handle traffic bypasses HTTP/HAProxy on the client path. The i23 HTTP result is the valid corrected HTTP datapoint because logs verified HAProxy, RayExecutorV2, and successful completion under the raised Docker fd limit.
 
 The fractional memory-utilization cap was intentional because each physical GPU hosted four vLLM engines. Without it, every vLLM worker would use the default memory reservation and likely over-reserve GPU memory.
 
@@ -418,7 +425,7 @@ Use Docker through `benchmarking/tools/run.sh`. Do not run the benchmark script 
 
 This image does not have the benchmark runner as its default Docker command, so use `run.sh --shell` and invoke `python benchmarking/run.py ...` inside the container.
 
-Current i23 launch shape:
+Last i23 launch shape:
 
 ```bash
 tmux has-session -t embedding_sota_investigation 2>/dev/null && tmux kill-session -t embedding_sota_investigation || true
