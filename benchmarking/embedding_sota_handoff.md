@@ -56,6 +56,10 @@ Local commits made for this investigation:
 - `918bd744` - recorded endpoint truncation rerun failure and next endpoint motivation.
 - `22efeee8` - prepared tokenized endpoint rerun with base64 responses.
 - `f7a9ad75` - added real fractional GPU controls for in-process vLLM embedding stages.
+- `9453a1a9` - prepared distinct Xenna fractional rerun entry.
+- `7eacfdfe` - recorded fractional Ray Data result and reran Xenna.
+- `de4ab6b8` - recorded fractional Xenna result.
+- `ca31a35e` - enabled Ray 2.56 `ray-haproxy`, forced Ray Serve vLLM RayExecutorV2, and added Ray Serve direct-handle client mode.
 
 Previous agent diffs were not discarded. They were preserved in:
 
@@ -244,14 +248,14 @@ Latest fractional GPU status:
 Current intended next work:
 
 ```bash
-fix-ray-serve-haproxy-rayexecutorv2-and-run-http-plus-handle
+run-corrected-ray-serve-haproxy-http-plus-handle
 ```
 
-Exact entries to add/run after code changes:
+Exact entries prepared in `benchmarking/local-embedding-endpoint.yaml`:
 
 ```text
-embedding_generation_ray_serve_haproxy_http_<commit>_i18
-embedding_generation_ray_serve_haproxy_handle_<commit>_i19
+embedding_generation_ray_serve_haproxy_http_ca31a35e_i18
+embedding_generation_ray_serve_haproxy_handle_ca31a35e_i19
 ```
 
 Ray Serve requirements before any new Ray Serve result is trusted:
@@ -270,7 +274,7 @@ The synthesis artifact is now:
 benchmarking/embedding_sota_conclusions.md
 ```
 
-The conclusion file records the two valid rankings: Xenna in-process pretokenized vLLM with 4 workers is the fastest tested startup-inclusive batch-job path, while Dynamo token_ids/base64 request batch 16 is the fastest tested persistent-service steady-state path. The fastest Xenna run carried `--model-inference-batch-size=32`, but that value is ignored by `VLLMEmbeddingModelStage`.
+The conclusion file records the two valid rankings: Xenna in-process pretokenized vLLM with 16 fractional workers at 0.249 GPU each is the fastest tested startup-inclusive batch-job path and also the fastest tested persistent-service steady-state path. The old `--model-inference-batch-size` sweeps remain invalid as vLLM batch-size evidence because that argument is ignored by `VLLMEmbeddingModelStage`.
 
 The i6 Ray Serve lower-concurrency run succeeded:
 
@@ -349,7 +353,7 @@ Use Docker through `benchmarking/tools/run.sh`. Do not run the benchmark script 
 
 This image does not have the benchmark runner as its default Docker command, so use `run.sh --shell` and invoke `python benchmarking/run.py ...` inside the container.
 
-Current i16 launch shape:
+Current i18/i19 launch shape:
 
 ```bash
 tmux has-session -t embedding_sota_investigation 2>/dev/null && tmux kill-session -t embedding_sota_investigation || true
@@ -365,7 +369,7 @@ benchmarking/tools/run.sh \
   --use-host-curator \
   --config benchmarking/nightly-benchmark.yaml \
   --config benchmarking/local-embedding-endpoint.yaml \
-  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_xenna_fracgpu_9453a1a9_i17 --reason fracgpu-xenna-rerun-9453a1a9-i17"
+  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_ray_serve_haproxy_http_ca31a35e_i18,embedding_generation_ray_serve_haproxy_handle_ca31a35e_i19 --reason ray-serve-haproxy-http-handle-ca31a35e-i18-i19"
 ```
 
 If running through tmux, pipe output to:
