@@ -205,63 +205,64 @@ The i5 endpoint rerun is complete and the tmux session was killed for hygiene:
 - Dynamo end-to-end metric: 504.61s total, 92.19s service startup, 2028.21 docs/s.
 - Dynamo steady-state pipeline rate excluding service startup: about 2481.61 docs/s.
 
-Current successful uncapped ranking by end-to-end benchmark throughput:
+Current successful uncapped ranking by end-to-end benchmark throughput, excluding old Ray Serve runs that did not enable HAProxy:
 
-1. Xenna in-process pretokenized vLLM: 2394.53 docs/s.
-2. Xenna in-process pretokenized vLLM, inert CLI batch value 16: 2377.21 docs/s.
-3. Xenna in-process pretokenized vLLM, inert CLI batch value 64: 2339.28 docs/s.
-4. Ray Data in-process pretokenized vLLM, inert CLI batch value 64: 2215.38 docs/s.
-5. Ray Data in-process pretokenized vLLM, inert CLI batch value 128: 2205.00 docs/s.
-6. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
-7. Dynamo endpoint token_ids/base64, request batch size 16: 2061.27 docs/s, including service startup.
-8. Dynamo endpoint token_ids/base64, request batch size 32: 2041.99 docs/s, including service startup.
-9. Dynamo endpoint token_ids/base64, request batch size 8: 2028.21 docs/s, including service startup.
-10. Ray Serve endpoint token_ids/base64 at aggregate concurrency 128: 913.45 docs/s, including service startup.
-11. Ray Serve endpoint token_ids/base64 at aggregate concurrency 512: 870.98 docs/s, including service startup.
+1. Xenna in-process pretokenized vLLM, 16 fractional workers at 0.249 GPU: 2865.16 docs/s.
+2. Ray Data in-process pretokenized vLLM, 16 fractional workers at 0.249 GPU: 2732.02 docs/s.
+3. Xenna in-process pretokenized vLLM: 2394.53 docs/s.
+4. Xenna in-process pretokenized vLLM, inert CLI batch value 16: 2377.21 docs/s.
+5. Xenna in-process pretokenized vLLM, inert CLI batch value 64: 2339.28 docs/s.
+6. Ray Data in-process pretokenized vLLM, inert CLI batch value 64: 2215.38 docs/s.
+7. Ray Data in-process pretokenized vLLM, inert CLI batch value 128: 2205.00 docs/s.
+8. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
+9. Dynamo endpoint token_ids/base64, request batch size 16: 2061.27 docs/s, including service startup.
+10. Dynamo endpoint token_ids/base64, request batch size 32: 2041.99 docs/s, including service startup.
+11. Dynamo endpoint token_ids/base64, request batch size 8: 2028.21 docs/s, including service startup.
 
-Current successful uncapped ranking by persistent-service steady-state throughput:
+Current successful uncapped ranking by persistent-service steady-state throughput, excluding old Ray Serve runs that did not enable HAProxy:
 
-1. Dynamo endpoint token_ids/base64, request batch size 16: about 2515.39 docs/s after excluding service startup.
-2. Dynamo endpoint token_ids/base64, request batch size 32: about 2506.17 docs/s after excluding service startup.
-3. Dynamo endpoint token_ids/base64, request batch size 8: about 2481.61 docs/s after excluding service startup.
-4. Xenna in-process pretokenized vLLM: 2394.53 docs/s.
-5. Xenna in-process pretokenized vLLM, inert CLI batch value 16: 2377.21 docs/s.
-6. Xenna in-process pretokenized vLLM, inert CLI batch value 64: 2339.28 docs/s.
-7. Ray Data in-process pretokenized vLLM, inert CLI batch value 64: 2215.38 docs/s.
-8. Ray Data in-process pretokenized vLLM, inert CLI batch value 128: 2205.00 docs/s.
-9. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
-10. Ray Serve endpoint token_ids/base64 at aggregate concurrency 128: about 968.72 docs/s after excluding service startup.
-11. Ray Serve endpoint token_ids/base64 at aggregate concurrency 512: about 920.58 docs/s after excluding service startup.
+1. Xenna in-process pretokenized vLLM, 16 fractional workers at 0.249 GPU: 2865.16 docs/s.
+2. Ray Data in-process pretokenized vLLM, 16 fractional workers at 0.249 GPU: 2732.02 docs/s.
+3. Dynamo endpoint token_ids/base64, request batch size 16: about 2515.39 docs/s after excluding service startup.
+4. Dynamo endpoint token_ids/base64, request batch size 32: about 2506.17 docs/s after excluding service startup.
+5. Dynamo endpoint token_ids/base64, request batch size 8: about 2481.61 docs/s after excluding service startup.
+6. Xenna in-process pretokenized vLLM: 2394.53 docs/s.
+7. Xenna in-process pretokenized vLLM, inert CLI batch value 16: 2377.21 docs/s.
+8. Xenna in-process pretokenized vLLM, inert CLI batch value 64: 2339.28 docs/s.
+9. Ray Data in-process pretokenized vLLM, inert CLI batch value 64: 2215.38 docs/s.
+10. Ray Data in-process pretokenized vLLM, inert CLI batch value 128: 2205.00 docs/s.
+11. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
 
-Do not collapse these two rankings into one claim. Batch jobs pay startup; already-running services do not. Current endpoint tuning says Dynamo request batch size 16 is the best tested endpoint point. For in-process vLLM, do not run more `--model-inference-batch-size` sweeps unless the script first adds a real vLLM-stage batching control.
+Do not collapse these two rankings into one claim. Batch jobs pay startup; already-running services do not. Current endpoint tuning says Dynamo request batch size 16 is the best tested endpoint point. For in-process vLLM, do not run more `--model-inference-batch-size` sweeps unless the script first adds a real vLLM-stage batching control. Previous Ray Serve HTTP entries are diagnostic only until rerun with HAProxy enabled and verified in logs.
 
 Latest fractional GPU status:
 
 - `embedding_generation_raydata_fracgpu_f7a9ad75_i16` succeeded: 1,023,449 docs, 262 files, no char caps, 16 workers, 0.249 GPU per worker, vLLM `gpu_memory_utilization=0.22`, 374.61s, 2732.02 docs/s.
 - `embedding_generation_xenna_fracgpu_f7a9ad75_i16` is invalid/incomplete. It was killed before writing metrics; logs reached 94/262 VLLM blocks.
+- `embedding_generation_xenna_fracgpu_9453a1a9_i17` succeeded: 1,023,449 docs, 262 files, no char caps, 16 workers, 0.249 GPU per worker, vLLM `gpu_memory_utilization=0.22`, 357.20s, 2865.16 docs/s. Stage sums: VLLM stage process 3887.66s, embedding 3664.67s, tokenization 144.57s.
 
-Current intended next run/reason:
+Current intended next work:
 
 ```bash
-fracgpu-xenna-rerun-9453a1a9-i17
+fix-ray-serve-haproxy-rayexecutorv2-and-run-http-plus-handle
 ```
 
-Exact entries:
+Exact entries to add/run after code changes:
 
 ```text
-embedding_generation_xenna_fracgpu_9453a1a9_i17
+embedding_generation_ray_serve_haproxy_http_<commit>_i18
+embedding_generation_ray_serve_haproxy_handle_<commit>_i19
 ```
 
-This run is intended to complete the missing Xenna side of the real in-process worker geometry experiment rather than the inert `--model-inference-batch-size` argument:
+Ray Serve requirements before any new Ray Serve result is trusted:
 
-- `--model-variation=vllm_text_pretokenized`
-- no `--max-chars` or `--endpoint-max-chars`
-- `--model-num-workers=16`
-- `--model-worker-gpus=0.249`
-- `--model-gpu-memory-utilization=0.22`
-- physical GPUs: `device=3,4,5,6`
+- Curator must enable Ray 2.56 HAProxy using `ray-haproxy`, not the old `haproxy` plus `socat` PATH check.
+- Logs must show `HAProxy is enabled in ServeController, replacing Serve proxy with HAProxy.`
+- Logs should show the packaged HAProxy binary path or `HAProxyManager` evidence.
+- Ray Serve vLLM engine must force/verify `distributed_executor_backend="ray"` and `VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1`.
+- Previous Ray Serve endpoint results are diagnostic only because the logs showed the default Python proxy path.
 
-The memory-utilization cap is intentional because each physical GPU should host four vLLM engines. Without it, every vLLM worker would use the default memory reservation and likely over-reserve GPU memory.
+The fractional memory-utilization cap was intentional because each physical GPU hosted four vLLM engines. Without it, every vLLM worker would use the default memory reservation and likely over-reserve GPU memory.
 
 The synthesis artifact is now:
 
