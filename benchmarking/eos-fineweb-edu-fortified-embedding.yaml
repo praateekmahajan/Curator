@@ -1,6 +1,6 @@
 paths:
   - name: "results_path"
-    host_path: "/lustre/fsw/datascience_rapids_cugraphgnn/praateekm/benchmark_results"
+    host_path: "/lustre/fsw/coreai_dlalgo_ci/curator_ci/results/main-mirror"
   - name: "datasets_path"
     host_path: "/lustre/fsw/coreai_dlalgo_ci/curator_ci/datasets"
   - name: "hf_cache_path"
@@ -35,7 +35,7 @@ entries:
     args: >-
       --benchmark-results-path={session_entry_dir}
       --input-path={dataset:fineweb_edu_fortified,parquet}
-      --output-path=/lustre/fsw/datascience_rapids_cugraphgnn/praateekm/pipeline_output/fineweb_edu_fortified_embeddinggemma_4n32g
+      --output-path=${BENCHMARK_OUTPUT_PATH}
       --executor=ray_data
       --model-identifier=google/embeddinggemma-300m
       --model-variation=vllm_text
