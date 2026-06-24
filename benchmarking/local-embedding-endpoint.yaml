@@ -24,7 +24,9 @@ sinks:
     enabled: false
 
 entries:
-  - name: embedding_generation_raydata
+  - name: embedding_generation_raydata_c7264f1c_i2
+    enabled: true
+    script: embedding_generation_benchmark.py
     args: >-
       --benchmark-results-path={session_entry_dir}
       --output-path={session_entry_dir}/scratch/output
@@ -37,9 +39,17 @@ entries:
       --model-num-workers=4
       --max-chars=1500
       --cache-dir={dataset:text_models_hf_cache,files}
+    ray:
+      num_cpus: 64
+      num_gpus: 4
     timeout_s: 1200
+    requirements:
+      - metric: throughput_docs_per_sec
+        min_value: 100
 
-  - name: embedding_generation_xenna
+  - name: embedding_generation_xenna_c7264f1c_i2
+    enabled: true
+    script: embedding_generation_benchmark.py
     args: >-
       --benchmark-results-path={session_entry_dir}
       --output-path={session_entry_dir}/scratch/output
@@ -56,8 +66,13 @@ entries:
       num_cpus: 64
       num_gpus: 4
     timeout_s: 1200
+    requirements:
+      - metric: throughput_docs_per_sec
+        min_value: 100
 
-  - name: embedding_generation_ray_serve_endpoint
+  - name: embedding_generation_ray_serve_endpoint_c7264f1c_i2
+    enabled: true
+    script: embedding_generation_benchmark.py
     args: >-
       --benchmark-results-path={session_entry_dir}
       --output-path={session_entry_dir}/scratch/output
@@ -78,9 +93,17 @@ entries:
       --endpoint-client-mode=tasks
       --endpoint-request-timeout-s=900
       --endpoint-pooler-config={}
+    ray:
+      num_cpus: 64
+      num_gpus: 4
     timeout_s: 2400
+    requirements:
+      - metric: throughput_docs_per_sec
+        min_value: 100
 
-  - name: embedding_generation_dynamo_endpoint
+  - name: embedding_generation_dynamo_endpoint_c7264f1c_i2
+    enabled: true
+    script: embedding_generation_benchmark.py
     args: >-
       --benchmark-results-path={session_entry_dir}
       --output-path={session_entry_dir}/scratch/output
@@ -101,4 +124,10 @@ entries:
       --endpoint-client-mode=tasks
       --endpoint-request-timeout-s=900
       --endpoint-pooler-config={}
+    ray:
+      num_cpus: 64
+      num_gpus: 4
     timeout_s: 1800
+    requirements:
+      - metric: throughput_docs_per_sec
+        min_value: 100
