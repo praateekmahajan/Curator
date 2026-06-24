@@ -60,6 +60,8 @@ Local commits made for this investigation:
 - `7eacfdfe` - recorded fractional Ray Data result and reran Xenna.
 - `de4ab6b8` - recorded fractional Xenna result.
 - `ca31a35e` - enabled Ray 2.56 `ray-haproxy`, forced Ray Serve vLLM RayExecutorV2, and added Ray Serve direct-handle client mode.
+- `233d9e42` - avoided Ray Serve HAProxy metrics port collisions.
+- `db6443b4` - moved the HAProxy metrics wildcard bind check into the shared `get_free_port` helper via `bind_host`.
 
 Previous agent diffs were not discarded. They were preserved in:
 
@@ -254,9 +256,16 @@ run-corrected-ray-serve-haproxy-http-plus-handle
 Exact entries prepared in `benchmarking/local-embedding-endpoint.yaml`:
 
 ```text
-embedding_generation_ray_serve_haproxy_http_ca31a35e_i18
-embedding_generation_ray_serve_haproxy_handle_ca31a35e_i19
+embedding_generation_ray_serve_haproxy_http_db6443b4_i20
+embedding_generation_ray_serve_haproxy_handle_db6443b4_i21
 ```
+
+The previous corrected Ray Serve attempts failed before throughput:
+
+- `embedding_generation_ray_serve_haproxy_http_ca31a35e_i18`
+- `embedding_generation_ray_serve_haproxy_handle_ca31a35e_i19`
+
+Both logs proved HAProxy enablement (`HAProxy is enabled in ServeController`, `Using HAProxy binary`) but HAProxy crashed because its metrics/stats frontend could not bind `0.0.0.0:9102`. No vLLM RayExecutorV2 class evidence was possible because replicas never became healthy.
 
 Ray Serve requirements before any new Ray Serve result is trusted:
 
@@ -369,7 +378,7 @@ benchmarking/tools/run.sh \
   --use-host-curator \
   --config benchmarking/nightly-benchmark.yaml \
   --config benchmarking/local-embedding-endpoint.yaml \
-  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_ray_serve_haproxy_http_ca31a35e_i18,embedding_generation_ray_serve_haproxy_handle_ca31a35e_i19 --reason ray-serve-haproxy-http-handle-ca31a35e-i18-i19"
+  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_ray_serve_haproxy_http_db6443b4_i20,embedding_generation_ray_serve_haproxy_handle_db6443b4_i21 --reason ray-serve-haproxy-http-handle-db6443b4-i20-i21"
 ```
 
 If running through tmux, pipe output to:
