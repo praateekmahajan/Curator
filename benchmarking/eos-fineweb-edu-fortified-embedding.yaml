@@ -9,7 +9,7 @@ paths:
 gpu_stats_recorder:
   interval_s: 5.0
 
-object_store_size: 536870912000  # 500 GiB per Ray node
+object_store_size: "default"  # Let ray start choose per-node object store sizing.
 delete_scratch: false
 default_timeout_s: 14000
 
