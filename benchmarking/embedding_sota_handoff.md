@@ -49,6 +49,7 @@ Local commits made for this investigation:
 - `a2418640` - single-YAML corrected baseline entries for run `i=2`.
 - `c6af206b` - durable handoff context.
 - `517cdd10` - recorded directional capped Ray Data result.
+- `f5eaed3c` - uncapped, pretokenized baseline enforcement.
 
 Previous agent diffs were not discarded. They were preserved in:
 
@@ -133,10 +134,10 @@ uncapped-pretokenized-baseline-i3
 Current exact entries:
 
 ```text
-embedding_generation_raydata_517cdd10_i3
-embedding_generation_xenna_517cdd10_i3
-embedding_generation_ray_serve_endpoint_517cdd10_i3
-embedding_generation_dynamo_endpoint_517cdd10_i3
+embedding_generation_raydata_f5eaed3c_i3
+embedding_generation_xenna_f5eaed3c_i3
+embedding_generation_ray_serve_endpoint_f5eaed3c_i3
+embedding_generation_dynamo_endpoint_f5eaed3c_i3
 ```
 
 Shared baseline shape:
@@ -179,7 +180,7 @@ benchmarking/tools/run.sh \
   --use-host-curator \
   --config benchmarking/nightly-benchmark.yaml \
   --config benchmarking/local-embedding-endpoint.yaml \
-  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_raydata_517cdd10_i3,embedding_generation_xenna_517cdd10_i3,embedding_generation_ray_serve_endpoint_517cdd10_i3,embedding_generation_dynamo_endpoint_517cdd10_i3 --reason uncapped-pretokenized-baseline-i3"
+  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_raydata_f5eaed3c_i3,embedding_generation_xenna_f5eaed3c_i3,embedding_generation_ray_serve_endpoint_f5eaed3c_i3,embedding_generation_dynamo_endpoint_f5eaed3c_i3 --reason uncapped-pretokenized-baseline-i3"
 ```
 
 If running through tmux, pipe output to:
