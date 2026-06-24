@@ -50,6 +50,8 @@ Local commits made for this investigation:
 - `c6af206b` - durable handoff context.
 - `517cdd10` - recorded directional capped Ray Data result.
 - `f5eaed3c` - uncapped, pretokenized baseline enforcement.
+- `2fc98b70` - recorded uncapped Ray Data in-process result.
+- `48c6b49f` - recorded uncapped Xenna in-process result.
 
 Previous agent diffs were not discarded. They were preserved in:
 
@@ -125,19 +127,32 @@ It produced directional, non-final results only:
 
 It was stopped before endpoint entries because character caps are not representative of real embedding workloads.
 
+The first uncapped run was:
+
+```bash
+uncapped-pretokenized-baseline-f5eaed3c-i3
+```
+
+It produced:
+
+- Ray Data in-process pretokenized: 1,023,449 docs, 262 input files, no char caps, 2150.33 docs/s.
+- Xenna in-process pretokenized: 1,023,449 docs, 262 input files, no char caps, 2394.53 docs/s.
+- Ray Serve endpoint failed because vLLM rejected prompts over the 2048-token model context when `truncate_prompt_tokens` was omitted.
+- Dynamo endpoint failed with `Failed to fold embeddings stream`, consistent with endpoint text mode not safely handling over-context uncapped prompts.
+
+The benchmark script has since been changed so endpoint `truncate_prompt_tokens <= 0` resolves to the model context length by default. This keeps no character cap while matching in-process pretokenized model-context token truncation.
+
 Current intended run/reason:
 
 ```bash
-uncapped-pretokenized-baseline-i3
+uncapped-endpoint-model-context-truncation-i4
 ```
 
 Current exact entries:
 
 ```text
-embedding_generation_raydata_f5eaed3c_i3
-embedding_generation_xenna_f5eaed3c_i3
-embedding_generation_ray_serve_endpoint_f5eaed3c_i3
-embedding_generation_dynamo_endpoint_f5eaed3c_i3
+embedding_generation_ray_serve_endpoint_48c6b49f_i4
+embedding_generation_dynamo_endpoint_48c6b49f_i4
 ```
 
 Shared baseline shape:
@@ -156,7 +171,7 @@ Shared baseline shape:
 - Endpoint max concurrent requests per client: 64
 - Endpoint request batch size: 8
 - No benchmark-side character cap. Do not set `--max-chars` or `--endpoint-max-chars` unless the entry name and tracking row explicitly say the experiment is char-capped.
-- No artificial endpoint token cap. Let vLLM/model context length handle prompt truncation unless the experiment intentionally varies `truncate_prompt_tokens`.
+- Endpoint token truncation defaults to the model context length. This is not a character cap; it is required because Ray Serve's vLLM OpenAI text path otherwise rejects over-context prompts instead of truncating them automatically.
 
 ## How To Run
 
@@ -180,7 +195,7 @@ benchmarking/tools/run.sh \
   --use-host-curator \
   --config benchmarking/nightly-benchmark.yaml \
   --config benchmarking/local-embedding-endpoint.yaml \
-  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_raydata_f5eaed3c_i3,embedding_generation_xenna_f5eaed3c_i3,embedding_generation_ray_serve_endpoint_f5eaed3c_i3,embedding_generation_dynamo_endpoint_f5eaed3c_i3 --reason uncapped-pretokenized-baseline-i3"
+  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_ray_serve_endpoint_48c6b49f_i4,embedding_generation_dynamo_endpoint_48c6b49f_i4 --reason uncapped-endpoint-model-context-truncation-i4"
 ```
 
 If running through tmux, pipe output to:
@@ -211,6 +226,7 @@ The benchmark script should enforce:
 - Endpoint response indexes are present, unique, and contiguous for each request.
 - In-process paths use `vllm_text_pretokenized`.
 - In-process and endpoint paths avoid benchmark-side character truncation unless the experiment intentionally studies a character cap.
+- Endpoint text paths use model-context token truncation by default, because the OpenAI-compatible vLLM endpoint does not automatically truncate over-context raw text.
 - Dynamo returns fixed-size pooled embeddings, not token-level variable-length embeddings.
 - Metrics include enough context to explain throughput: number of input files, number of documents, text cap, endpoint concurrency, request batch size, response encoding, and startup time when applicable.
 

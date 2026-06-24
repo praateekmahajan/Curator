@@ -630,6 +630,17 @@ def _create_endpoint_embedding_stage(
     )
 
 
+def _effective_endpoint_truncate_prompt_tokens(
+    requested_truncate_prompt_tokens: int | None,
+    max_seq_length: int,
+) -> int | None:
+    if requested_truncate_prompt_tokens is None:
+        return None
+    if requested_truncate_prompt_tokens <= 0:
+        return max_seq_length
+    return requested_truncate_prompt_tokens
+
+
 def _read_ray_num_cpus(benchmark_results_path: str | Path | None) -> int | None:
     if benchmark_results_path is None:
         return None
@@ -745,6 +756,10 @@ def run_embedding_generation_benchmark(  # noqa: PLR0915
     endpoint_effective_client_workers = client_num_workers
     endpoint_total_max_concurrent_requests = client_num_workers * endpoint_max_concurrent_requests
     effective_endpoint_max_chars = endpoint_max_chars if endpoint_max_chars is not None else max_chars
+    effective_endpoint_truncate_prompt_tokens = _effective_endpoint_truncate_prompt_tokens(
+        endpoint_truncate_prompt_tokens,
+        max_seq_length,
+    )
     if variation in {EmbeddingModelVariation.RAY_SERVE_ENDPOINT, EmbeddingModelVariation.DYNAMO_ENDPOINT}:
         pooler_config = json_loads_arg(endpoint_pooler_config, "--endpoint-pooler-config")
         resolved_endpoint_model_path = _resolve_endpoint_model_path(model_identifier, cache_dir, endpoint_model_path)
@@ -762,7 +777,8 @@ def run_embedding_generation_benchmark(  # noqa: PLR0915
         logger.info(f"Endpoint effective client workers estimate: {endpoint_effective_client_workers}")
         logger.info(f"Endpoint client max concurrent requests per worker: {endpoint_max_concurrent_requests}")
         logger.info(f"Endpoint aggregate max concurrent requests: {endpoint_total_max_concurrent_requests}")
-        logger.info(f"Endpoint truncate_prompt_tokens: {endpoint_truncate_prompt_tokens}")
+        logger.info(f"Endpoint requested truncate_prompt_tokens: {endpoint_truncate_prompt_tokens}")
+        logger.info(f"Endpoint effective truncate_prompt_tokens: {effective_endpoint_truncate_prompt_tokens}")
         logger.info(f"Endpoint input format: {endpoint_input_format}")
         logger.info(f"Endpoint request batch size: {endpoint_request_batch_size}")
         logger.info(f"Endpoint encoding format: {endpoint_encoding_format}")
@@ -796,7 +812,7 @@ def run_embedding_generation_benchmark(  # noqa: PLR0915
                 endpoint_request_timeout_s=endpoint_request_timeout_s,
                 endpoint_max_retries=endpoint_max_retries,
                 endpoint_retry_base_delay_s=endpoint_retry_base_delay_s,
-                endpoint_truncate_prompt_tokens=endpoint_truncate_prompt_tokens,
+                endpoint_truncate_prompt_tokens=effective_endpoint_truncate_prompt_tokens,
                 endpoint_input_format=endpoint_input_format,
                 endpoint_request_batch_size=endpoint_request_batch_size,
                 endpoint_encoding_format=endpoint_encoding_format,
@@ -850,7 +866,8 @@ def run_embedding_generation_benchmark(  # noqa: PLR0915
             "endpoint_effective_client_workers": endpoint_effective_client_workers,
             "endpoint_max_concurrent_requests_per_worker": endpoint_max_concurrent_requests,
             "endpoint_total_max_concurrent_requests": endpoint_total_max_concurrent_requests,
-            "endpoint_truncate_prompt_tokens": endpoint_truncate_prompt_tokens,
+            "endpoint_requested_truncate_prompt_tokens": endpoint_truncate_prompt_tokens,
+            "endpoint_truncate_prompt_tokens": effective_endpoint_truncate_prompt_tokens,
             "endpoint_input_format": endpoint_input_format,
             "endpoint_request_batch_size": endpoint_request_batch_size,
             "endpoint_encoding_format": endpoint_encoding_format,
@@ -874,7 +891,8 @@ def run_embedding_generation_benchmark(  # noqa: PLR0915
             "endpoint_effective_client_workers": endpoint_effective_client_workers,
             "endpoint_max_concurrent_requests_per_worker": endpoint_max_concurrent_requests,
             "endpoint_total_max_concurrent_requests": endpoint_total_max_concurrent_requests,
-            "endpoint_truncate_prompt_tokens": endpoint_truncate_prompt_tokens,
+            "endpoint_requested_truncate_prompt_tokens": endpoint_truncate_prompt_tokens,
+            "endpoint_truncate_prompt_tokens": effective_endpoint_truncate_prompt_tokens,
             "endpoint_input_format": endpoint_input_format,
             "endpoint_request_batch_size": endpoint_request_batch_size,
             "endpoint_encoding_format": endpoint_encoding_format,
@@ -1012,7 +1030,7 @@ def main() -> int:
         default=-1,
         help=(
             "vLLM truncate_prompt_tokens value passed through OpenAI extra_body for endpoint embeddings; "
-            "use 'none' to omit the extra_body field"
+            "non-positive values use the model context length, and 'none' omits the extra_body field"
         ),
     )
     parser.add_argument(

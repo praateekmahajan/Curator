@@ -68,7 +68,7 @@ entries:
       - metric: throughput_docs_per_sec
         min_value: 100
 
-  - name: embedding_generation_ray_serve_endpoint_f5eaed3c_i3
+  - name: embedding_generation_ray_serve_endpoint_48c6b49f_i4
     enabled: true
     script: embedding_generation_benchmark.py
     args: >-
@@ -97,7 +97,7 @@ entries:
       - metric: throughput_docs_per_sec
         min_value: 100
 
-  - name: embedding_generation_dynamo_endpoint_f5eaed3c_i3
+  - name: embedding_generation_dynamo_endpoint_48c6b49f_i4
     enabled: true
     script: embedding_generation_benchmark.py
     args: >-
