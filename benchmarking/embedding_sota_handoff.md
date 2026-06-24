@@ -158,13 +158,13 @@ It failed:
 
 The next endpoint experiment used client-side pretokenized `token_ids` plus base64 responses, with no character cap.
 
-Current intended run/reason:
+Completed i5 run/reason:
 
 ```bash
 uncapped-endpoint-tokenids-base64-i5
 ```
 
-Current exact entries:
+Completed i5 exact entries:
 
 ```text
 embedding_generation_ray_serve_endpoint_918bd744_i5
@@ -212,13 +212,27 @@ Current successful uncapped ranking by persistent-service steady-state throughpu
 
 Do not collapse these two rankings into one claim. Batch jobs pay startup; already-running services do not. The next experiment should either make Ray Serve correct under lower pressure or tune Dynamo request batch/concurrency to see whether its steady-state advantage is robust.
 
+Current intended next run/reason:
+
+```bash
+rayserve-tokenids-base64-lower-concurrency-a0d40d09-i6
+```
+
+Current exact entry:
+
+```text
+embedding_generation_ray_serve_endpoint_a0d40d09_i6
+```
+
+This keeps Ray Serve on token_ids/base64/no char caps/model-context token truncation and changes only per-client concurrent requests from 64 to 8, reducing aggregate max HTTP requests from 1024 to 128. The purpose is to test whether Ray Serve's i5 `EndOfStream` / `No response returned` / client `ReadError` is caused by excessive HTTP transport pressure rather than embedding semantics.
+
 ## How To Run
 
 Use Docker through `benchmarking/tools/run.sh`. Do not run the benchmark script directly on bare metal.
 
 This image does not have the benchmark runner as its default Docker command, so use `run.sh --shell` and invoke `python benchmarking/run.py ...` inside the container.
 
-Current launch shape:
+Current i6 launch shape:
 
 ```bash
 tmux has-session -t embedding_sota_investigation 2>/dev/null && tmux kill-session -t embedding_sota_investigation || true
@@ -234,7 +248,7 @@ benchmarking/tools/run.sh \
   --use-host-curator \
   --config benchmarking/nightly-benchmark.yaml \
   --config benchmarking/local-embedding-endpoint.yaml \
-  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_ray_serve_endpoint_918bd744_i5,embedding_generation_dynamo_endpoint_918bd744_i5 --reason uncapped-endpoint-tokenids-base64-i5"
+  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_ray_serve_endpoint_a0d40d09_i6 --reason rayserve-tokenids-base64-lower-concurrency-a0d40d09-i6"
 ```
 
 If running through tmux, pipe output to:
