@@ -55,6 +55,7 @@ Local commits made for this investigation:
 - `1157f44f` - endpoint text requests default to model-context token truncation.
 - `918bd744` - recorded endpoint truncation rerun failure and next endpoint motivation.
 - `22efeee8` - prepared tokenized endpoint rerun with base64 responses.
+- `f7a9ad75` - added real fractional GPU controls for in-process vLLM embedding stages.
 
 Previous agent diffs were not discarded. They were preserved in:
 
@@ -237,16 +238,26 @@ Do not collapse these two rankings into one claim. Batch jobs pay startup; alrea
 Current intended next run/reason:
 
 ```bash
-none-final-synthesis
+fracgpu-inprocess-pretokenized-f7a9ad75-i16
 ```
 
-Current exact entry:
+Exact entries:
 
 ```text
-none
+embedding_generation_raydata_fracgpu_f7a9ad75_i16
+embedding_generation_xenna_fracgpu_f7a9ad75_i16
 ```
 
-No active benchmark is running. The next task is to synthesize the evidence-backed ranking and explanation. If more experimentation is requested later, useful lower-priority follow-ups are Ray Serve direct-handle/no-HTTP serving and fractional or more in-process vLLM actors per GPU. Do not run more Ray Data or Xenna `--model-inference-batch-size` sweeps for vLLM unless the script first adds a real vLLM-stage batching control.
+This run is intended to test real in-process worker geometry rather than the inert `--model-inference-batch-size` argument:
+
+- `--model-variation=vllm_text_pretokenized`
+- no `--max-chars` or `--endpoint-max-chars`
+- `--model-num-workers=16`
+- `--model-worker-gpus=0.249`
+- `--model-gpu-memory-utilization=0.22`
+- physical GPUs: `device=3,4,5,6`
+
+The memory-utilization cap is intentional because each physical GPU should host four vLLM engines. Without it, every vLLM worker would use the default memory reservation and likely over-reserve GPU memory.
 
 The synthesis artifact is now:
 
@@ -333,7 +344,7 @@ Use Docker through `benchmarking/tools/run.sh`. Do not run the benchmark script 
 
 This image does not have the benchmark runner as its default Docker command, so use `run.sh --shell` and invoke `python benchmarking/run.py ...` inside the container.
 
-Last completed i13 launch shape:
+Current i16 launch shape:
 
 ```bash
 tmux has-session -t embedding_sota_investigation 2>/dev/null && tmux kill-session -t embedding_sota_investigation || true
@@ -349,7 +360,7 @@ benchmarking/tools/run.sh \
   --use-host-curator \
   --config benchmarking/nightly-benchmark.yaml \
   --config benchmarking/local-embedding-endpoint.yaml \
-  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_raydata_94b480ce_i13 --reason raydata-inprocess-pretokenized-batch128-94b480ce-i13"
+  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_raydata_fracgpu_f7a9ad75_i16,embedding_generation_xenna_fracgpu_f7a9ad75_i16 --reason fracgpu-inprocess-pretokenized-f7a9ad75-i16"
 ```
 
 If running through tmux, pipe output to:
