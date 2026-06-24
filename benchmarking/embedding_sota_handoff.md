@@ -2,7 +2,7 @@
 
 Date: 2026-06-24
 
-This is the canonical restart context for the embedding generation SOTA investigation. If the conversation compacts, read this file first, then `benchmarking/embedding_sota_tracking.md`, then the two historical note files listed below.
+This is the canonical restart context for the embedding generation SOTA investigation. If the conversation compacts, read this file first, then `benchmarking/embedding_sota_conclusions.md`, then `benchmarking/embedding_sota_tracking.md`, then the two historical note files listed below.
 
 ## Goal
 
@@ -87,6 +87,12 @@ Tracking file:
 
 ```bash
 benchmarking/embedding_sota_tracking.md
+```
+
+Conclusion file:
+
+```bash
+benchmarking/embedding_sota_conclusions.md
 ```
 
 Tmux log for the current run:
@@ -242,6 +248,14 @@ none
 
 No active benchmark is running. The next task is to synthesize the evidence-backed ranking and explanation. If more experimentation is requested later, useful lower-priority follow-ups are Ray Serve direct-handle/no-HTTP serving, fractional or more in-process vLLM actors per GPU, and a Ray Data batch-size midpoint around 96 only if we need a more precise Ray Data curve.
 
+The synthesis artifact is now:
+
+```bash
+benchmarking/embedding_sota_conclusions.md
+```
+
+The conclusion file records the two valid rankings: Xenna in-process pretokenized vLLM batch 32 is the fastest tested startup-inclusive batch-job path, while Dynamo token_ids/base64 request batch 16 is the fastest tested persistent-service steady-state path.
+
 The i6 Ray Serve lower-concurrency run succeeded:
 
 - 1,023,449 docs, 262 input files.
@@ -359,6 +373,7 @@ benchmarking/embedding_sota_investigation_tmux.log
 - Do not use benchmark-side character caps unless that is the explicit experiment motivation.
 - Latest Docker validation before i9 confirmed the single YAML has pretokenized in-process entries, token_ids endpoint entries, and no character caps; the script still has the pretokenized default/guard and the Curator vLLM stage token-ID path.
 - Latest Docker validation after i13 used `benchmarking/tools/run.sh --shell` with `GPUS=none` and confirmed both active in-process entries are `vllm_text_pretokenized`, no active YAML entry sets `--max-chars` or `--endpoint-max-chars`, and the script still defaults to `vllm_text_pretokenized` with raw `vllm_text` guarded behind `--allow-raw-inprocess-vllm`.
+- Latest Docker validation after adding the conclusion file used `benchmarking/tools/run.sh --shell` with `GPUS=none` and confirmed the 11 ranked results match raw `metrics.json`/`results.json`, all ranked runs have 1,023,449 docs and 262 input files, no ranked run has character caps, and the active YAML still has no character caps with pretokenized in-process entries.
 
 ## Correctness Requirements
 
