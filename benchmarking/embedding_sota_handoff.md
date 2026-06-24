@@ -203,12 +203,14 @@ Current successful uncapped ranking by end-to-end benchmark throughput:
 1. Xenna in-process pretokenized vLLM: 2394.53 docs/s.
 2. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
 3. Dynamo endpoint token_ids/base64: 2028.21 docs/s, including service startup.
+4. Ray Serve endpoint token_ids/base64 at aggregate concurrency 128: 913.45 docs/s, including service startup.
 
 Current successful uncapped ranking by persistent-service steady-state throughput:
 
 1. Dynamo endpoint token_ids/base64: about 2481.61 docs/s after excluding service startup.
 2. Xenna in-process pretokenized vLLM: 2394.53 docs/s.
 3. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
+4. Ray Serve endpoint token_ids/base64 at aggregate concurrency 128: about 968.72 docs/s after excluding service startup.
 
 Do not collapse these two rankings into one claim. Batch jobs pay startup; already-running services do not. The next experiment should either make Ray Serve correct under lower pressure or tune Dynamo request batch/concurrency to see whether its steady-state advantage is robust.
 
@@ -225,6 +227,16 @@ embedding_generation_ray_serve_endpoint_a0d40d09_i6
 ```
 
 This keeps Ray Serve on token_ids/base64/no char caps/model-context token truncation and changes only per-client concurrent requests from 64 to 8, reducing aggregate max HTTP requests from 1024 to 128. The purpose is to test whether Ray Serve's i5 `EndOfStream` / `No response returned` / client `ReadError` is caused by excessive HTTP transport pressure rather than embedding semantics.
+
+The i6 Ray Serve lower-concurrency run succeeded:
+
+- 1,023,449 docs, 262 input files.
+- End-to-end: 1120.43s, 913.45 docs/s.
+- Startup: 63.94s.
+- Persistent-service steady state excluding startup: about 968.72 docs/s.
+- `pretokenized=true`, `endpoint_pretokenized=true`, no char caps, endpoint token truncation 2048, token_ids/base64.
+
+This confirms Ray Serve is correct at aggregate concurrency 128 but much slower than current in-process and Dynamo runs. The next Ray Serve experiment should sweep concurrency upward, changing only `--endpoint-max-concurrent-requests`.
 
 ## How To Run
 
