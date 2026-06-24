@@ -186,7 +186,7 @@ Shared baseline shape:
 - GPUs: `device=3,4,5,6`
 - CPUs: 64
 - In-process workers/replicas: 4
-- In-process batch size: 32
+- In-process `--model-inference-batch-size`: present in some entry args but ignored by `VLLMEmbeddingModelStage`; do not treat it as vLLM batch-size tuning evidence.
 - In-process model variation: `vllm_text_pretokenized`.
 - Endpoint replicas: 4
 - Endpoint client workers: 16
@@ -207,10 +207,10 @@ The i5 endpoint rerun is complete and the tmux session was killed for hygiene:
 Current successful uncapped ranking by end-to-end benchmark throughput:
 
 1. Xenna in-process pretokenized vLLM: 2394.53 docs/s.
-2. Xenna in-process pretokenized vLLM, batch size 16: 2377.21 docs/s.
-3. Xenna in-process pretokenized vLLM, batch size 64: 2339.28 docs/s.
-4. Ray Data in-process pretokenized vLLM, batch size 64: 2215.38 docs/s.
-5. Ray Data in-process pretokenized vLLM, batch size 128: 2205.00 docs/s.
+2. Xenna in-process pretokenized vLLM, inert CLI batch value 16: 2377.21 docs/s.
+3. Xenna in-process pretokenized vLLM, inert CLI batch value 64: 2339.28 docs/s.
+4. Ray Data in-process pretokenized vLLM, inert CLI batch value 64: 2215.38 docs/s.
+5. Ray Data in-process pretokenized vLLM, inert CLI batch value 128: 2205.00 docs/s.
 6. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
 7. Dynamo endpoint token_ids/base64, request batch size 16: 2061.27 docs/s, including service startup.
 8. Dynamo endpoint token_ids/base64, request batch size 32: 2041.99 docs/s, including service startup.
@@ -224,15 +224,15 @@ Current successful uncapped ranking by persistent-service steady-state throughpu
 2. Dynamo endpoint token_ids/base64, request batch size 32: about 2506.17 docs/s after excluding service startup.
 3. Dynamo endpoint token_ids/base64, request batch size 8: about 2481.61 docs/s after excluding service startup.
 4. Xenna in-process pretokenized vLLM: 2394.53 docs/s.
-5. Xenna in-process pretokenized vLLM, batch size 16: 2377.21 docs/s.
-6. Xenna in-process pretokenized vLLM, batch size 64: 2339.28 docs/s.
-7. Ray Data in-process pretokenized vLLM, batch size 64: 2215.38 docs/s.
-8. Ray Data in-process pretokenized vLLM, batch size 128: 2205.00 docs/s.
+5. Xenna in-process pretokenized vLLM, inert CLI batch value 16: 2377.21 docs/s.
+6. Xenna in-process pretokenized vLLM, inert CLI batch value 64: 2339.28 docs/s.
+7. Ray Data in-process pretokenized vLLM, inert CLI batch value 64: 2215.38 docs/s.
+8. Ray Data in-process pretokenized vLLM, inert CLI batch value 128: 2205.00 docs/s.
 9. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
 10. Ray Serve endpoint token_ids/base64 at aggregate concurrency 128: about 968.72 docs/s after excluding service startup.
 11. Ray Serve endpoint token_ids/base64 at aggregate concurrency 512: about 920.58 docs/s after excluding service startup.
 
-Do not collapse these two rankings into one claim. Batch jobs pay startup; already-running services do not. Current endpoint tuning says Dynamo request batch size 16 is the best tested endpoint point; the next higher-value experiment is tuning the in-process winner.
+Do not collapse these two rankings into one claim. Batch jobs pay startup; already-running services do not. Current endpoint tuning says Dynamo request batch size 16 is the best tested endpoint point. For in-process vLLM, do not run more `--model-inference-batch-size` sweeps unless the script first adds a real vLLM-stage batching control.
 
 Current intended next run/reason:
 
@@ -246,7 +246,7 @@ Current exact entry:
 none
 ```
 
-No active benchmark is running. The next task is to synthesize the evidence-backed ranking and explanation. If more experimentation is requested later, useful lower-priority follow-ups are Ray Serve direct-handle/no-HTTP serving, fractional or more in-process vLLM actors per GPU, and a Ray Data batch-size midpoint around 96 only if we need a more precise Ray Data curve.
+No active benchmark is running. The next task is to synthesize the evidence-backed ranking and explanation. If more experimentation is requested later, useful lower-priority follow-ups are Ray Serve direct-handle/no-HTTP serving and fractional or more in-process vLLM actors per GPU. Do not run more Ray Data or Xenna `--model-inference-batch-size` sweeps for vLLM unless the script first adds a real vLLM-stage batching control.
 
 The synthesis artifact is now:
 
@@ -254,7 +254,7 @@ The synthesis artifact is now:
 benchmarking/embedding_sota_conclusions.md
 ```
 
-The conclusion file records the two valid rankings: Xenna in-process pretokenized vLLM batch 32 is the fastest tested startup-inclusive batch-job path, while Dynamo token_ids/base64 request batch 16 is the fastest tested persistent-service steady-state path.
+The conclusion file records the two valid rankings: Xenna in-process pretokenized vLLM with 4 workers is the fastest tested startup-inclusive batch-job path, while Dynamo token_ids/base64 request batch 16 is the fastest tested persistent-service steady-state path. The fastest Xenna run carried `--model-inference-batch-size=32`, but that value is ignored by `VLLMEmbeddingModelStage`.
 
 The i6 Ray Serve lower-concurrency run succeeded:
 
@@ -295,37 +295,37 @@ The i9 Dynamo request-batch-size 32 run succeeded but regressed slightly:
 
 Current Dynamo conclusion: request batch size 16 is the best tested Dynamo point. Batch size 32 stayed correct but was slower than 16, so larger request payload/backpressure appears to offset the reduced request count. Do not try batch size 64 unless the goal is explicitly to map the full Dynamo curve; the higher-value next step is tuning the in-process winner.
 
-The i10 Xenna in-process batch-size 64 run succeeded but regressed:
+The i10 Xenna in-process run with inert CLI batch value 64 succeeded:
 
 - 1,023,449 docs, 262 input files.
 - End-to-end: 437.51s, 2339.28 docs/s.
 - `pretokenized=true`, no char caps, in-process `vllm_text_pretokenized`.
 
-Current Xenna conclusion: batch size 32 is still the best tested startup-inclusive in-process point. Batch size 64 is correct but slower, so the next check is batch size 16 to see whether the optimum is below 32 or whether 32 is the local sweet spot.
+Current corrected Xenna conclusion: the run was correct, but it does not show that vLLM batch size 64 is slower because `--model-inference-batch-size` is ignored by `VLLMEmbeddingModelStage`.
 
-The i11 Xenna in-process batch-size 16 run succeeded but was also slower than batch size 32:
+The i11 Xenna in-process run with inert CLI batch value 16 succeeded:
 
 - 1,023,449 docs, 262 input files.
 - End-to-end: 430.52s, 2377.21 docs/s.
 - `pretokenized=true`, no char caps, in-process `vllm_text_pretokenized`.
 
-Current Xenna conclusion: tested batch sizes bracket the optimum at 32: batch 16 < batch 32 > batch 64. The next ranking risk is Ray Data, whose baseline may be undertuned.
+Current corrected Xenna conclusion: the fastest observed Xenna run is still the i3 run at 2394.53 docs/s, but the batch-size bracketing claim is invalid. Treat i3/i10/i11 as repeated Xenna in-process measurements under the same effective vLLM stage configuration.
 
-The i12 Ray Data in-process batch-size 64 run succeeded and improved over Ray Data batch size 32, but remained behind Xenna:
+The i12 Ray Data in-process run with inert CLI batch value 64 succeeded and remained behind Xenna:
 
 - 1,023,449 docs, 262 input files.
 - End-to-end: 461.97s, 2215.38 docs/s.
 - `pretokenized=true`, no char caps, in-process `vllm_text_pretokenized`.
 
-Current Ray Data conclusion: batch size 64 improves Ray Data from 2150.33 to 2215.38 docs/s, but still trails Xenna batch size 32 by about 7.5%. Since the direction improved, test batch size 128 before calling the remaining gap executor-level.
+Current corrected Ray Data conclusion: the run does not prove that vLLM batch size 64 improves Ray Data. It is another Ray Data in-process measurement with the same effective vLLM stage configuration.
 
-The i13 Ray Data in-process batch-size 128 run succeeded but regressed slightly from batch size 64:
+The i13 Ray Data in-process run with inert CLI batch value 128 succeeded:
 
 - 1,023,449 docs, 262 input files.
 - End-to-end: 464.15s, 2205.00 docs/s.
 - `pretokenized=true`, no char caps, in-process `vllm_text_pretokenized`.
 
-Current Ray Data conclusion: tested Ray Data batch sizes are 32 < 128 < 64, and the best Ray Data point still trails Xenna batch size 32 by about 7.5%. The remaining Ray Data/Xenna gap is more likely executor scheduling/overlap/backpressure than local vLLM batch size.
+Current corrected Ray Data conclusion: the tested `--model-inference-batch-size` values are inert for vLLM, so do not infer a Ray Data batch-size curve. The best observed Ray Data run still trails the best observed Xenna run by about 7.5%, and the remaining gap is more likely executor scheduling, overlap, or backpressure than local vLLM batch size.
 
 ## How To Run
 
