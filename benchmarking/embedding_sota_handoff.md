@@ -327,9 +327,18 @@ Latest Dynamo text-input status:
 
 ```bash
 embedding_generation_dynamo_endpoint_text_45c963d7_i24
+embedding_generation_dynamo_endpoint_text_e146d35a_i25
 ```
 
-This entry is prepared to rerun Dynamo HTTP with text input under the corrected benchmark setup:
+i24 reran Dynamo HTTP with text input under the corrected benchmark setup but failed before throughput and before any client/text requests. The actual root cause is in the copied Dynamo runtime log:
+
+```bash
+/raid/praateekm/curator-nightly/results/embedding-sota-investigation/embedding_generation_dynamo_endpoint_text_45c963d7_i24/ray_cluster/session_latest/nemo_curator_dynamo_84b80a79/Dynamo_DP2_embeddinggemma-300m.log
+```
+
+vLLM refused to initialize DP2 because free memory on its mapped GPU was 86.24/94.97 GiB, below the default `gpu_memory_utilization=0.92` reservation target of 87.37 GiB. This is a selected-GPU resource failure, not a Dynamo text-input semantic failure. It did not reproduce the old `Failed to fold embeddings stream` error because the benchmark never reached endpoint traffic.
+
+i25 is prepared as the same Dynamo HTTP text shape under a distinct entry name so the failed i24 result remains auditable:
 
 - No character caps: do not set `--max-chars` or `--endpoint-max-chars`.
 - `endpoint_input_format=text`.
@@ -339,7 +348,7 @@ This entry is prepared to rerun Dynamo HTTP with text input under the corrected 
 - Model-context token truncation resolves to 2048.
 - Same dataset slice: 262 input files, expected 1,023,449 documents.
 
-Why rerun: the old Dynamo text run `embedding_generation_dynamo_endpoint_48c6b49f_i4` failed with `500 Failed to fold embeddings stream`. It used text input, no char caps, and model-context token truncation, but it used float responses and request batch size 8. That failure is diagnostic, not a conclusive proof that Dynamo text input is impossible under the current corrected transport shape. If i24 fails with the same error, inspect Dynamo worker logs around embedding output shape and the pooling patch.
+Why rerun: the old Dynamo text run `embedding_generation_dynamo_endpoint_48c6b49f_i4` failed with `500 Failed to fold embeddings stream`. It used text input, no char caps, and model-context token truncation, but it used float responses and request batch size 8. That failure is diagnostic, not a conclusive proof that Dynamo text input is impossible under the current corrected transport shape. If i25 reaches traffic and fails with the same error, inspect Dynamo worker logs around embedding output shape and the pooling patch.
 
 The previous corrected Ray Serve attempts failed before throughput:
 
