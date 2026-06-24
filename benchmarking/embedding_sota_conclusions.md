@@ -24,7 +24,7 @@ Xenna in-process vLLM, pretokenized, 16 fractional workers at 0.249 GPU each
 2865.16 docs/s
 ```
 
-Do not collapse startup-inclusive and service-amortized rankings. The endpoint path has a real service startup cost in the benchmark, and the in-process path does not. Also, previous Ray Serve HTTP results are now excluded from ranking evidence because those runs did not enable HAProxy; corrected Ray Serve HTTP+HAProxy and Ray Serve handle runs are still required.
+Do not collapse startup-inclusive and service-amortized rankings. The endpoint path has a real service startup cost in the benchmark, and the in-process path does not. Previous Ray Serve HTTP results are excluded from ranking evidence because those runs did not enable HAProxy. The corrected Ray Serve direct-handle run is now included; corrected Ray Serve HTTP+HAProxy at 1024 aggregate in-flight requests still failed with file-descriptor pressure and remains unresolved.
 
 ## Methodology Gates
 
@@ -41,7 +41,7 @@ The successful ranking evidence below satisfies these gates:
 - Fractional in-process runs use real vLLM-stage controls: `--model-num-workers=16`, `--model-worker-gpus=0.249`, and `--model-gpu-memory-utilization=0.22`.
 - Endpoint ranking evidence uses `endpoint_input_format=token_ids` and `endpoint_encoding_format=base64`.
 - Endpoint token truncation is model-context token truncation, not character truncation. For these runs, `endpoint_truncate_prompt_tokens=2048`.
-- Ray Serve endpoint runs are excluded until HAProxy is actually enabled and verified in logs.
+- Legacy Ray Serve endpoint runs are excluded until HAProxy is actually enabled and verified in logs. The corrected i22 Ray Serve direct-handle run is ranked because logs verified HAProxy startup and all four vLLM replicas using RayExecutorV2.
 
 Script-level checks that make the metrics trustworthy:
 
@@ -79,6 +79,7 @@ This is the ranking to use for batch jobs that start the endpoint inside the ben
 | 9 | Dynamo endpoint | token_ids/base64, request batch 16 | 496.51 | 89.64 | 2061.27 |
 | 10 | Dynamo endpoint | token_ids/base64, request batch 32 | 501.20 | 92.83 | 2041.99 |
 | 11 | Dynamo endpoint | token_ids/base64, request batch 8 | 504.61 | 92.19 | 2028.21 |
+| 12 | Ray Serve direct handle | HAProxy enabled, RayExecutorV2, token_ids/base64, request batch 8 | 508.83 | 74.83 | 2011.39 |
 
 Conclusion: use Xenna in-process pretokenized vLLM with fractional GPU workers for offline batch embedding in Curator. The speedup comes from real worker geometry, not `--model-inference-batch-size`: four vLLM engines per physical GPU overlap tokenization and embedding work enough to keep the GPU busier.
 
@@ -101,10 +102,11 @@ For in-process runs, this equals the startup-inclusive value because `serve_star
 | 5 | Dynamo endpoint | token_ids/base64, request batch 8 | about 2481.61 |
 | 6 | Xenna in-process vLLM | pretokenized, 4 workers; inert CLI batch value 32 | 2394.53 |
 | 7 | Xenna in-process vLLM | pretokenized, 4 workers; inert CLI batch value 16 | 2377.21 |
-| 8 | Xenna in-process vLLM | pretokenized, 4 workers; inert CLI batch value 64 | 2339.28 |
-| 9 | Ray Data in-process vLLM | pretokenized, 4 workers; inert CLI batch value 64 | 2215.38 |
-| 10 | Ray Data in-process vLLM | pretokenized, 4 workers; inert CLI batch value 128 | 2205.00 |
-| 11 | Ray Data in-process vLLM | pretokenized, 4 workers; inert CLI batch value 32 | 2150.33 |
+| 8 | Ray Serve direct handle | HAProxy enabled, RayExecutorV2, token_ids/base64, request batch 8 | about 2358.18 |
+| 9 | Xenna in-process vLLM | pretokenized, 4 workers; inert CLI batch value 64 | 2339.28 |
+| 10 | Ray Data in-process vLLM | pretokenized, 4 workers; inert CLI batch value 64 | 2215.38 |
+| 11 | Ray Data in-process vLLM | pretokenized, 4 workers; inert CLI batch value 128 | 2205.00 |
+| 12 | Ray Data in-process vLLM | pretokenized, 4 workers; inert CLI batch value 32 | 2150.33 |
 
 Conclusion: even in the service-amortized view, the fastest current measured path is still in-process fractional Xenna. Dynamo token_ids/base64 request batch 16 remains the best tested endpoint point, but it is now behind fractional in-process vLLM.
 
@@ -118,25 +120,26 @@ Xenna beats Ray Data for the in-process path under the tested geometry. Both use
 
 Dynamo was previously able to beat the four-worker in-process path only in the persistent-service view. The corrected Dynamo path uses token IDs, base64 responses, high aggregate concurrency, request batching, model-context token truncation, and the pooling patch. With fractional in-process workers, Dynamo no longer leads either current ranking, but it remains the best validated endpoint path.
 
-Ray Serve HTTP is unresolved, not ranked. The existing Ray Serve runs did not enable HAProxy, so their poor throughput is diagnostic evidence about the Python-proxy path only. Correct Ray Serve evidence requires Ray 2.56 `ray-haproxy` enablement, vLLM RayExecutorV2 verification, and a direct-handle run in addition to HTTP.
+Ray Serve direct handle is now valid evidence but not a leader. The corrected i22 run used token IDs, base64 responses, no character caps, HAProxy enabled, and RayExecutorV2 on all four replicas. It reached 2011.39 docs/s startup-inclusive and about 2358.18 docs/s after excluding 74.83s of startup. That places it behind Dynamo batch16 by about 6.3% in the persistent-service view and behind fractional Xenna by about 17.7%. Because the client bypassed HTTP but still showed repeated Ray Serve queue-length deadline warnings, the remaining overhead is likely Serve router/scheduler/backpressure plus per-request service boundaries, not OpenAI HTTP ingress alone.
+
+Ray Serve HTTP is still unresolved, not ranked. Corrected HTTP+HAProxy at 1024 aggregate in-flight requests failed after startup with OpenAI `InternalServerError` and ingress `Too many open files`, even though HAProxy and RayExecutorV2 were verified. The next HTTP rerun should change exactly one pressure variable, probably aggregate concurrency or fd limits.
 
 ## Evidence Excluded From Ranking
 
 - The capped i2 in-process results are directional only because `max_chars=1500` is not representative of real documents.
 - Raw-text endpoint failures are not ranked because they were not stable/correct for uncapped documents.
 - Failed endpoint runs with no successful throughput are useful diagnostics but not ranking evidence.
-- Prior Ray Serve HTTP successes are excluded because the logs did not show HAProxy enabled; rerun them after fixing the Ray 2.56 `ray-haproxy` path.
+- Prior Ray Serve HTTP successes are excluded because the logs did not show HAProxy enabled. The corrected i22 direct-handle run is included; corrected HTTP+HAProxy high-concurrency failure remains diagnostic only.
 - Historical standalone and one-GPU notes are used for hypotheses only. The ranking above comes from the corrected four-GPU Curator benchmark session.
 - The in-process vLLM batch-size interpretation from the first conclusion revision is excluded. Code inspection showed the argument only affects `EmbeddingCreatorStage`, not `VLLMEmbeddingModelStage`.
 
 ## Next Useful Experiments
 
-The current fastest tested path is fractional Xenna in-process vLLM. The remaining required experiment is corrected Ray Serve, because the old Ray Serve numbers did not satisfy the HAProxy requirement.
+The current fastest tested path is fractional Xenna in-process vLLM. Corrected Ray Serve direct handle has been tested and is slower. The remaining Ray Serve gap is HTTP+HAProxy at a pressure point that does not hit file-descriptor failure.
 
 If we want to push beyond the current result:
 
-- Test Ray Serve direct-handle/no-HTTP endpoint path.
-- Rerun Ray Serve HTTP with HAProxy actually enabled and verified.
+- Rerun Ray Serve HTTP with HAProxy verified while changing only one pressure variable from the failed 1024 aggregate in-flight run.
 - Test more or fractional in-process vLLM actors per GPU to keep engines fed while other actors tokenize.
 - Do not run more `--model-inference-batch-size` sweeps for in-process vLLM unless the script first adds a real vLLM-stage batching control.
 - Treat Dynamo request batch 16 as the best tested endpoint point unless a new transport or payload shape changes the bottleneck.
