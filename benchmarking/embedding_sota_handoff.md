@@ -202,17 +202,19 @@ Current successful uncapped ranking by end-to-end benchmark throughput:
 
 1. Xenna in-process pretokenized vLLM: 2394.53 docs/s.
 2. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
-3. Dynamo endpoint token_ids/base64: 2028.21 docs/s, including service startup.
-4. Ray Serve endpoint token_ids/base64 at aggregate concurrency 128: 913.45 docs/s, including service startup.
-5. Ray Serve endpoint token_ids/base64 at aggregate concurrency 512: 870.98 docs/s, including service startup.
+3. Dynamo endpoint token_ids/base64, request batch size 16: 2061.27 docs/s, including service startup.
+4. Dynamo endpoint token_ids/base64, request batch size 8: 2028.21 docs/s, including service startup.
+5. Ray Serve endpoint token_ids/base64 at aggregate concurrency 128: 913.45 docs/s, including service startup.
+6. Ray Serve endpoint token_ids/base64 at aggregate concurrency 512: 870.98 docs/s, including service startup.
 
 Current successful uncapped ranking by persistent-service steady-state throughput:
 
-1. Dynamo endpoint token_ids/base64: about 2481.61 docs/s after excluding service startup.
-2. Xenna in-process pretokenized vLLM: 2394.53 docs/s.
-3. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
-4. Ray Serve endpoint token_ids/base64 at aggregate concurrency 128: about 968.72 docs/s after excluding service startup.
-5. Ray Serve endpoint token_ids/base64 at aggregate concurrency 512: about 920.58 docs/s after excluding service startup.
+1. Dynamo endpoint token_ids/base64, request batch size 16: about 2515.39 docs/s after excluding service startup.
+2. Dynamo endpoint token_ids/base64, request batch size 8: about 2481.61 docs/s after excluding service startup.
+3. Xenna in-process pretokenized vLLM: 2394.53 docs/s.
+4. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
+5. Ray Serve endpoint token_ids/base64 at aggregate concurrency 128: about 968.72 docs/s after excluding service startup.
+6. Ray Serve endpoint token_ids/base64 at aggregate concurrency 512: about 920.58 docs/s after excluding service startup.
 
 Do not collapse these two rankings into one claim. Batch jobs pay startup; already-running services do not. The next experiment should either make Ray Serve correct under lower pressure or tune Dynamo request batch/concurrency to see whether its steady-state advantage is robust.
 
@@ -248,6 +250,16 @@ The i7 Ray Serve aggregate-concurrency 512 run also succeeded, but it was slower
 - Persistent-service steady state excluding startup: about 920.58 docs/s.
 
 Current Ray Serve conclusion: aggregate concurrency 128 is the best tested Ray Serve point. Aggregate 512 is stable but slower; aggregate 1024 fails with ingress/client transport errors. If more Ray Serve tuning is needed, test aggregate 256 next. Otherwise prioritize Dynamo tuning and in-process/Xenna comparisons.
+
+The i8 Dynamo request-batch-size 16 run succeeded and modestly beat the previous Dynamo batch-size 8 result:
+
+- 1,023,449 docs, 262 input files.
+- End-to-end: 496.51s, 2061.27 docs/s.
+- Startup: 89.64s.
+- Persistent-service steady state excluding startup: about 2515.39 docs/s.
+- `pretokenized=true`, `endpoint_pretokenized=true`, no char caps, endpoint token truncation 2048, token_ids/base64.
+
+Current Dynamo conclusion: request batch size 16 is the best tested Dynamo point and the best steady-state point overall, but still loses to Xenna for startup-inclusive batch-job throughput. Next Dynamo experiment should try request batch size 32.
 
 ## How To Run
 
