@@ -143,17 +143,30 @@ It produced:
 
 The benchmark script has since been changed so endpoint `truncate_prompt_tokens <= 0` resolves to the model context length by default. This keeps no character cap while matching in-process pretokenized model-context token truncation.
 
+The endpoint text rerun was:
+
+```bash
+uncapped-endpoint-model-context-truncation-1157f44f-i4
+```
+
+It failed:
+
+- Ray Serve text input avoided the over-context validation error, but failed with HTTP `ReadError` / OpenAI `APIConnectionError` under 16 client tasks.
+- Dynamo text input still failed with `Failed to fold embeddings stream`.
+
+Next endpoint experiment uses client-side pretokenized `token_ids` plus base64 responses, with no character cap.
+
 Current intended run/reason:
 
 ```bash
-uncapped-endpoint-model-context-truncation-i4
+uncapped-endpoint-tokenids-base64-i5
 ```
 
 Current exact entries:
 
 ```text
-embedding_generation_ray_serve_endpoint_48c6b49f_i4
-embedding_generation_dynamo_endpoint_48c6b49f_i4
+embedding_generation_ray_serve_endpoint_918bd744_i5
+embedding_generation_dynamo_endpoint_918bd744_i5
 ```
 
 Shared baseline shape:
@@ -171,6 +184,8 @@ Shared baseline shape:
 - Endpoint client workers: 16
 - Endpoint max concurrent requests per client: 64
 - Endpoint request batch size: 8
+- Endpoint input format for i5: `token_ids`.
+- Endpoint response encoding for i5: `base64`.
 - No benchmark-side character cap. Do not set `--max-chars` or `--endpoint-max-chars` unless the entry name and tracking row explicitly say the experiment is char-capped.
 - Endpoint token truncation defaults to the model context length. This is not a character cap; it is required because Ray Serve's vLLM OpenAI text path otherwise rejects over-context prompts instead of truncating them automatically.
 
@@ -196,7 +211,7 @@ benchmarking/tools/run.sh \
   --use-host-curator \
   --config benchmarking/nightly-benchmark.yaml \
   --config benchmarking/local-embedding-endpoint.yaml \
-  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_ray_serve_endpoint_48c6b49f_i4,embedding_generation_dynamo_endpoint_48c6b49f_i4 --reason uncapped-endpoint-model-context-truncation-i4"
+  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_ray_serve_endpoint_918bd744_i5,embedding_generation_dynamo_endpoint_918bd744_i5 --reason uncapped-endpoint-tokenids-base64-i5"
 ```
 
 If running through tmux, pipe output to:
