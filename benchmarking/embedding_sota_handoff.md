@@ -52,6 +52,7 @@ Local commits made for this investigation:
 - `f5eaed3c` - uncapped, pretokenized baseline enforcement.
 - `2fc98b70` - recorded uncapped Ray Data in-process result.
 - `48c6b49f` - recorded uncapped Xenna in-process result.
+- `1157f44f` - endpoint text requests default to model-context token truncation.
 
 Previous agent diffs were not discarded. They were preserved in:
 
