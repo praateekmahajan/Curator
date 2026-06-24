@@ -323,6 +323,24 @@ The i22 corrected direct-handle entry succeeded:
 
 Current corrected Ray Serve conclusion: direct handle is the faster Ray Serve client path, but it is still slower than fractional Xenna, fractional Ray Data, and Dynamo batch16. Raising Docker `nofile` makes Ray Serve HTTP+HAProxy complete at the i20 pressure point, but HTTP remains much slower than direct handle: about 1100.87 docs/s post-startup for HTTP versus about 2358.18 docs/s post-startup for direct handle.
 
+Latest Dynamo text-input status:
+
+```bash
+embedding_generation_dynamo_endpoint_text_45c963d7_i24
+```
+
+This entry is prepared to rerun Dynamo HTTP with text input under the corrected benchmark setup:
+
+- No character caps: do not set `--max-chars` or `--endpoint-max-chars`.
+- `endpoint_input_format=text`.
+- Base64 responses, matching the efficient token-input endpoint response path.
+- Request batch size 16, matching the best tested Dynamo token-input run.
+- 4 replicas, 16 HTTP clients, 64 concurrent requests per client.
+- Model-context token truncation resolves to 2048.
+- Same dataset slice: 262 input files, expected 1,023,449 documents.
+
+Why rerun: the old Dynamo text run `embedding_generation_dynamo_endpoint_48c6b49f_i4` failed with `500 Failed to fold embeddings stream`. It used text input, no char caps, and model-context token truncation, but it used float responses and request batch size 8. That failure is diagnostic, not a conclusive proof that Dynamo text input is impossible under the current corrected transport shape. If i24 fails with the same error, inspect Dynamo worker logs around embedding output shape and the pooling patch.
+
 The previous corrected Ray Serve attempts failed before throughput:
 
 - `embedding_generation_ray_serve_haproxy_http_ca31a35e_i18`
