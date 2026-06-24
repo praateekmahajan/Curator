@@ -97,7 +97,7 @@ entries:
       - metric: throughput_docs_per_sec
         min_value: 100
 
-  - name: embedding_generation_dynamo_endpoint_918bd744_i5
+  - name: embedding_generation_dynamo_endpoint_a0ce08c9_i8
     enabled: true
     script: embedding_generation_benchmark.py
     args: >-
@@ -113,7 +113,7 @@ entries:
       --client-num-workers=16
       --endpoint-max-concurrent-requests=64
       --endpoint-input-format=token_ids
-      --endpoint-request-batch-size=8
+      --endpoint-request-batch-size=16
       --endpoint-encoding-format=base64
       --endpoint-client-mode=tasks
       --endpoint-request-timeout-s=900

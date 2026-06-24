@@ -219,16 +219,16 @@ Do not collapse these two rankings into one claim. Batch jobs pay startup; alrea
 Current intended next run/reason:
 
 ```bash
-rayserve-tokenids-base64-concurrency512-3109d174-i7
+dynamo-tokenids-base64-batch16-a0ce08c9-i8
 ```
 
 Current exact entry:
 
 ```text
-embedding_generation_ray_serve_endpoint_3109d174_i7
+embedding_generation_dynamo_endpoint_a0ce08c9_i8
 ```
 
-This keeps Ray Serve on token_ids/base64/no char caps/model-context token truncation and changes only per-client concurrent requests from 8 to 32, raising aggregate max HTTP requests from 128 to 512. The purpose is to bisect between stable aggregate concurrency 128 and failed aggregate concurrency 1024.
+This keeps Dynamo on token_ids/base64/no char caps/model-context token truncation, 16 client tasks, 64 concurrent requests per client, and 4 replicas. It changes only `--endpoint-request-batch-size` from 8 to 16. The purpose is to test whether larger request batches reduce endpoint transport overhead enough to beat the current Xenna end-to-end baseline or widen Dynamo's persistent-service steady-state lead.
 
 The i6 Ray Serve lower-concurrency run succeeded:
 
@@ -255,7 +255,7 @@ Use Docker through `benchmarking/tools/run.sh`. Do not run the benchmark script 
 
 This image does not have the benchmark runner as its default Docker command, so use `run.sh --shell` and invoke `python benchmarking/run.py ...` inside the container.
 
-Current i7 launch shape:
+Current i8 launch shape:
 
 ```bash
 tmux has-session -t embedding_sota_investigation 2>/dev/null && tmux kill-session -t embedding_sota_investigation || true
@@ -271,7 +271,7 @@ benchmarking/tools/run.sh \
   --use-host-curator \
   --config benchmarking/nightly-benchmark.yaml \
   --config benchmarking/local-embedding-endpoint.yaml \
-  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_ray_serve_endpoint_3109d174_i7 --reason rayserve-tokenids-base64-concurrency512-3109d174-i7"
+  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_dynamo_endpoint_a0ce08c9_i8 --reason dynamo-tokenids-base64-batch16-a0ce08c9-i8"
 ```
 
 If running through tmux, pipe output to:
