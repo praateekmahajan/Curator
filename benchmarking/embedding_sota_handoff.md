@@ -235,20 +235,24 @@ Current successful uncapped ranking by persistent-service steady-state throughpu
 
 Do not collapse these two rankings into one claim. Batch jobs pay startup; already-running services do not. Current endpoint tuning says Dynamo request batch size 16 is the best tested endpoint point. For in-process vLLM, do not run more `--model-inference-batch-size` sweeps unless the script first adds a real vLLM-stage batching control.
 
+Latest fractional GPU status:
+
+- `embedding_generation_raydata_fracgpu_f7a9ad75_i16` succeeded: 1,023,449 docs, 262 files, no char caps, 16 workers, 0.249 GPU per worker, vLLM `gpu_memory_utilization=0.22`, 374.61s, 2732.02 docs/s.
+- `embedding_generation_xenna_fracgpu_f7a9ad75_i16` is invalid/incomplete. It was killed before writing metrics; logs reached 94/262 VLLM blocks.
+
 Current intended next run/reason:
 
 ```bash
-fracgpu-inprocess-pretokenized-f7a9ad75-i16
+fracgpu-xenna-rerun-9453a1a9-i17
 ```
 
 Exact entries:
 
 ```text
-embedding_generation_raydata_fracgpu_f7a9ad75_i16
-embedding_generation_xenna_fracgpu_f7a9ad75_i16
+embedding_generation_xenna_fracgpu_9453a1a9_i17
 ```
 
-This run is intended to test real in-process worker geometry rather than the inert `--model-inference-batch-size` argument:
+This run is intended to complete the missing Xenna side of the real in-process worker geometry experiment rather than the inert `--model-inference-batch-size` argument:
 
 - `--model-variation=vllm_text_pretokenized`
 - no `--max-chars` or `--endpoint-max-chars`
@@ -360,7 +364,7 @@ benchmarking/tools/run.sh \
   --use-host-curator \
   --config benchmarking/nightly-benchmark.yaml \
   --config benchmarking/local-embedding-endpoint.yaml \
-  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_raydata_fracgpu_f7a9ad75_i16,embedding_generation_xenna_fracgpu_f7a9ad75_i16 --reason fracgpu-inprocess-pretokenized-f7a9ad75-i16"
+  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_xenna_fracgpu_9453a1a9_i17 --reason fracgpu-xenna-rerun-9453a1a9-i17"
 ```
 
 If running through tmux, pipe output to:
@@ -382,6 +386,8 @@ benchmarking/embedding_sota_investigation_tmux.log
 - Use the same tmux session name and clean it up before relaunching.
 - Keep in-process entries on `vllm_text_pretokenized`. Raw in-process `vllm_text` requires explicit `--allow-raw-inprocess-vllm` and should only be used for an intentional raw-tokenization regression experiment.
 - Do not use benchmark-side character caps unless that is the explicit experiment motivation.
+- Ray Serve endpoint numbers are not valid unless the logs show HAProxy was actually enabled. In Ray 2.56 this branch must use the `ray-haproxy` package path, not only the old Ray 2.55 system `haproxy`/`socat` check.
+- Ray Serve endpoint reruns must also verify that the vLLM engine uses RayExecutorV2.
 - Latest Docker validation before i9 confirmed the single YAML has pretokenized in-process entries, token_ids endpoint entries, and no character caps; the script still has the pretokenized default/guard and the Curator vLLM stage token-ID path.
 - Latest Docker validation after i13 used `benchmarking/tools/run.sh --shell` with `GPUS=none` and confirmed both active in-process entries are `vllm_text_pretokenized`, no active YAML entry sets `--max-chars` or `--endpoint-max-chars`, and the script still defaults to `vllm_text_pretokenized` with raw `vllm_text` guarded behind `--allow-raw-inprocess-vllm`.
 - Latest Docker validation after adding the conclusion file used `benchmarking/tools/run.sh --shell` with `GPUS=none` and confirmed the 11 ranked results match raw `metrics.json`/`results.json`, all ranked runs have 1,023,449 docs and 262 input files, no ranked run has character caps, and the active YAML still has no character caps with pretokenized in-process entries.

@@ -47,7 +47,7 @@ entries:
       - metric: throughput_docs_per_sec
         min_value: 100
 
-  - name: embedding_generation_xenna_fracgpu_f7a9ad75_i16
+  - name: embedding_generation_xenna_fracgpu_9453a1a9_i17
     enabled: true
     script: embedding_generation_benchmark.py
     args: >-
