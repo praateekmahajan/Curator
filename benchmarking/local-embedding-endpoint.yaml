@@ -24,7 +24,7 @@ sinks:
     enabled: false
 
 entries:
-  - name: embedding_generation_raydata_c7264f1c_i2
+  - name: embedding_generation_raydata_517cdd10_i3
     enabled: true
     script: embedding_generation_benchmark.py
     args: >-
@@ -37,7 +37,6 @@ entries:
       --model-variation=vllm_text_pretokenized
       --model-inference-batch-size=32
       --model-num-workers=4
-      --max-chars=1500
       --cache-dir={dataset:text_models_hf_cache,files}
     ray:
       num_cpus: 64
@@ -47,7 +46,7 @@ entries:
       - metric: throughput_docs_per_sec
         min_value: 100
 
-  - name: embedding_generation_xenna_c7264f1c_i2
+  - name: embedding_generation_xenna_517cdd10_i3
     enabled: true
     script: embedding_generation_benchmark.py
     args: >-
@@ -60,7 +59,6 @@ entries:
       --model-variation=vllm_text_pretokenized
       --model-inference-batch-size=32
       --model-num-workers=4
-      --max-chars=1500
       --cache-dir={dataset:text_models_hf_cache,files}
     ray:
       num_cpus: 64
@@ -70,7 +68,7 @@ entries:
       - metric: throughput_docs_per_sec
         min_value: 100
 
-  - name: embedding_generation_ray_serve_endpoint_c7264f1c_i2
+  - name: embedding_generation_ray_serve_endpoint_517cdd10_i3
     enabled: true
     script: embedding_generation_benchmark.py
     args: >-
@@ -85,11 +83,9 @@ entries:
       --server-replicas=4
       --client-num-workers=16
       --endpoint-max-concurrent-requests=64
-      --endpoint-truncate-prompt-tokens=0
       --endpoint-input-format=text
       --endpoint-request-batch-size=8
       --endpoint-encoding-format=float
-      --endpoint-max-chars=1500
       --endpoint-client-mode=tasks
       --endpoint-request-timeout-s=900
       --endpoint-pooler-config={}
@@ -101,7 +97,7 @@ entries:
       - metric: throughput_docs_per_sec
         min_value: 100
 
-  - name: embedding_generation_dynamo_endpoint_c7264f1c_i2
+  - name: embedding_generation_dynamo_endpoint_517cdd10_i3
     enabled: true
     script: embedding_generation_benchmark.py
     args: >-
@@ -116,11 +112,9 @@ entries:
       --server-replicas=4
       --client-num-workers=16
       --endpoint-max-concurrent-requests=64
-      --endpoint-truncate-prompt-tokens=0
       --endpoint-input-format=text
       --endpoint-request-batch-size=8
       --endpoint-encoding-format=float
-      --endpoint-max-chars=1500
       --endpoint-client-mode=tasks
       --endpoint-request-timeout-s=900
       --endpoint-pooler-config={}

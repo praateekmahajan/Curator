@@ -26,7 +26,7 @@ The expected baseline ranking is:
 3. Dynamo/Ray Serve endpoints can only compete if the endpoint is fed with enough concurrency and uses efficient payload/response formats. Prior one-GPU work suggests pretokenized inputs, large request batches, and base64 responses matter.
 4. Ray Serve direct handle may be a future optimization because it can bypass HTTP while preserving service-style separation.
 
-The benchmark must validate correctness and speed together. A fast endpoint result is not useful if it returns missing rows, duplicate indexes, token-level embeddings instead of pooled embeddings, or a different text cap than the in-process path.
+The benchmark must validate correctness and speed together. A fast endpoint result is not useful if it returns missing rows, duplicate indexes, token-level embeddings instead of pooled embeddings, raw in-process vLLM text input, or benchmark-side character truncation.
 
 ## Current Branch State
 
@@ -47,6 +47,8 @@ Local commits made for this investigation:
 - `ccd6bac9` - benchmark script correctness fixes: endpoint response validation, shared `--max-chars`, endpoint/in-process text-cap parity, Dynamo pooling patch wiring.
 - `c7264f1c` - initial tracking file.
 - `a2418640` - single-YAML corrected baseline entries for run `i=2`.
+- `c6af206b` - durable handoff context.
+- `517cdd10` - recorded directional capped Ray Data result.
 
 Previous agent diffs were not discarded. They were preserved in:
 
@@ -109,19 +111,32 @@ embedding_sota_investigation
 
 Always reuse this tmux session name. Before starting a new run, kill the old session with this exact name if it exists. Do not create many new tmux sessions.
 
-Current run commit/reason:
+The stopped capped run was:
 
 ```bash
 a2418640 / single-yaml-corrected-baseline-a2418640-i2
 ```
 
+It produced directional, non-final results only:
+
+- Ray Data in-process: 1,023,449 docs, 262 input files, 3571.74 docs/s, `max_chars=1500`.
+- Xenna in-process: 1,023,449 docs, 262 input files, 4150.21 docs/s, `max_chars=1500`.
+
+It was stopped before endpoint entries because character caps are not representative of real embedding workloads.
+
+Current intended run/reason:
+
+```bash
+uncapped-pretokenized-baseline-i3
+```
+
 Current exact entries:
 
 ```text
-embedding_generation_raydata_c7264f1c_i2
-embedding_generation_xenna_c7264f1c_i2
-embedding_generation_ray_serve_endpoint_c7264f1c_i2
-embedding_generation_dynamo_endpoint_c7264f1c_i2
+embedding_generation_raydata_517cdd10_i3
+embedding_generation_xenna_517cdd10_i3
+embedding_generation_ray_serve_endpoint_517cdd10_i3
+embedding_generation_dynamo_endpoint_517cdd10_i3
 ```
 
 Shared baseline shape:
@@ -134,11 +149,13 @@ Shared baseline shape:
 - CPUs: 64
 - In-process workers/replicas: 4
 - In-process batch size: 32
+- In-process model variation: `vllm_text_pretokenized`.
 - Endpoint replicas: 4
 - Endpoint client workers: 16
 - Endpoint max concurrent requests per client: 64
 - Endpoint request batch size: 8
-- Text cap: `--max-chars=1500` for in-process, `--endpoint-max-chars=1500` for endpoint.
+- No benchmark-side character cap. Do not set `--max-chars` or `--endpoint-max-chars` unless the entry name and tracking row explicitly say the experiment is char-capped.
+- No artificial endpoint token cap. Let vLLM/model context length handle prompt truncation unless the experiment intentionally varies `truncate_prompt_tokens`.
 
 ## How To Run
 
@@ -162,7 +179,7 @@ benchmarking/tools/run.sh \
   --use-host-curator \
   --config benchmarking/nightly-benchmark.yaml \
   --config benchmarking/local-embedding-endpoint.yaml \
-  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_raydata_c7264f1c_i2,embedding_generation_xenna_c7264f1c_i2,embedding_generation_ray_serve_endpoint_c7264f1c_i2,embedding_generation_dynamo_endpoint_c7264f1c_i2 --reason single-yaml-corrected-baseline-a2418640-i2"
+  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_raydata_517cdd10_i3,embedding_generation_xenna_517cdd10_i3,embedding_generation_ray_serve_endpoint_517cdd10_i3,embedding_generation_dynamo_endpoint_517cdd10_i3 --reason uncapped-pretokenized-baseline-i3"
 ```
 
 If running through tmux, pipe output to:
@@ -182,6 +199,8 @@ benchmarking/embedding_sota_investigation_tmux.log
 - Keep appending to `benchmarking/embedding_sota_tracking.md`.
 - Use the same benchmark session name so all results land under one result session.
 - Use the same tmux session name and clean it up before relaunching.
+- Keep in-process entries on `vllm_text_pretokenized`. Raw in-process `vllm_text` requires explicit `--allow-raw-inprocess-vllm` and should only be used for an intentional raw-tokenization regression experiment.
+- Do not use benchmark-side character caps unless that is the explicit experiment motivation.
 
 ## Correctness Requirements
 
@@ -189,7 +208,8 @@ The benchmark script should enforce:
 
 - Endpoint response count equals request input count.
 - Endpoint response indexes are present, unique, and contiguous for each request.
-- In-process and endpoint paths use the same text cap.
+- In-process paths use `vllm_text_pretokenized`.
+- In-process and endpoint paths avoid benchmark-side character truncation unless the experiment intentionally studies a character cap.
 - Dynamo returns fixed-size pooled embeddings, not token-level variable-length embeddings.
 - Metrics include enough context to explain throughput: number of input files, number of documents, text cap, endpoint concurrency, request batch size, response encoding, and startup time when applicable.
 

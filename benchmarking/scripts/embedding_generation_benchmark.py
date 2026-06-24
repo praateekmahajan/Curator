@@ -690,6 +690,7 @@ def run_embedding_generation_benchmark(  # noqa: PLR0915
     endpoint_dtype: str = "auto",
     endpoint_pooler_config: str = '{"task":"embed"}',
     endpoint_model_path: str | None = None,
+    allow_raw_inprocess_vllm: bool = False,
     benchmark_results_path: str | None = None,
     **kwargs: Any,  # noqa: ANN401, ARG001
 ) -> dict[str, Any]:
@@ -699,6 +700,13 @@ def run_embedding_generation_benchmark(  # noqa: PLR0915
         variation in {EmbeddingModelVariation.RAY_SERVE_ENDPOINT, EmbeddingModelVariation.DYNAMO_ENDPOINT}
         and endpoint_input_format == "token_ids"
     )
+    if variation == EmbeddingModelVariation.VLLM_TEXT and not allow_raw_inprocess_vllm:
+        msg = (
+            "Raw in-process vLLM text benchmarking is disabled by default because tokenizer work "
+            "can dominate throughput. Use --model-variation=vllm_text_pretokenized for SOTA "
+            "comparisons, or pass --allow-raw-inprocess-vllm for an intentional raw-text experiment."
+        )
+        raise ValueError(msg)
     max_seq_length = _resolve_max_seq_length(model_identifier, cache_dir=cache_dir)
     input_path = Path(input_path)
     output_path = Path(output_path).absolute()
@@ -929,9 +937,17 @@ def main() -> int:
     )
     parser.add_argument(
         "--model-variation",
-        default="vllm_text",
+        default="vllm_text_pretokenized",
         choices=[v.value for v in EmbeddingModelVariation],
-        help="Embedding model backend (default: vllm_text)",
+        help="Embedding model backend (default: vllm_text_pretokenized)",
+    )
+    parser.add_argument(
+        "--allow-raw-inprocess-vllm",
+        action="store_true",
+        help=(
+            "Allow --model-variation=vllm_text. Keep this off for SOTA comparisons; raw text "
+            "in-process vLLM can benchmark tokenizer overhead instead of embedding throughput."
+        ),
     )
     parser.add_argument(
         "--embedding-pooling",
