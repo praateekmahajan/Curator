@@ -225,13 +225,13 @@ Do not collapse these two rankings into one claim. Batch jobs pay startup; alrea
 Current intended next run/reason:
 
 ```bash
-xenna-inprocess-pretokenized-batch16-fa3fea19-i11
+xenna-inprocess-pretokenized-batch16-61c0107f-i11
 ```
 
 Current exact entry:
 
 ```text
-embedding_generation_xenna_fa3fea19_i11
+embedding_generation_xenna_61c0107f_i11
 ```
 
 This should keep Xenna in-process vLLM on `vllm_text_pretokenized`, no character caps, 4 model workers, the same 262-file dataset slice, and change only `--model-inference-batch-size` from 32 to 16. The purpose is to bracket the current best Xenna batch size 32 from below after batch size 64 regressed.
@@ -305,7 +305,7 @@ benchmarking/tools/run.sh \
   --use-host-curator \
   --config benchmarking/nightly-benchmark.yaml \
   --config benchmarking/local-embedding-endpoint.yaml \
-  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_xenna_fa3fea19_i11 --reason xenna-inprocess-pretokenized-batch16-fa3fea19-i11"
+  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_xenna_61c0107f_i11 --reason xenna-inprocess-pretokenized-batch16-61c0107f-i11"
 ```
 
 If running through tmux, pipe output to:
