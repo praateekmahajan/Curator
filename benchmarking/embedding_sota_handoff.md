@@ -53,6 +53,8 @@ Local commits made for this investigation:
 - `2fc98b70` - recorded uncapped Ray Data in-process result.
 - `48c6b49f` - recorded uncapped Xenna in-process result.
 - `1157f44f` - endpoint text requests default to model-context token truncation.
+- `918bd744` - recorded endpoint truncation rerun failure and next endpoint motivation.
+- `22efeee8` - prepared tokenized endpoint rerun with base64 responses.
 
 Previous agent diffs were not discarded. They were preserved in:
 
@@ -154,7 +156,7 @@ It failed:
 - Ray Serve text input avoided the over-context validation error, but failed with HTTP `ReadError` / OpenAI `APIConnectionError` under 16 client tasks.
 - Dynamo text input still failed with `Failed to fold embeddings stream`.
 
-Next endpoint experiment uses client-side pretokenized `token_ids` plus base64 responses, with no character cap.
+The next endpoint experiment used client-side pretokenized `token_ids` plus base64 responses, with no character cap.
 
 Current intended run/reason:
 
@@ -188,6 +190,27 @@ Shared baseline shape:
 - Endpoint response encoding for i5: `base64`.
 - No benchmark-side character cap. Do not set `--max-chars` or `--endpoint-max-chars` unless the entry name and tracking row explicitly say the experiment is char-capped.
 - Endpoint token truncation defaults to the model context length. This is not a character cap; it is required because Ray Serve's vLLM OpenAI text path otherwise rejects over-context prompts instead of truncating them automatically.
+
+The i5 endpoint rerun is complete and the tmux session was killed for hygiene:
+
+- Ray Serve token_ids/base64 failed before producing throughput with `httpcore.ReadError` / OpenAI `APIConnectionError`. Its results confirmed tokenized input, base64 response encoding, no character cap, and `pretokenized=true`; this is an endpoint transport/serving failure, not a raw-text or over-context failure.
+- Dynamo token_ids/base64 succeeded on 1,023,449 docs and 262 input files with `pretokenized=true`, `endpoint_pretokenized=true`, no character cap, and effective endpoint truncation of 2048 tokens.
+- Dynamo end-to-end metric: 504.61s total, 92.19s service startup, 2028.21 docs/s.
+- Dynamo steady-state pipeline rate excluding service startup: about 2481.61 docs/s.
+
+Current successful uncapped ranking by end-to-end benchmark throughput:
+
+1. Xenna in-process pretokenized vLLM: 2394.53 docs/s.
+2. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
+3. Dynamo endpoint token_ids/base64: 2028.21 docs/s, including service startup.
+
+Current successful uncapped ranking by persistent-service steady-state throughput:
+
+1. Dynamo endpoint token_ids/base64: about 2481.61 docs/s after excluding service startup.
+2. Xenna in-process pretokenized vLLM: 2394.53 docs/s.
+3. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
+
+Do not collapse these two rankings into one claim. Batch jobs pay startup; already-running services do not. The next experiment should either make Ray Serve correct under lower pressure or tune Dynamo request batch/concurrency to see whether its steady-state advantage is robust.
 
 ## How To Run
 
