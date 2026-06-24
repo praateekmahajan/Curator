@@ -201,13 +201,14 @@ The i5 endpoint rerun is complete and the tmux session was killed for hygiene:
 Current successful uncapped ranking by end-to-end benchmark throughput:
 
 1. Xenna in-process pretokenized vLLM: 2394.53 docs/s.
-2. Xenna in-process pretokenized vLLM, batch size 64: 2339.28 docs/s.
-3. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
-4. Dynamo endpoint token_ids/base64, request batch size 16: 2061.27 docs/s, including service startup.
-5. Dynamo endpoint token_ids/base64, request batch size 32: 2041.99 docs/s, including service startup.
-6. Dynamo endpoint token_ids/base64, request batch size 8: 2028.21 docs/s, including service startup.
-7. Ray Serve endpoint token_ids/base64 at aggregate concurrency 128: 913.45 docs/s, including service startup.
-8. Ray Serve endpoint token_ids/base64 at aggregate concurrency 512: 870.98 docs/s, including service startup.
+2. Xenna in-process pretokenized vLLM, batch size 16: 2377.21 docs/s.
+3. Xenna in-process pretokenized vLLM, batch size 64: 2339.28 docs/s.
+4. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
+5. Dynamo endpoint token_ids/base64, request batch size 16: 2061.27 docs/s, including service startup.
+6. Dynamo endpoint token_ids/base64, request batch size 32: 2041.99 docs/s, including service startup.
+7. Dynamo endpoint token_ids/base64, request batch size 8: 2028.21 docs/s, including service startup.
+8. Ray Serve endpoint token_ids/base64 at aggregate concurrency 128: 913.45 docs/s, including service startup.
+9. Ray Serve endpoint token_ids/base64 at aggregate concurrency 512: 870.98 docs/s, including service startup.
 
 Current successful uncapped ranking by persistent-service steady-state throughput:
 
@@ -215,26 +216,27 @@ Current successful uncapped ranking by persistent-service steady-state throughpu
 2. Dynamo endpoint token_ids/base64, request batch size 32: about 2506.17 docs/s after excluding service startup.
 3. Dynamo endpoint token_ids/base64, request batch size 8: about 2481.61 docs/s after excluding service startup.
 4. Xenna in-process pretokenized vLLM: 2394.53 docs/s.
-5. Xenna in-process pretokenized vLLM, batch size 64: 2339.28 docs/s.
-6. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
-7. Ray Serve endpoint token_ids/base64 at aggregate concurrency 128: about 968.72 docs/s after excluding service startup.
-8. Ray Serve endpoint token_ids/base64 at aggregate concurrency 512: about 920.58 docs/s after excluding service startup.
+5. Xenna in-process pretokenized vLLM, batch size 16: 2377.21 docs/s.
+6. Xenna in-process pretokenized vLLM, batch size 64: 2339.28 docs/s.
+7. Ray Data in-process pretokenized vLLM: 2150.33 docs/s.
+8. Ray Serve endpoint token_ids/base64 at aggregate concurrency 128: about 968.72 docs/s after excluding service startup.
+9. Ray Serve endpoint token_ids/base64 at aggregate concurrency 512: about 920.58 docs/s after excluding service startup.
 
 Do not collapse these two rankings into one claim. Batch jobs pay startup; already-running services do not. Current endpoint tuning says Dynamo request batch size 16 is the best tested endpoint point; the next higher-value experiment is tuning the in-process winner.
 
 Current intended next run/reason:
 
 ```bash
-xenna-inprocess-pretokenized-batch16-61c0107f-i11
+raydata-inprocess-pretokenized-batch64-7049259a-i12
 ```
 
 Current exact entry:
 
 ```text
-embedding_generation_xenna_61c0107f_i11
+embedding_generation_raydata_7049259a_i12
 ```
 
-This should keep Xenna in-process vLLM on `vllm_text_pretokenized`, no character caps, 4 model workers, the same 262-file dataset slice, and change only `--model-inference-batch-size` from 32 to 16. The purpose is to bracket the current best Xenna batch size 32 from below after batch size 64 regressed.
+This should keep Ray Data in-process vLLM on `vllm_text_pretokenized`, no character caps, 4 model workers, the same 262-file dataset slice, and change only `--model-inference-batch-size` from 32 to 64. The purpose is to check whether Ray Data's lower baseline is a batch-size artifact or an executor/scheduling gap versus Xenna.
 
 The i6 Ray Serve lower-concurrency run succeeded:
 
@@ -283,13 +285,21 @@ The i10 Xenna in-process batch-size 64 run succeeded but regressed:
 
 Current Xenna conclusion: batch size 32 is still the best tested startup-inclusive in-process point. Batch size 64 is correct but slower, so the next check is batch size 16 to see whether the optimum is below 32 or whether 32 is the local sweet spot.
 
+The i11 Xenna in-process batch-size 16 run succeeded but was also slower than batch size 32:
+
+- 1,023,449 docs, 262 input files.
+- End-to-end: 430.52s, 2377.21 docs/s.
+- `pretokenized=true`, no char caps, in-process `vllm_text_pretokenized`.
+
+Current Xenna conclusion: tested batch sizes bracket the optimum at 32: batch 16 < batch 32 > batch 64. The next ranking risk is Ray Data, whose baseline may be undertuned.
+
 ## How To Run
 
 Use Docker through `benchmarking/tools/run.sh`. Do not run the benchmark script directly on bare metal.
 
 This image does not have the benchmark runner as its default Docker command, so use `run.sh --shell` and invoke `python benchmarking/run.py ...` inside the container.
 
-Current i11 launch shape:
+Current i12 launch shape:
 
 ```bash
 tmux has-session -t embedding_sota_investigation 2>/dev/null && tmux kill-session -t embedding_sota_investigation || true
@@ -305,7 +315,7 @@ benchmarking/tools/run.sh \
   --use-host-curator \
   --config benchmarking/nightly-benchmark.yaml \
   --config benchmarking/local-embedding-endpoint.yaml \
-  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_xenna_61c0107f_i11 --reason xenna-inprocess-pretokenized-batch16-61c0107f-i11"
+  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_raydata_7049259a_i12 --reason raydata-inprocess-pretokenized-batch64-7049259a-i12"
 ```
 
 If running through tmux, pipe output to:
