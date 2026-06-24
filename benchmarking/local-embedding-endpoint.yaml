@@ -24,7 +24,7 @@ sinks:
     enabled: false
 
 entries:
-  - name: embedding_generation_raydata_caef1bc3_i12
+  - name: embedding_generation_raydata_94b480ce_i13
     enabled: true
     script: embedding_generation_benchmark.py
     args: >-
@@ -35,7 +35,7 @@ entries:
       --load-dataset-ratio=0.2
       --model-identifier=google/embeddinggemma-300m
       --model-variation=vllm_text_pretokenized
-      --model-inference-batch-size=64
+      --model-inference-batch-size=128
       --model-num-workers=4
       --cache-dir={dataset:text_models_hf_cache,files}
     ray:

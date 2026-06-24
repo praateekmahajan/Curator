@@ -229,13 +229,13 @@ Do not collapse these two rankings into one claim. Batch jobs pay startup; alrea
 Current intended next run/reason:
 
 ```bash
-raydata-inprocess-pretokenized-batch128-47b7ef84-i13
+raydata-inprocess-pretokenized-batch128-94b480ce-i13
 ```
 
 Current exact entry:
 
 ```text
-embedding_generation_raydata_47b7ef84_i13
+embedding_generation_raydata_94b480ce_i13
 ```
 
 This should keep Ray Data in-process vLLM on `vllm_text_pretokenized`, no character caps, 4 model workers, the same 262-file dataset slice, and change only `--model-inference-batch-size` from 64 to 128. The purpose is to see whether Ray Data's improvement from batch 32 to 64 continues or saturates below Xenna.
@@ -325,7 +325,7 @@ benchmarking/tools/run.sh \
   --use-host-curator \
   --config benchmarking/nightly-benchmark.yaml \
   --config benchmarking/local-embedding-endpoint.yaml \
-  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_raydata_47b7ef84_i13 --reason raydata-inprocess-pretokenized-batch128-47b7ef84-i13"
+  --shell "cd /opt/Curator && export USER=root LOGNAME=root RAY_SERVE_EXPERIMENTAL_PIP_HAPROXY=1 && python benchmarking/run.py --config benchmarking/nightly-benchmark.yaml --config benchmarking/local-embedding-endpoint.yaml --session-name embedding-sota-investigation --entries-exact embedding_generation_raydata_94b480ce_i13 --reason raydata-inprocess-pretokenized-batch128-94b480ce-i13"
 ```
 
 If running through tmux, pipe output to:
