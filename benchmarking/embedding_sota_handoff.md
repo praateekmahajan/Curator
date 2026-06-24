@@ -358,6 +358,7 @@ benchmarking/embedding_sota_investigation_tmux.log
 - Keep in-process entries on `vllm_text_pretokenized`. Raw in-process `vllm_text` requires explicit `--allow-raw-inprocess-vllm` and should only be used for an intentional raw-tokenization regression experiment.
 - Do not use benchmark-side character caps unless that is the explicit experiment motivation.
 - Latest Docker validation before i9 confirmed the single YAML has pretokenized in-process entries, token_ids endpoint entries, and no character caps; the script still has the pretokenized default/guard and the Curator vLLM stage token-ID path.
+- Latest Docker validation after i13 used `benchmarking/tools/run.sh --shell` with `GPUS=none` and confirmed both active in-process entries are `vllm_text_pretokenized`, no active YAML entry sets `--max-chars` or `--endpoint-max-chars`, and the script still defaults to `vllm_text_pretokenized` with raw `vllm_text` guarded behind `--allow-raw-inprocess-vllm`.
 
 ## Correctness Requirements
 
