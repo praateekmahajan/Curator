@@ -137,6 +137,16 @@ embedding_sota_investigation
 
 Always reuse this tmux session name. Before starting a new run, kill the old session with this exact name if it exists. Do not create many new tmux sessions.
 
+Latest Dynamo HTTP text-input status:
+
+- `embedding_generation_dynamo_endpoint_text_45c963d7_i24` was a false-start failure before endpoint traffic. vLLM startup failed on one selected GPU because free memory was below the default `gpu_memory_utilization=0.92` reservation target.
+- `embedding_generation_dynamo_endpoint_text_e146d35a_i25` reran the same shape on cleaner GPUs and reached traffic. It still failed before throughput with OpenAI 500 `Failed to fold embeddings stream`.
+- i25 used 262 input files, no `--max-chars`, no `--endpoint-max-chars`, `endpoint_input_format=text`, base64 responses, request batch size 16, 16 HTTP clients, 64 concurrent requests per client, and 4 Dynamo replicas.
+- i25 endpoint startup succeeded: all four Dynamo models registered and the endpoint was ready after 85.3s.
+- The server-side cause was a backend `VLLMValidationError`: a prompt reached vLLM with at least 2049 input tokens for the 2048-token `google/embeddinggemma-300m` context.
+- The benchmark script did send `extra_body.truncate_prompt_tokens=2048`, but Dynamo's embedding handler creates `PoolingParams()` and calls `engine_client.encode(prompt=raw_string, ...)` without propagating embedding truncation. Code search in Dynamo found no `truncate_prompt_tokens` handling in the embeddings path.
+- Conclusion: Dynamo HTTP text input is included in the matrix, but it has no valid throughput on uncapped real documents until Dynamo propagates/tokenizes truncation correctly. The working Dynamo endpoint path remains `token_ids` plus base64, with i8 as the best token-input Dynamo result so far.
+
 The stopped capped run was:
 
 ```bash
