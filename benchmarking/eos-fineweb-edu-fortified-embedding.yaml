@@ -9,7 +9,7 @@ paths:
 gpu_stats_recorder:
   interval_s: 5.0
 
-object_store_size: "default"  # Let ray start choose per-node object store sizing.
+object_store_size: 750000000000  # 750GB per Ray node; SlurmRayClient passes this to head and workers.
 delete_scratch: false
 default_timeout_s: 14000
 
