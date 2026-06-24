@@ -68,7 +68,7 @@ entries:
       - metric: throughput_docs_per_sec
         min_value: 100
 
-  - name: embedding_generation_ray_serve_endpoint_a0d40d09_i6
+  - name: embedding_generation_ray_serve_endpoint_3109d174_i7
     enabled: true
     script: embedding_generation_benchmark.py
     args: >-
@@ -82,7 +82,7 @@ entries:
       --cache-dir={dataset:text_models_hf_cache,files}
       --server-replicas=4
       --client-num-workers=16
-      --endpoint-max-concurrent-requests=8
+      --endpoint-max-concurrent-requests=32
       --endpoint-input-format=token_ids
       --endpoint-request-batch-size=8
       --endpoint-encoding-format=base64
