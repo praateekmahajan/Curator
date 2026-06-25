@@ -301,7 +301,12 @@ def run_entry(  # noqa: PLR0913
             warning_threshold=entry.gpu_mem_use_warning_threshold,
             warning_threshold_msg="used before benchmark started",
         )
-        command_to_run = _wrap_command_as_ray_job(cmd, ray_client, run_id) if _should_submit_entry_as_ray_job() else cmd
+        submit_as_ray_job = _should_submit_entry_as_ray_job()
+        command_to_run = _wrap_command_as_ray_job(cmd, ray_client, run_id) if submit_as_ray_job else cmd
+        command_env = None
+        if submit_as_ray_job:
+            command_env = os.environ.copy()
+            command_env.pop("RAY_ADDRESS", None)
         logger.info(
             f"\tRunning command "
             f"{' '.join(command_to_run) if isinstance(command_to_run, list) else command_to_run}"
@@ -324,6 +329,7 @@ def run_entry(  # noqa: PLR0913
                 command=command_to_run,
                 timeout=entry.timeout_s,
                 stdouterr_path=stdouterr_path,
+                env=command_env,
                 run_id=run_id,
                 fancy=os.environ.get("CURATOR_BENCHMARKING_DEBUG", "0") == "0",
             )
