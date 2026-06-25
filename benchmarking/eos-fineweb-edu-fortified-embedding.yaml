@@ -7,7 +7,7 @@ paths:
     host_path: "/lustre/fsw/datascience_rapids_cugraphgnn/praateekm/hf_cache/hub"
 
 gpu_stats_recorder:
-  interval_s: 5.0
+  interval_s: 0
 
 object_store_size: 750000000000  # 750GB per Ray node; SlurmRayClient passes this to head and workers.
 delete_scratch: false

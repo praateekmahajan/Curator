@@ -13,18 +13,20 @@
 # limitations under the License.
 
 
+import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
-import ray
 from loguru import logger
 from runner.utils import get_shm_usage
 
+from nemo_curator.core.constants import DEFAULT_RAY_DASHBOARD_PORT
 from nemo_curator.core.client import RayClient, SlurmRayClient
 from nemo_curator.core.utils import check_ray_responsive
 
@@ -195,19 +197,97 @@ def teardown_ray_cluster_and_env(
             logger.exception("Failed to copy/remove Ray temp dir")
 
 
+def _find_ray_binary() -> str:
+    candidate = Path(sys.executable).with_name("ray")
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return str(candidate)
+    found = shutil.which("ray")
+    if found:
+        return found
+    msg = "Could not find the `ray` binary. Make sure Ray is installed in the active Python environment."
+    raise FileNotFoundError(msg)
+
+
+def _ray_dashboard_address_from_env() -> str | None:
+    ray_address = os.environ.get("RAY_ADDRESS")
+    if not ray_address:
+        return None
+
+    address = ray_address.split("://", 1)[-1]
+    host = address.rsplit(":", 1)[0].strip("[]")
+    if not host:
+        return None
+    return f"http://{host}:{DEFAULT_RAY_DASHBOARD_PORT}"
+
+
+def _parse_json_array_from_stdout(stdout: str) -> list[dict[str, Any]]:
+    start = stdout.find("[")
+    end = stdout.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        msg = f"Ray state CLI returned non-JSON output: {stdout.strip()}"
+        raise ValueError(msg)
+    data = json.loads(stdout[start : end + 1])
+    if not isinstance(data, list):
+        msg = f"Ray state CLI returned {type(data).__name__}, expected list"
+        raise TypeError(msg)
+    return data
+
+
+def _get_ray_cluster_data_from_state_cli() -> dict[str, Any]:
+    dashboard_address = _ray_dashboard_address_from_env()
+    if dashboard_address is None:
+        return {}
+
+    result = subprocess.run(  # noqa: S603
+        [
+            _find_ray_binary(),
+            "list",
+            "nodes",
+            "--address",
+            dashboard_address,
+            "--format=json",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        msg = (result.stderr or result.stdout).strip()
+        raise RuntimeError(msg)
+
+    nodes = _parse_json_array_from_stdout(result.stdout)
+    alive_nodes = [node for node in nodes if str(node.get("state", "")).upper() == "ALIVE"]
+    resources: dict[str, float] = {}
+    for node in alive_nodes:
+        for name, value in (node.get("resources_total") or {}).items():
+            if isinstance(value, int | float):
+                resources[name] = resources.get(name, 0.0) + float(value)
+
+    return {
+        "node_count": len(nodes),
+        "alive_node_count": len(alive_nodes),
+        "resources": resources,
+        "nodes": nodes,
+    }
+
+
 def get_ray_cluster_data() -> dict[str, Any]:
-    """Get resource data from the Ray cluster.
+    """Get resource data from the Ray cluster without attaching a Ray driver.
 
     If the cluster is not responsive (e.g. crashed due to OOM), returns an empty dict
-    instead of connecting — ray.init() on a dead cluster fatally terminates the process
-    via Ray's C++ core worker.
+    instead of connecting as a Ray driver. This avoids runner-side ``ray.init`` calls
+    blocking before the benchmark subprocess has been launched.
     """
     if not check_ray_responsive():
         logger.warning("Ray cluster is not responsive, skipping cluster data collection")
         return {}
-    with ray.init(ignore_reinit_error=True):
-        time.sleep(0.2)  # ray.available_resources() returns might have a lag
-        return ray.cluster_resources()
+
+    try:
+        return _get_ray_cluster_data_from_state_cli()
+    except Exception as e:
+        logger.warning(f"Failed to collect Ray cluster data through Ray state CLI: {e}")
+        return {}
 
 
 def _ensure_ray_client_process_started(client: RayClient, timeout_s: int, poll_interval_s: float) -> None:
