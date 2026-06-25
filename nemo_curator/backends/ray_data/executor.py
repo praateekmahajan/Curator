@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import TYPE_CHECKING, Any
 
 import ray
@@ -73,14 +74,18 @@ class RayDataExecutor(BaseExecutor):
         # lazily on first task dispatch by cloning the current virtualenv. The NeMo Curator
         # container's /opt/venv is created with `uv venv --seed` so pip is available in clones.
         try:
-            # Initialize ray and explicitly set NOSET to empty
-            # This ensures if Xenna was used before which was setting NOSET, we end up overriding it.
-            ray.init(
-                ignore_reinit_error=True, runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": ""}}
-            )
+            # Initialize Ray and explicitly set NOSET to empty. Avoid passing a runtime_env
+            # here: on SLURM/container launches, runtime_env setup can block before the
+            # executor submits any Ray Data work.
+            os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = ""
+            ray_address = os.environ.get("RAY_ADDRESS")
+            logger.info(f"Initializing Ray Data executor with RAY_ADDRESS={ray_address}")
+            ray.init(address=ray_address, ignore_reinit_error=True)
+            logger.info(f"Ray Data executor connected. Cluster resources: {ray.cluster_resources()}")
 
             # Convert tasks to dataset
             current_dataset = self._tasks_to_dataset(tasks)
+            logger.info(f"Created initial Ray Data dataset from {len(tasks)} task(s)")
 
             # Execute setup on node for all stages
             execute_setup_on_node(stages, ignore_head_node=self.ignore_head_node)
