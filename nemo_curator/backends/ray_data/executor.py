@@ -29,6 +29,18 @@ if TYPE_CHECKING:
     from nemo_curator.stages.base import ProcessingStage
 
 
+def _get_ray_head_ip(ray_address: str) -> str:
+    """Extract the head node IP/host from a Ray GCS address."""
+    return ray_address.split("://", 1)[-1].rsplit(":", 1)[0].strip("[]")
+
+
+def _should_init_from_local_slurm_head(ray_address: str | None) -> bool:
+    """Return whether this process should attach through the local head raylet."""
+    if os.environ.get("CURATOR_RAY_DATA_LOCAL_HEAD_INIT", "1") == "0":
+        return False
+    return bool(ray_address) and os.environ.get("SLURM_NODEID", "0") == "0"
+
+
 class RayDataExecutor(BaseExecutor):
     """Ray Data-based executor for pipeline execution.
 
@@ -79,8 +91,28 @@ class RayDataExecutor(BaseExecutor):
             # executor submits any Ray Data work.
             os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = ""
             ray_address = os.environ.get("RAY_ADDRESS")
-            logger.info(f"Initializing Ray Data executor with RAY_ADDRESS={ray_address}")
-            ray.init(address=ray_address, ignore_reinit_error=True)
+            if _should_init_from_local_slurm_head(ray_address):
+                head_ip = _get_ray_head_ip(ray_address)
+                ray_temp_dir = os.environ.get("CURATOR_RAY_TEMP_DIR")
+                logger.info(
+                    "Initializing Ray Data executor from local SLURM head "
+                    f"with address=auto, _node_ip_address={head_ip}, "
+                    f"_temp_dir={ray_temp_dir} (RAY_ADDRESS={ray_address})"
+                )
+                saved_ray_address = os.environ.pop("RAY_ADDRESS", None)
+                try:
+                    ray.init(
+                        address="auto",
+                        _node_ip_address=head_ip,
+                        _temp_dir=ray_temp_dir,
+                        ignore_reinit_error=True,
+                    )
+                finally:
+                    if saved_ray_address is not None:
+                        os.environ["RAY_ADDRESS"] = saved_ray_address
+            else:
+                logger.info(f"Initializing Ray Data executor with RAY_ADDRESS={ray_address}")
+                ray.init(address=ray_address, ignore_reinit_error=True)
             logger.info(f"Ray Data executor connected. Cluster resources: {ray.cluster_resources()}")
 
             # Convert tasks to dataset

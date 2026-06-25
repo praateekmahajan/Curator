@@ -17,7 +17,6 @@ import argparse
 import json
 import os
 import pickle
-import shlex
 import shutil
 import sys
 import time
@@ -68,56 +67,6 @@ from runner.utils import (
 def _is_slurm_head_process() -> bool:
     """Return True for non-SLURM and SLURM node 0 processes."""
     return int(os.environ.get("SLURM_NODEID", "0")) == 0
-
-
-def _find_ray_binary() -> str:
-    """Locate the Ray CLI in the active Python environment."""
-    candidate = Path(sys.executable).with_name("ray")
-    if candidate.is_file() and os.access(candidate, os.X_OK):
-        return str(candidate)
-    found = shutil.which("ray")
-    if found:
-        return found
-    msg = "Could not find the `ray` binary. Make sure Ray is installed in the active Python environment."
-    raise FileNotFoundError(msg)
-
-
-def _should_submit_entry_as_ray_job() -> bool:
-    """Return whether the benchmark script should run as a Ray Job."""
-    if os.environ.get("CURATOR_BENCHMARK_SUBMIT_RAY_JOB", "1") == "0":
-        return False
-    return bool(os.environ.get("SLURM_JOB_ID")) and _is_slurm_head_process()
-
-
-def _wrap_command_as_ray_job(command: str, ray_client: Any, run_id: str) -> list[str]:
-    """Wrap a benchmark script command in ``ray job submit``.
-
-    SLURM container steps do not necessarily share the Ray head's ``/tmp`` socket
-    namespace. Submitting the script as a Ray Job launches the driver inside the
-    Ray cluster, where Ray Data can attach through the local raylet normally.
-    """
-    ray_address = os.environ.get("RAY_ADDRESS")
-    if not ray_address:
-        msg = "RAY_ADDRESS is not set; cannot submit benchmark command as a Ray Job"
-        raise RuntimeError(msg)
-    head_host = ray_address.split("://", 1)[-1].rsplit(":", 1)[0].strip("[]")
-    dashboard_port = getattr(ray_client, "ray_dashboard_port", 8265)
-    dashboard_address = f"http://{head_host}:{dashboard_port}"
-    submission_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in run_id)
-    pythonpath_parts = [str(Path.cwd())]
-    if os.environ.get("PYTHONPATH"):
-        pythonpath_parts.append(os.environ["PYTHONPATH"])
-    runtime_env = {"env_vars": {"PYTHONPATH": ":".join(pythonpath_parts)}}
-    return [
-        _find_ray_binary(),
-        "job",
-        "submit",
-        f"--address={dashboard_address}",
-        f"--submission-id={submission_id}",
-        f"--runtime-env-json={json.dumps(runtime_env, separators=(',', ':'))}",
-        "--",
-        *shlex.split(command),
-    ]
 
 
 def ensure_dir(dir_path: Path) -> None:
@@ -303,16 +252,8 @@ def run_entry(  # noqa: PLR0913
             warning_threshold=entry.gpu_mem_use_warning_threshold,
             warning_threshold_msg="used before benchmark started",
         )
-        submit_as_ray_job = _should_submit_entry_as_ray_job()
-        command_to_run = _wrap_command_as_ray_job(cmd, ray_client, run_id) if submit_as_ray_job else cmd
-        command_env = None
-        if submit_as_ray_job:
-            command_env = os.environ.copy()
-            command_env.pop("RAY_ADDRESS", None)
-        logger.info(
-            f"\tRunning command "
-            f"{' '.join(command_to_run) if isinstance(command_to_run, list) else command_to_run}"
-        )
+        command_to_run = cmd
+        logger.info(f"\tRunning command {command_to_run}")
         # Background pollers write per-GPU stats from every Ray node to per-node CSVs,
         # then merge them into gpustats.csv using the original single-node schema.
         # Set gpu_stats_recorder.interval_s to 0 in YAML to disable.
@@ -331,7 +272,6 @@ def run_entry(  # noqa: PLR0913
                 command=command_to_run,
                 timeout=entry.timeout_s,
                 stdouterr_path=stdouterr_path,
-                env=command_env,
                 run_id=run_id,
                 fancy=os.environ.get("CURATOR_BENCHMARKING_DEBUG", "0") == "0",
             )

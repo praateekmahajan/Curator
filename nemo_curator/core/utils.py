@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import shutil
 import socket
@@ -167,13 +168,16 @@ def init_cluster(  # noqa: PLR0913
     if object_store_memory is not None:
         ray_command.extend(["--object-store-memory", str(object_store_memory)])
     ray_command.extend(["--disable-usage-stats"])
+    system_config = {}
+    if os.environ.get("CURATOR_RAY_PRESTART_FIRST_DRIVER", "0") != "1":
+        system_config["prestart_worker_first_driver"] = False
     if enable_object_spilling:
-        ray_command.extend(
-            [
-                "--system-config",
-                '{"local_fs_capacity_threshold": 0.95, "object_spilling_config": "{ "type": "filesystem", "params": {"directory_path": "/tmp/ray_spill", "buffer_size": 1000000 } }"}',
-            ]
+        system_config["local_fs_capacity_threshold"] = 0.95
+        system_config["object_spilling_config"] = json.dumps(
+            {"type": "filesystem", "params": {"directory_path": "/tmp/ray_spill", "buffer_size": 1000000}}
         )
+    if system_config:
+        ray_command.extend(["--system-config", json.dumps(system_config)])
     if num_gpus:
         ray_command.extend(["--num-gpus", str(num_gpus)])
     if num_cpus:

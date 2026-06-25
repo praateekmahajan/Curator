@@ -166,6 +166,7 @@ def setup_ray_cluster_and_env(  # noqa: PLR0913
         msg = f"Failed to start Ray cluster after {max_retries} attempts"
         raise RuntimeError(msg)
 
+    os.environ["CURATOR_RAY_TEMP_DIR"] = str(short_temp_path)
     pid = client.ray_process.pid if client.ray_process else None
     logger.info(f"{client.__class__.__name__} started successfully: pid={pid}, port={client.ray_port}")
     return client, short_temp_path
@@ -193,6 +194,7 @@ def teardown_ray_cluster_and_env(
         try:
             _copy_ray_debug_artifacts(ray_temp_path, ray_cluster_path)
             shutil.rmtree(ray_temp_path, ignore_errors=True)
+            os.environ.pop("CURATOR_RAY_TEMP_DIR", None)
         except Exception:
             logger.exception("Failed to copy/remove Ray temp dir")
 
