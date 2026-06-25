@@ -14,6 +14,7 @@
 
 import atexit
 import contextlib
+import json
 import os
 import shutil
 import signal
@@ -571,38 +572,68 @@ class SlurmRayClient(RayClient):
         Raises ``TimeoutError`` (after tearing everything down) if not
         all nodes join within ``worker_connect_timeout_s``.
         """
-        import ray as _ray
-
         expected = len(self._slurm_nodes)
         deadline = time.time() + self.worker_connect_timeout_s
+        ray_bin = _find_ray_binary()
+        head_ip = socket.gethostbyname(self._slurm_nodes[0])
+        dashboard_address = f"http://{head_ip}:{self.ray_dashboard_port}"
+        last_error = ""
 
-        self._ray_init_with_timeout(os.environ["RAY_ADDRESS"], timeout_s=120)
-        try:
-            while True:
-                alive = [n for n in _ray.nodes() if n.get("Alive")]
-                if len(alive) >= expected:
-                    total_cpus = sum(n.get("Resources", {}).get("CPU", 0) for n in alive)
-                    total_gpus = sum(n.get("Resources", {}).get("GPU", 0) for n in alive)
-                    logger.info(
-                        f"All {expected} node(s) connected — "
-                        f"total CPUs: {total_cpus:.0f}, total GPUs: {total_gpus:.0f}"
-                    )
-                    return
+        while True:
+            alive: list[dict] = []
+            try:
+                result = subprocess.run(  # noqa: S603
+                    [
+                        ray_bin,
+                        "list",
+                        "nodes",
+                        "--address",
+                        dashboard_address,
+                        "--format=json",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    last_error = (result.stderr or result.stdout).strip()
+                else:
+                    # Some environments emit import-time log lines before JSON.
+                    start = result.stdout.find("[")
+                    end = result.stdout.rfind("]")
+                    if start == -1 or end == -1 or end < start:
+                        last_error = f"Ray state CLI returned non-JSON output: {result.stdout.strip()}"
+                    else:
+                        nodes = json.loads(result.stdout[start : end + 1])
+                        alive = [n for n in nodes if str(n.get("state", "")).upper() == "ALIVE"]
+            except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired) as exc:
+                last_error = str(exc)
 
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    logger.error(
-                        f"Timeout: only {len(alive)}/{expected} node(s) connected "
-                        f"after {self.worker_connect_timeout_s}s."
-                    )
-                    self.stop()
-                    msg = (
-                        f"Timed out after {self.worker_connect_timeout_s}s: "
-                        f"only {len(alive)}/{expected} node(s) connected. Cluster torn down."
-                    )
-                    raise TimeoutError(msg)
+            if len(alive) >= expected:
+                total_cpus = sum((n.get("resources_total") or {}).get("CPU", 0) for n in alive)
+                total_gpus = sum((n.get("resources_total") or {}).get("GPU", 0) for n in alive)
+                logger.info(
+                    f"All {expected} node(s) connected - "
+                    f"total CPUs: {total_cpus:.0f}, total GPUs: {total_gpus:.0f}"
+                )
+                return
 
-                logger.info(f"Waiting for workers: {len(alive)}/{expected} ({remaining:.0f}s left)")
-                time.sleep(min(5, remaining))
-        finally:
-            _ray.shutdown()
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                logger.error(
+                    f"Timeout: only {len(alive)}/{expected} node(s) connected "
+                    f"after {self.worker_connect_timeout_s}s. Last Ray state error: {last_error}"
+                )
+                self.stop()
+                msg = (
+                    f"Timed out after {self.worker_connect_timeout_s}s: "
+                    f"only {len(alive)}/{expected} node(s) connected. Cluster torn down."
+                )
+                raise TimeoutError(msg)
+
+            logger.info(
+                f"Waiting for workers via Ray state API at {dashboard_address}: "
+                f"{len(alive)}/{expected} ({remaining:.0f}s left)"
+            )
+            time.sleep(min(5, remaining))
