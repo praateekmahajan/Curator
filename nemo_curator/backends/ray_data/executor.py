@@ -79,12 +79,8 @@ class RayDataExecutor(BaseExecutor):
             # executor submits any Ray Data work.
             os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = ""
             ray_address = os.environ.get("RAY_ADDRESS")
-            node_ip_address = ray_address.rsplit(":", 1)[0] if ray_address else None
-            logger.info(
-                f"Initializing Ray Data executor with RAY_ADDRESS={ray_address}, "
-                f"_node_ip_address={node_ip_address}"
-            )
-            ray.init(address=ray_address, _node_ip_address=node_ip_address, ignore_reinit_error=True)
+            logger.info(f"Initializing Ray Data executor with RAY_ADDRESS={ray_address}")
+            ray.init(address=ray_address, ignore_reinit_error=True)
             logger.info(f"Ray Data executor connected. Cluster resources: {ray.cluster_resources()}")
 
             # Convert tasks to dataset
