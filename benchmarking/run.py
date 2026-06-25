@@ -107,19 +107,16 @@ def _wrap_command_as_ray_job(command: str, ray_client: Any, run_id: str) -> list
     pythonpath_parts = [str(Path.cwd())]
     if os.environ.get("PYTHONPATH"):
         pythonpath_parts.append(os.environ["PYTHONPATH"])
-    entrypoint_args = [
-        "env",
-        f"PYTHONPATH={':'.join(pythonpath_parts)}",
-        *shlex.split(command),
-    ]
+    runtime_env = {"env_vars": {"PYTHONPATH": ":".join(pythonpath_parts)}}
     return [
         _find_ray_binary(),
         "job",
         "submit",
         f"--address={dashboard_address}",
         f"--submission-id={submission_id}",
+        f"--runtime-env-json={json.dumps(runtime_env)}",
         "--",
-        *entrypoint_args,
+        *shlex.split(command),
     ]
 
 
