@@ -104,7 +104,14 @@ def _wrap_command_as_ray_job(command: str, ray_client: Any, run_id: str) -> list
     dashboard_port = getattr(ray_client, "ray_dashboard_port", 8265)
     dashboard_address = f"http://{head_host}:{dashboard_port}"
     submission_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in run_id)
-    entrypoint = f"cd {shlex.quote(str(Path.cwd()))} && {command}"
+    pythonpath_parts = [str(Path.cwd())]
+    if os.environ.get("PYTHONPATH"):
+        pythonpath_parts.append(os.environ["PYTHONPATH"])
+    entrypoint_args = [
+        "env",
+        f"PYTHONPATH={':'.join(pythonpath_parts)}",
+        *shlex.split(command),
+    ]
     return [
         _find_ray_binary(),
         "job",
@@ -112,9 +119,7 @@ def _wrap_command_as_ray_job(command: str, ray_client: Any, run_id: str) -> list
         f"--address={dashboard_address}",
         f"--submission-id={submission_id}",
         "--",
-        "bash",
-        "-lc",
-        entrypoint,
+        *entrypoint_args,
     ]
 
 
