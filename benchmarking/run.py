@@ -114,7 +114,7 @@ def _wrap_command_as_ray_job(command: str, ray_client: Any, run_id: str) -> list
         "submit",
         f"--address={dashboard_address}",
         f"--submission-id={submission_id}",
-        f"--runtime-env-json={json.dumps(runtime_env)}",
+        f"--runtime-env-json={json.dumps(runtime_env, separators=(',', ':'))}",
         "--",
         *shlex.split(command),
     ]
