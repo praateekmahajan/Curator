@@ -322,6 +322,7 @@ class SlurmRayClient(RayClient):
         #SBATCH --gpus-per-node=8
 
         srun --ntasks-per-node=1 \\
+            --cpus-per-task=224 \\
             --container-image=nvcr.io/nvidia/nemo-curator:26.02 \\
             --container-mounts="/lustre:/lustre" \\
             bash -c "source .venv/bin/activate && python my_pipeline.py"
@@ -333,7 +334,7 @@ class SlurmRayClient(RayClient):
         #SBATCH --ntasks-per-node=1
         #SBATCH --gpus-per-node=8
 
-        srun python my_pipeline.py
+        srun --ntasks-per-node=1 --cpus-per-task=224 python my_pipeline.py
 
     If ``RAY_ADDRESS`` is set before :meth:`start` is called,
     ``SlurmRayClient`` connects to the existing cluster without
@@ -412,6 +413,7 @@ class SlurmRayClient(RayClient):
             f"SLURM_NODEID={node_id}, head={self._slurm_nodes[0]}, "
             f"cpus/node={self.num_cpus}, gpus/node={self.num_gpus}"
         )
+        self._validate_cpu_affinity()
 
         if self.cleanup_on_start:
             self._cleanup_local_ray()
@@ -451,6 +453,26 @@ class SlurmRayClient(RayClient):
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
+
+    def _validate_cpu_affinity(self) -> None:
+        """Fail fast when SLURM cpus-per-task is smaller than Ray's advertised CPUs."""
+        if self.num_cpus is None or os.environ.get("CURATOR_ALLOW_SLURM_CPU_AFFINITY_MISMATCH") == "1":
+            return
+        if not hasattr(os, "sched_getaffinity"):
+            return
+
+        allowed_cpus = len(os.sched_getaffinity(0))
+        if allowed_cpus >= self.num_cpus:
+            return
+
+        msg = (
+            "SLURM CPU affinity exposes only "
+            f"{allowed_cpus} CPU(s), but SlurmRayClient is configured to advertise "
+            f"{self.num_cpus} CPU(s) to Ray. Relaunch the SLURM step with "
+            f"`--cpus-per-task={self.num_cpus}` (and `--ntasks-per-node=1`) so "
+            "Ray workers inherit the full per-node CPU set."
+        )
+        raise RuntimeError(msg)
 
     def _head_port_file(self, slurm_job_id: str) -> str:
         """Return path to the shared port-broadcast file for this job.
