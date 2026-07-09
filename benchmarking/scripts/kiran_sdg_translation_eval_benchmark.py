@@ -49,11 +49,12 @@ from nemo_curator.tasks.utils import TaskPerfUtils
 from nemo_curator.utils.file_utils import get_all_file_paths_under
 
 if TYPE_CHECKING:
-    from nemo_curator.core.serve import InferenceServer
+    from nemo_curator.core.serve import DynamoVLLMModelConfig, InferenceServer
 
 TRANSLATION_ALIAS = "gemma12b"
 EVALUATION_ALIAS = "gemma31b"
 PROVIDER_NAME = "curator-dynamo"
+GEMMA4_TRANSFORMERS_RUNTIME_PACKAGE = "transformers>=5.10.1"
 PipelineTasks = list[Task] | WorkflowRunResult | Mapping[str, list[Task]] | None
 
 
@@ -135,13 +136,18 @@ def _engine_kwargs(
     return kwargs
 
 
-def _start_inference_server(args: argparse.Namespace) -> InferenceServer:
-    from nemo_curator.core.serve import DynamoServerConfig, DynamoVLLMModelConfig, InferenceServer
+def _gemma4_transformers_runtime_env() -> dict[str, dict[str, list[str]]]:
+    return {"uv": {"packages": [GEMMA4_TRANSFORMERS_RUNTIME_PACKAGE]}}
 
-    models = [
+
+def _build_model_configs(args: argparse.Namespace) -> list[DynamoVLLMModelConfig]:
+    from nemo_curator.core.serve import DynamoVLLMModelConfig
+
+    return [
         DynamoVLLMModelConfig(
             model_identifier=args.translation_model_identifier,
             model_name=args.translation_served_model_name,
+            runtime_env=_gemma4_transformers_runtime_env(),
             engine_kwargs=_engine_kwargs(
                 tensor_parallel_size=1,
                 max_num_seqs=args.max_num_seqs,
@@ -154,6 +160,7 @@ def _start_inference_server(args: argparse.Namespace) -> InferenceServer:
         DynamoVLLMModelConfig(
             model_identifier=args.evaluation_model_identifier,
             model_name=args.evaluation_served_model_name,
+            runtime_env=_gemma4_transformers_runtime_env(),
             engine_kwargs=_engine_kwargs(
                 tensor_parallel_size=2,
                 max_num_seqs=args.max_num_seqs,
@@ -165,8 +172,12 @@ def _start_inference_server(args: argparse.Namespace) -> InferenceServer:
         ),
     ]
 
+
+def _start_inference_server(args: argparse.Namespace) -> InferenceServer:
+    from nemo_curator.core.serve import DynamoServerConfig, InferenceServer
+
     server = InferenceServer(
-        models=models,
+        models=_build_model_configs(args),
         backend=DynamoServerConfig(),
         health_check_timeout_s=args.health_check_timeout_s,
         verbose=args.verbose,
