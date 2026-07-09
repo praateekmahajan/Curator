@@ -116,18 +116,21 @@ def _load_config_builder(
     return dd.DataDesignerConfigBuilder.from_config(data_designer_config)
 
 
-def _engine_kwargs(
+def _engine_kwargs(  # noqa: PLR0913
     tensor_parallel_size: int,
     max_num_seqs: int,
     max_model_len: int,
     speculative_model: str | None,
     num_speculative_tokens: int,
+    linear_backend: str | None = None,
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "tensor_parallel_size": tensor_parallel_size,
         "max_num_seqs": max_num_seqs,
         "max_model_len": max_model_len,
     }
+    if linear_backend:
+        kwargs["linear_backend"] = linear_backend
     if speculative_model:
         kwargs["speculative_config"] = {
             "model": speculative_model,
@@ -136,8 +139,11 @@ def _engine_kwargs(
     return kwargs
 
 
-def _gemma4_transformers_runtime_env() -> dict[str, dict[str, list[str]]]:
-    return {"uv": {"packages": [GEMMA4_TRANSFORMERS_RUNTIME_PACKAGE]}}
+def _gemma4_transformers_runtime_env(*, disable_deep_gemm: bool = False) -> dict[str, Any]:
+    runtime_env: dict[str, Any] = {"uv": {"packages": [GEMMA4_TRANSFORMERS_RUNTIME_PACKAGE]}}
+    if disable_deep_gemm:
+        runtime_env["env_vars"] = {"VLLM_USE_DEEP_GEMM": "0"}
+    return runtime_env
 
 
 def _build_model_configs(args: argparse.Namespace) -> list[DynamoVLLMModelConfig]:
@@ -145,28 +151,30 @@ def _build_model_configs(args: argparse.Namespace) -> list[DynamoVLLMModelConfig
 
     return [
         DynamoVLLMModelConfig(
-            model_identifier=args.translation_model_identifier,
+            model_identifier=args.translation_model_path or args.translation_model_identifier,
             model_name=args.translation_served_model_name,
-            runtime_env=_gemma4_transformers_runtime_env(),
+            runtime_env=_gemma4_transformers_runtime_env(disable_deep_gemm=args.translation_disable_deep_gemm),
             engine_kwargs=_engine_kwargs(
                 tensor_parallel_size=1,
                 max_num_seqs=args.max_num_seqs,
                 max_model_len=args.max_model_len,
                 speculative_model=None if args.disable_speculative else args.translation_speculative_model,
                 num_speculative_tokens=args.num_speculative_tokens,
+                linear_backend=args.translation_linear_backend,
             ),
             num_replicas=args.translation_replicas,
         ),
         DynamoVLLMModelConfig(
-            model_identifier=args.evaluation_model_identifier,
+            model_identifier=args.evaluation_model_path or args.evaluation_model_identifier,
             model_name=args.evaluation_served_model_name,
-            runtime_env=_gemma4_transformers_runtime_env(),
+            runtime_env=_gemma4_transformers_runtime_env(disable_deep_gemm=args.evaluation_disable_deep_gemm),
             engine_kwargs=_engine_kwargs(
                 tensor_parallel_size=2,
                 max_num_seqs=args.max_num_seqs,
                 max_model_len=args.max_model_len,
                 speculative_model=None if args.disable_speculative else args.evaluation_speculative_model,
                 num_speculative_tokens=args.num_speculative_tokens,
+                linear_backend=args.evaluation_linear_backend,
             ),
             num_replicas=args.evaluation_replicas,
         ),
@@ -193,6 +201,13 @@ def run_kiran_sdg_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa
     input_path = Path(args.input_path)
     output_path = Path(args.output_path)
     checkpoint_path = Path(args.checkpoint_path) if args.checkpoint_path else None
+    ndd_artifact_path = (
+        Path(args.ndd_artifact_path)
+        if args.ndd_artifact_path
+        else (
+            checkpoint_path / "ndd-artifacts" if checkpoint_path is not None else output_path.parent / "ndd-artifacts"
+        )
+    )
 
     input_files = get_all_file_paths_under(str(input_path), keep_extensions="jsonl")
     input_files = sorted(input_files)
@@ -219,6 +234,8 @@ def run_kiran_sdg_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa
     logger.info(f"Input rows: {input_row_count}")
     logger.info(f"Output path: {output_path}")
     logger.info(f"Checkpoint path: {checkpoint_path}")
+    logger.info(f"NDD run mode: {args.ndd_run_mode}")
+    logger.info(f"NDD artifact path: {ndd_artifact_path}")
     logger.info(f"Required GPUs: {required_gpus}")
     logger.info(f"Translation fanout ~= {aggregate_translation_fanout}")
     logger.info(f"Evaluation fanout ~= {aggregate_evaluation_fanout}")
@@ -251,6 +268,13 @@ def run_kiran_sdg_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa
         data_designer_stage = DataDesignerStage(
             config_builder=config_builder,
             model_providers=model_providers,
+            run_mode=args.ndd_run_mode,
+            artifact_path=ndd_artifact_path if args.ndd_run_mode == "create" else None,
+            resume_mode=args.ndd_resume_mode,
+            run_config={
+                "buffer_size": args.ndd_buffer_size,
+                "max_in_flight_tasks": args.ndd_max_in_flight_tasks,
+            },
             verbose=args.verbose,
         ).with_(num_workers=args.client_workers)
 
@@ -291,15 +315,22 @@ def run_kiran_sdg_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa
             "required_gpus": required_gpus,
             "aggregate_translation_fanout": aggregate_translation_fanout,
             "aggregate_evaluation_fanout": aggregate_evaluation_fanout,
+            "ndd_run_mode": args.ndd_run_mode,
+            "ndd_artifact_path": str(ndd_artifact_path),
+            "ndd_resume_mode": args.ndd_resume_mode,
+            "ndd_buffer_size": args.ndd_buffer_size,
+            "ndd_max_in_flight_tasks": args.ndd_max_in_flight_tasks,
             "model_layout": {
                 "translation": {
-                    "model_identifier": args.translation_model_identifier,
+                    "model_identifier": args.translation_model_path or args.translation_model_identifier,
+                    "source_model_identifier": args.translation_model_identifier,
                     "served_model_name": args.translation_served_model_name,
                     "tensor_parallel_size": 1,
                     "num_replicas": args.translation_replicas,
                 },
                 "evaluation": {
-                    "model_identifier": args.evaluation_model_identifier,
+                    "model_identifier": args.evaluation_model_path or args.evaluation_model_identifier,
+                    "source_model_identifier": args.evaluation_model_identifier,
                     "served_model_name": args.evaluation_served_model_name,
                     "tensor_parallel_size": 2,
                     "num_replicas": args.evaluation_replicas,
@@ -321,6 +352,9 @@ def run_kiran_sdg_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa
             "evaluation_concurrency": args.evaluation_concurrency,
             "aggregate_translation_fanout": aggregate_translation_fanout,
             "aggregate_evaluation_fanout": aggregate_evaluation_fanout,
+            "ndd_run_mode": args.ndd_run_mode,
+            "ndd_buffer_size": args.ndd_buffer_size,
+            "ndd_max_in_flight_tasks": args.ndd_max_in_flight_tasks,
             "translation_replicas": args.translation_replicas,
             "evaluation_replicas": args.evaluation_replicas,
             "required_gpus": required_gpus,
@@ -352,14 +386,27 @@ def main() -> int:
     parser.add_argument("--num-files", type=int, default=None)
     parser.add_argument("--max-records", type=int, default=None)
     parser.add_argument("--files-per-partition", type=int, default=1)
-    parser.add_argument("--client-workers", type=int, default=1)
+    parser.add_argument("--client-workers", type=int, default=2)
     parser.add_argument("--translation-concurrency", type=int, default=64)
-    parser.add_argument("--evaluation-concurrency", type=int, default=64)
+    parser.add_argument("--evaluation-concurrency", type=int, default=48)
+    parser.add_argument("--ndd-run-mode", default="create", choices=["preview", "create"])
+    parser.add_argument("--ndd-artifact-path", default=None)
+    parser.add_argument("--ndd-resume-mode", default="if_possible", choices=["never", "always", "if_possible"])
+    parser.add_argument("--ndd-buffer-size", type=int, default=64)
+    parser.add_argument("--ndd-max-in-flight-tasks", type=int, default=192)
     parser.add_argument("--translation-replicas", type=int, default=2)
     parser.add_argument("--evaluation-replicas", type=int, default=1)
     parser.add_argument(
         "--translation-model-identifier",
         default="RedHatAI/gemma-4-12B-it-FP8-Dynamic",
+    )
+    parser.add_argument(
+        "--translation-model-path",
+        default=None,
+        help=(
+            "Optional absolute local model snapshot path. When set, Dynamo/vLLM loads "
+            "weights from this path while --translation-served-model-name remains the served name."
+        ),
     )
     parser.add_argument(
         "--translation-served-model-name",
@@ -368,6 +415,14 @@ def main() -> int:
     parser.add_argument(
         "--evaluation-model-identifier",
         default="RedHatAI/gemma-4-31B-it-FP8-block",
+    )
+    parser.add_argument(
+        "--evaluation-model-path",
+        default=None,
+        help=(
+            "Optional absolute local model snapshot path. When set, Dynamo/vLLM loads "
+            "weights from this path while --evaluation-served-model-name remains the served name."
+        ),
     )
     parser.add_argument(
         "--evaluation-served-model-name",
@@ -385,6 +440,10 @@ def main() -> int:
     parser.add_argument("--disable-speculative", action="store_true")
     parser.add_argument("--max-num-seqs", type=int, default=256)
     parser.add_argument("--max-model-len", type=int, default=32768)
+    parser.add_argument("--translation-linear-backend", default=None)
+    parser.add_argument("--evaluation-linear-backend", default=None)
+    parser.add_argument("--translation-disable-deep-gemm", action="store_true")
+    parser.add_argument("--evaluation-disable-deep-gemm", action="store_true")
     parser.add_argument("--health-check-timeout-s", type=int, default=1800)
     parser.add_argument("--verbose", action="store_true")
 

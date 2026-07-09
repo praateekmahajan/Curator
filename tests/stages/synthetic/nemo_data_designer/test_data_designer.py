@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -38,7 +39,9 @@ from data_designer.interface import DataDesigner
 
 def _minimal_config_builder() -> dd.DataDesignerConfigBuilder:
     """Real minimal DataDesignerConfigBuilder (avoids 'model configs required' where no local defaults)."""
-    return dd.DataDesignerConfigBuilder(model_configs=[dd.ModelConfig(alias="test_model", model="test/model")])
+    return dd.DataDesignerConfigBuilder(
+        model_configs=[dd.ModelConfig(alias="test_model", model="test/model", provider="test_provider")]
+    )
 
 
 class TestBaseDataDesignerStage:
@@ -133,6 +136,24 @@ class TestBaseDataDesignerStage:
         assert isinstance(stage.data_designer, DataDesigner)
         # DataDesigner was constructed with our provider (process would use it; we only check setup).
         assert stage.data_designer is not None
+
+    def test_deepcopy_recreates_data_designer_client(self) -> None:
+        """Xenna deep-copies pipeline stages, so the live DataDesigner client must not be copied."""
+        custom_provider = dd.ModelProvider(
+            name="test_provider",
+            endpoint="https://test.example/v1",
+            provider_type="openai",
+        )
+        stage = DataDesignerStage(
+            config_builder=_minimal_config_builder(),
+            model_providers=[custom_provider],
+        )
+
+        copied_stage = copy.deepcopy(stage)
+
+        assert isinstance(copied_stage.data_designer, DataDesigner)
+        assert copied_stage.data_designer is not stage.data_designer
+        assert copied_stage.model_providers == stage.model_providers
 
     def test_process(self) -> None:
         """process uses real config_builder and DataFrameSeedSource; only preview return is stubbed."""
@@ -242,6 +263,56 @@ class TestBaseDataDesignerStage:
         assert "ndd_running_time" in stage._custom_metrics
         assert stage._custom_metrics["num_input_records"] == 2.0
         assert stage._custom_metrics["num_output_records"] == 3.0
+
+    def test_process_create_mode_uses_artifacts_resume_and_run_config(self, tmp_path: Path) -> None:
+        """create mode should call DataDesigner.create and load the artifact-backed dataset."""
+        real_builder = _minimal_config_builder()
+        stage = DataDesignerStage(
+            config_builder=real_builder,
+            run_mode="create",
+            artifact_path=tmp_path,
+            resume_mode="if_possible",
+            run_config={
+                "buffer_size": 64,
+                "max_in_flight_tasks": 192,
+            },
+            verbose=False,
+        )
+        stage.setup()
+
+        input_df = pd.DataFrame([{"text": "hello"}])
+        output_df = pd.DataFrame([{"text": "hello", "generated": "world"}])
+        fake_results = MagicMock()
+        fake_results.load_dataset.return_value = output_df
+        fake_results.analysis = None
+        fake_results.load_analysis.return_value = None
+
+        stage.data_designer.set_run_config = MagicMock()
+        stage.data_designer.create = MagicMock(return_value=fake_results)
+
+        batch = DocumentBatch(
+            data=input_df,
+            dataset_name="ds1",
+            _metadata={"source_files": ["/data/doc_0.jsonl"]},
+        )
+        batch._set_task_id("", "source-task")
+
+        out_batch = stage.process(batch)
+
+        stage.data_designer.set_run_config.assert_called_once()
+        run_config = stage.data_designer.set_run_config.call_args.args[0]
+        assert run_config.buffer_size == 64
+        assert run_config.max_in_flight_tasks == 192
+
+        stage.data_designer.create.assert_called_once()
+        create_kwargs = stage.data_designer.create.call_args.kwargs
+        assert create_kwargs["num_records"] == 1
+        assert create_kwargs["artifact_path"] == tmp_path
+        assert create_kwargs["resume"].value == "if_possible"
+        assert create_kwargs["dataset_name"].startswith("ds1-")
+
+        fake_results.load_dataset.assert_called_once_with()
+        assert out_batch.data is output_df
 
     def test_process_with_mock_llm_endpoint(self, httpserver: pytest_httpserver.HTTPServer) -> None:
         """Run process() against a fake HTTP LLM endpoint (OpenAI-style) instead of mocking preview()."""

@@ -420,11 +420,11 @@ def test_vllm_cu129_index_url_derives_from_dynamo_pin() -> None:
     None (never a wrong, cu130-prone URL) when there's no exact pin or ai-dynamo is
     absent; a malformed Requires-Dist line is skipped, not fatal."""
     meta = dynamo_vllm.importlib.metadata
-    expected = f"https://wheels.vllm.ai/0.22.1/{dynamo_vllm._ACTOR_VENV_CUDA_TAG}"
+    expected = f"https://wheels.vllm.ai/0.24.0/{dynamo_vllm._ACTOR_VENV_CUDA_TAG}"
 
     # Exact [vllm]-extra pin wins; a malformed sibling line is skipped, not fatal.
     with mock.patch.object(
-        meta, "requires", return_value=["bad req!!!", "vllm[flashinfer]==0.22.1 ; extra == 'vllm'"]
+        meta, "requires", return_value=["bad req!!!", "vllm[flashinfer]==0.24.0 ; extra == 'vllm'"]
     ):
         assert dynamo_vllm._vllm_cu129_index_url() == expected
     # A vllm pin for a different extra must not win over the [vllm] extra pin.
@@ -433,7 +433,7 @@ def test_vllm_cu129_index_url_derives_from_dynamo_pin() -> None:
         "requires",
         return_value=[
             "vllm==0.99.0 ; extra == 'sglang'",
-            "vllm[flashinfer]==0.22.1 ; extra == 'vllm'",
+            "vllm[flashinfer]==0.24.0 ; extra == 'vllm'",
         ],
     ):
         assert dynamo_vllm._vllm_cu129_index_url() == expected

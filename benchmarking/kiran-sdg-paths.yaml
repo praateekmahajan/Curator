@@ -1,10 +1,11 @@
 paths:
   - name: results_path
-    host_path: /raid/praateekm/results
+    host_path: /raid/praateekm/curator-nightly/results
   - name: kiran_data_path
     host_path: /datasets/praateekm/bigiron_datasets/kiran
-  - name: hf_cache
-    host_path: /raid/praateekm/hf_cache
+  - name: model_weights_path
+    host_path: /raid/praateekm/hf_cache/hub
+    container_path: /model_weights
 
 sinks: []
 delete_scratch: false

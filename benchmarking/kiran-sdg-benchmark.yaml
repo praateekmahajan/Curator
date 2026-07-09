@@ -13,16 +13,23 @@ entries:
       --config-path={kiran_data_path}/en_hi_native_nostruct_g412b.bigiron.json
       --output-path={session_entry_dir}/output
       --checkpoint-path={session_entry_dir}/checkpoints
-      --hf-home={hf_cache}
+      --translation-model-path={model_weights_path}/models--RedHatAI--gemma-4-12B-it-FP8-Dynamic/snapshots/67e53491df7a281623fa740de61307d5c542b7f4
+      --evaluation-model-path={model_weights_path}/models--RedHatAI--gemma-4-31B-it-FP8-block/snapshots/e1c5d725be4d3349e85334dc108e901dd99521e4
       --executor=ray_data
       --files-per-partition=1
-      --client-workers=1
+      --client-workers=2
       --translation-concurrency=64
-      --evaluation-concurrency=64
+      --evaluation-concurrency=48
+      --ndd-run-mode=create
+      --ndd-artifact-path={session_entry_dir}/ndd-artifacts
+      --ndd-resume-mode=if_possible
+      --ndd-buffer-size=64
+      --ndd-max-in-flight-tasks=192
       --translation-replicas=2
       --evaluation-replicas=1
       --max-num-seqs=256
       --max-model-len=32768
+      --evaluation-disable-deep-gemm
       --disable-speculative
     requirements:
       - metric: input_file_count

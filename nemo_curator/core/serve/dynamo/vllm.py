@@ -67,15 +67,15 @@ _ACTOR_VENV_OVERRIDES_PATH = Path(tempfile.gettempdir()) / "nemo_curator_dynamo_
 _ACTOR_VENV_NIXL_CU13_EXCLUSION = "nixl-cu13 ; sys_platform == 'never'"
 # The CUDA build the actor venv must match (torch ecosystem + vllm wheel variant).
 _ACTOR_VENV_CUDA_TAG = "cu129"
-# Latest known nightly that includes ai-dynamo/dynamo#10380 while ai-dynamo[vllm]
-# still pins vLLM 0.22.x. Newer 1.3.0 nightlies moved to vLLM 0.23.0.
-_DYNAMO_NIGHTLY_VERSION = "1.3.0.dev20260615"
+# Latest known nightly that includes ai-dynamo/dynamo#10380 and pins
+# ai-dynamo[vllm] to vLLM 0.24.0, which has native Gemma4 Unified support.
+_DYNAMO_NIGHTLY_VERSION = "1.3.0.dev20260709"
 
 
 def _vllm_cu129_index_url() -> str | None:
     """The vLLM cu129 wheel index for the exact version ai-dynamo[vllm] pins.
 
-    ai-dynamo's [vllm] extra pins an exact vllm (e.g. ``==0.22.1``) that may
+    ai-dynamo's [vllm] extra pins an exact vllm (e.g. ``==0.24.0``) that may
     differ from Curator's base vllm — the base installs ai-dynamo WITHOUT its
     [vllm] extra, so its vllm comes from Curator's own pin, while the actor
     venv installs ``ai-dynamo[vllm]`` and must honor ai-dynamo's pin. vLLM

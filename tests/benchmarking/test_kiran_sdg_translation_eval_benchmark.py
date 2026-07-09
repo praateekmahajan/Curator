@@ -57,8 +57,10 @@ def test_kiran_gemma4_models_request_transformers5_actor_runtime_env(monkeypatch
     benchmark = _import_kiran_benchmark(monkeypatch)
     args = argparse.Namespace(
         translation_model_identifier="RedHatAI/gemma-4-12B-it-FP8-Dynamic",
+        translation_model_path="/model_weights/models--RedHatAI--gemma-4-12B-it-FP8-Dynamic/snapshots/abc",
         translation_served_model_name="google/gemma-4-12B-it",
         evaluation_model_identifier="RedHatAI/gemma-4-31B-it-FP8-block",
+        evaluation_model_path="/model_weights/models--RedHatAI--gemma-4-31B-it-FP8-block/snapshots/def",
         evaluation_served_model_name="google/gemma-4-31B-it",
         max_num_seqs=256,
         max_model_len=32768,
@@ -68,10 +70,23 @@ def test_kiran_gemma4_models_request_transformers5_actor_runtime_env(monkeypatch
         num_speculative_tokens=4,
         translation_replicas=2,
         evaluation_replicas=1,
+        translation_linear_backend=None,
+        evaluation_linear_backend=None,
+        translation_disable_deep_gemm=False,
+        evaluation_disable_deep_gemm=True,
+        hf_home=None,
     )
 
     models = benchmark._build_model_configs(args)
 
     assert len(models) == 2
-    for model in models:
-        assert model.runtime_env["uv"]["packages"] == ["transformers>=5.10.1"]
+    assert models[0].model_identifier == args.translation_model_path
+    assert models[0].model_name == args.translation_served_model_name
+    assert models[1].model_identifier == args.evaluation_model_path
+    assert models[1].model_name == args.evaluation_served_model_name
+    assert "linear_backend" not in models[0].engine_kwargs
+    assert "linear_backend" not in models[1].engine_kwargs
+    assert models[0].runtime_env["uv"]["packages"] == ["transformers>=5.10.1"]
+    assert "env_vars" not in models[0].runtime_env
+    assert models[1].runtime_env["uv"]["packages"] == ["transformers>=5.10.1"]
+    assert models[1].runtime_env["env_vars"] == {"VLLM_USE_DEEP_GEMM": "0"}
