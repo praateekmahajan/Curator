@@ -1,0 +1,33 @@
+entries:
+  - name: kiran_sdg_translation_eval_curator_dynamo_4gpu
+    enabled: true
+    script: kiran_sdg_translation_eval_benchmark.py
+    timeout_s: 28800
+    ray:
+      num_cpus: 64
+      num_gpus: 4
+      enable_object_spilling: false
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={kiran_data_path}/data/local_1024
+      --config-path={kiran_data_path}/en_hi_native_nostruct_g412b.bigiron.json
+      --output-path={session_entry_dir}/output
+      --checkpoint-path={session_entry_dir}/checkpoints
+      --hf-home={hf_cache}
+      --executor=ray_data
+      --files-per-partition=1
+      --client-workers=1
+      --translation-concurrency=64
+      --evaluation-concurrency=64
+      --translation-replicas=2
+      --evaluation-replicas=1
+      --max-num-seqs=256
+      --max-model-len=32768
+      --disable-speculative
+    requirements:
+      - metric: input_file_count
+        exact_value: 16
+      - metric: input_row_count
+        exact_value: 16384
+      - metric: output_row_count
+        exact_value: 16384

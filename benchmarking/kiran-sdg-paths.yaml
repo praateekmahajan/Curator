@@ -1,0 +1,19 @@
+paths:
+  - name: results_path
+    host_path: /raid/praateekm/results
+  - name: kiran_data_path
+    host_path: /datasets/praateekm/bigiron_datasets/kiran
+  - name: hf_cache
+    host_path: /raid/praateekm/hf_cache
+
+sinks: []
+delete_scratch: false
+object_store_size: default
+max_timeout_s: 28800
+gpu_stats_recorder:
+  interval_s: 1.0
+
+ray:
+  num_cpus: 64
+  num_gpus: 4
+  enable_object_spilling: false
