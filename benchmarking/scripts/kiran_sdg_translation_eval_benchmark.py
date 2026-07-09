@@ -95,6 +95,7 @@ def _load_config_builder(
     data_designer_config = json.loads(json.dumps(raw_config["data_designer"]))
     data_designer_config.pop("seed_config", None)
     for column_config in data_designer_config["columns"]:
+        column_config.pop("allow_resize", None)
         column_config.pop("skip", None)
         column_config.pop("propagate_skip", None)
 

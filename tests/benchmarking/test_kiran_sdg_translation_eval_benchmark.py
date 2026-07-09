@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import sys
 import types
 from pathlib import Path
@@ -51,6 +52,68 @@ def _import_kiran_benchmark(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType
     script_dir = Path(__file__).resolve().parents[2] / "benchmarking" / "scripts"
     monkeypatch.syspath_prepend(str(script_dir))
     return importlib.import_module("kiran_sdg_translation_eval_benchmark")
+
+
+def test_kiran_config_loader_drops_legacy_column_fields(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    benchmark = _import_kiran_benchmark(monkeypatch)
+    captured_config = {}
+
+    class FakeConfigBuilder:
+        @staticmethod
+        def from_config(config: dict) -> str:
+            captured_config.update(config)
+            return "builder"
+
+    benchmark.dd.DataDesignerConfigBuilder = FakeConfigBuilder
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "data_designer": {
+                    "seed_config": {"path": "/old/seed"},
+                    "columns": [
+                        {
+                            "name": "translated_text",
+                            "column_type": "llm-text",
+                            "allow_resize": False,
+                            "skip": None,
+                            "propagate_skip": True,
+                        }
+                    ],
+                    "model_configs": [
+                        {
+                            "alias": benchmark.TRANSLATION_ALIAS,
+                            "model": "translation",
+                            "inference_parameters": {},
+                        },
+                        {
+                            "alias": benchmark.EVALUATION_ALIAS,
+                            "model": "evaluation",
+                            "inference_parameters": {},
+                        },
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        benchmark._load_config_builder(config_path, translation_concurrency=11, evaluation_concurrency=22) == "builder"
+    )
+
+    assert "seed_config" not in captured_config
+    column_config = captured_config["columns"][0]
+    assert "allow_resize" not in column_config
+    assert "skip" not in column_config
+    assert "propagate_skip" not in column_config
+    translation_config, evaluation_config = captured_config["model_configs"]
+    assert translation_config["provider"] == benchmark.PROVIDER_NAME
+    assert translation_config["skip_health_check"] is True
+    assert translation_config["inference_parameters"]["max_parallel_requests"] == 11
+    assert evaluation_config["provider"] == benchmark.PROVIDER_NAME
+    assert evaluation_config["skip_health_check"] is True
+    assert evaluation_config["inference_parameters"]["max_parallel_requests"] == 22
 
 
 def test_kiran_gemma4_models_request_transformers5_actor_runtime_env(monkeypatch: pytest.MonkeyPatch) -> None:
