@@ -1,0 +1,15 @@
+paths:
+  - name: results_path
+    host_path: /raid/praateekm/curator-nightly/results
+  - name: kiran_data_path
+    host_path: /datasets/praateekm/bigiron_datasets/kiran
+    container_path: /datasets/praateekm/bigiron_datasets/kiran
+  - name: model_weights_path
+    host_path: /raid/praateekm/hf_cache/hub
+    container_path: /model_weights
+  - name: hf_home_path
+    host_path: /raid/praateekm/hf_cache
+    container_path: /hf_home
+
+gpu_stats_recorder:
+  interval_s: 1.0

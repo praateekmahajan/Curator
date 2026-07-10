@@ -156,7 +156,7 @@ def _build_model_configs(args: argparse.Namespace) -> list[DynamoVLLMModelConfig
             model_name=args.translation_served_model_name,
             runtime_env=_gemma4_transformers_runtime_env(disable_deep_gemm=args.translation_disable_deep_gemm),
             engine_kwargs=_engine_kwargs(
-                tensor_parallel_size=1,
+                tensor_parallel_size=args.translation_tensor_parallel_size,
                 max_num_seqs=args.max_num_seqs,
                 max_model_len=args.max_model_len,
                 speculative_model=None if args.disable_speculative else args.translation_speculative_model,
@@ -170,7 +170,7 @@ def _build_model_configs(args: argparse.Namespace) -> list[DynamoVLLMModelConfig
             model_name=args.evaluation_served_model_name,
             runtime_env=_gemma4_transformers_runtime_env(disable_deep_gemm=args.evaluation_disable_deep_gemm),
             engine_kwargs=_engine_kwargs(
-                tensor_parallel_size=2,
+                tensor_parallel_size=args.evaluation_tensor_parallel_size,
                 max_num_seqs=args.max_num_seqs,
                 max_model_len=args.max_model_len,
                 speculative_model=None if args.disable_speculative else args.evaluation_speculative_model,
@@ -226,7 +226,10 @@ def run_kiran_sdg_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa
         )
         raise ValueError(msg)
 
-    required_gpus = args.translation_replicas + args.evaluation_replicas * 2
+    required_gpus = (
+        args.translation_replicas * args.translation_tensor_parallel_size
+        + args.evaluation_replicas * args.evaluation_tensor_parallel_size
+    )
     aggregate_translation_fanout = args.client_workers * args.translation_concurrency
     aggregate_evaluation_fanout = args.client_workers * args.evaluation_concurrency
 
@@ -326,14 +329,14 @@ def run_kiran_sdg_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa
                     "model_identifier": args.translation_model_path or args.translation_model_identifier,
                     "source_model_identifier": args.translation_model_identifier,
                     "served_model_name": args.translation_served_model_name,
-                    "tensor_parallel_size": 1,
+                    "tensor_parallel_size": args.translation_tensor_parallel_size,
                     "num_replicas": args.translation_replicas,
                 },
                 "evaluation": {
                     "model_identifier": args.evaluation_model_path or args.evaluation_model_identifier,
                     "source_model_identifier": args.evaluation_model_identifier,
                     "served_model_name": args.evaluation_served_model_name,
-                    "tensor_parallel_size": 2,
+                    "tensor_parallel_size": args.evaluation_tensor_parallel_size,
                     "num_replicas": args.evaluation_replicas,
                 },
             },
@@ -358,6 +361,8 @@ def run_kiran_sdg_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa
             "ndd_max_in_flight_tasks": args.ndd_max_in_flight_tasks,
             "translation_replicas": args.translation_replicas,
             "evaluation_replicas": args.evaluation_replicas,
+            "translation_tensor_parallel_size": args.translation_tensor_parallel_size,
+            "evaluation_tensor_parallel_size": args.evaluation_tensor_parallel_size,
             "required_gpus": required_gpus,
             "input_tokens_median_per_record": _stage_stat(
                 output_tasks,
@@ -372,7 +377,7 @@ def run_kiran_sdg_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa
     }
 
 
-def main() -> int:
+def main() -> int:  # noqa: PLR0915
     parser = argparse.ArgumentParser(description="Kiran SDG translation/evaluation benchmark")
     parser.add_argument("--benchmark-results-path", required=True)
     parser.add_argument("--input-path", required=True)
@@ -397,6 +402,8 @@ def main() -> int:
     parser.add_argument("--ndd-max-in-flight-tasks", type=int, default=192)
     parser.add_argument("--translation-replicas", type=int, default=2)
     parser.add_argument("--evaluation-replicas", type=int, default=1)
+    parser.add_argument("--translation-tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--evaluation-tensor-parallel-size", type=int, default=2)
     parser.add_argument(
         "--translation-model-identifier",
         default="RedHatAI/gemma-4-12B-it-FP8-Dynamic",

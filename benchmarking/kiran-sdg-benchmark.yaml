@@ -1,8 +1,8 @@
 entries:
-  - name: kiran_sdg_translation_eval_curator_dynamo_4gpu
+  - name: kiran_sdg_shape_2x12b_1x31b_tp2_c2
     enabled: true
     script: kiran_sdg_translation_eval_benchmark.py
-    timeout_s: 28800
+    timeout_s: 14340
     ray:
       num_cpus: 64
       num_gpus: 4
@@ -13,28 +13,123 @@ entries:
       --config-path={kiran_data_path}/en_hi_native_nostruct_g412b.bigiron.json
       --output-path={session_entry_dir}/output
       --checkpoint-path={session_entry_dir}/checkpoints
+      --hf-home={hf_home_path}
       --translation-model-path={model_weights_path}/models--RedHatAI--gemma-4-12B-it-FP8-Dynamic/snapshots/67e53491df7a281623fa740de61307d5c542b7f4
       --evaluation-model-path={model_weights_path}/models--RedHatAI--gemma-4-31B-it-FP8-block/snapshots/e1c5d725be4d3349e85334dc108e901dd99521e4
       --executor=ray_data
+      --num-files=4
       --files-per-partition=1
       --client-workers=2
-      --translation-concurrency=64
-      --evaluation-concurrency=48
+      --translation-concurrency=128
+      --evaluation-concurrency=64
       --ndd-run-mode=create
       --ndd-artifact-path={session_entry_dir}/ndd-artifacts
       --ndd-resume-mode=if_possible
-      --ndd-buffer-size=64
-      --ndd-max-in-flight-tasks=192
+      --ndd-buffer-size=512
+      --ndd-max-in-flight-tasks=512
       --translation-replicas=2
+      --translation-tensor-parallel-size=1
       --evaluation-replicas=1
+      --evaluation-tensor-parallel-size=2
       --max-num-seqs=256
       --max-model-len=32768
+      --translation-disable-deep-gemm
       --evaluation-disable-deep-gemm
       --disable-speculative
     requirements:
       - metric: input_file_count
-        exact_value: 16
+        exact_value: 4
       - metric: input_row_count
-        exact_value: 16384
+        exact_value: 4096
       - metric: output_row_count
-        exact_value: 16384
+        exact_value: 4096
+
+  - name: kiran_sdg_shape_2x12b_2x31b_tp1_c2
+    enabled: true
+    script: kiran_sdg_translation_eval_benchmark.py
+    timeout_s: 14340
+    ray:
+      num_cpus: 64
+      num_gpus: 4
+      enable_object_spilling: false
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={kiran_data_path}/data/local_1024
+      --config-path={kiran_data_path}/en_hi_native_nostruct_g412b.bigiron.json
+      --output-path={session_entry_dir}/output
+      --checkpoint-path={session_entry_dir}/checkpoints
+      --hf-home={hf_home_path}
+      --translation-model-path={model_weights_path}/models--RedHatAI--gemma-4-12B-it-FP8-Dynamic/snapshots/67e53491df7a281623fa740de61307d5c542b7f4
+      --evaluation-model-path={model_weights_path}/models--RedHatAI--gemma-4-31B-it-FP8-block/snapshots/e1c5d725be4d3349e85334dc108e901dd99521e4
+      --executor=ray_data
+      --num-files=4
+      --files-per-partition=1
+      --client-workers=2
+      --translation-concurrency=128
+      --evaluation-concurrency=64
+      --ndd-run-mode=create
+      --ndd-artifact-path={session_entry_dir}/ndd-artifacts
+      --ndd-resume-mode=if_possible
+      --ndd-buffer-size=512
+      --ndd-max-in-flight-tasks=512
+      --translation-replicas=2
+      --translation-tensor-parallel-size=1
+      --evaluation-replicas=2
+      --evaluation-tensor-parallel-size=1
+      --max-num-seqs=256
+      --max-model-len=32768
+      --translation-disable-deep-gemm
+      --evaluation-disable-deep-gemm
+      --disable-speculative
+    requirements:
+      - metric: input_file_count
+        exact_value: 4
+      - metric: input_row_count
+        exact_value: 4096
+      - metric: output_row_count
+        exact_value: 4096
+
+  - name: kiran_sdg_shape_1x12b_3x31b_tp1_c2
+    enabled: true
+    script: kiran_sdg_translation_eval_benchmark.py
+    timeout_s: 14340
+    ray:
+      num_cpus: 64
+      num_gpus: 4
+      enable_object_spilling: false
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={kiran_data_path}/data/local_1024
+      --config-path={kiran_data_path}/en_hi_native_nostruct_g412b.bigiron.json
+      --output-path={session_entry_dir}/output
+      --checkpoint-path={session_entry_dir}/checkpoints
+      --hf-home={hf_home_path}
+      --translation-model-path={model_weights_path}/models--RedHatAI--gemma-4-12B-it-FP8-Dynamic/snapshots/67e53491df7a281623fa740de61307d5c542b7f4
+      --evaluation-model-path={model_weights_path}/models--RedHatAI--gemma-4-31B-it-FP8-block/snapshots/e1c5d725be4d3349e85334dc108e901dd99521e4
+      --executor=ray_data
+      --num-files=4
+      --files-per-partition=1
+      --client-workers=2
+      --translation-concurrency=64
+      --evaluation-concurrency=96
+      --ndd-run-mode=create
+      --ndd-artifact-path={session_entry_dir}/ndd-artifacts
+      --ndd-resume-mode=if_possible
+      --ndd-buffer-size=512
+      --ndd-max-in-flight-tasks=512
+      --translation-replicas=1
+      --translation-tensor-parallel-size=1
+      --evaluation-replicas=3
+      --evaluation-tensor-parallel-size=1
+      --max-num-seqs=256
+      --max-model-len=32768
+      --translation-disable-deep-gemm
+      --evaluation-disable-deep-gemm
+      --disable-speculative
+    requirements:
+      - metric: input_file_count
+        exact_value: 4
+      - metric: input_row_count
+        exact_value: 4096
+      - metric: output_row_count
+        exact_value: 4096
