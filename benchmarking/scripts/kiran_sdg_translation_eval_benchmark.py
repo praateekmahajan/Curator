@@ -121,6 +121,8 @@ def _engine_kwargs(  # noqa: PLR0913
     tensor_parallel_size: int,
     max_num_seqs: int,
     max_model_len: int,
+    gpu_memory_utilization: float,
+    max_num_batched_tokens: int | None,
     speculative_model: str | None,
     num_speculative_tokens: int,
     linear_backend: str | None = None,
@@ -129,7 +131,10 @@ def _engine_kwargs(  # noqa: PLR0913
         "tensor_parallel_size": tensor_parallel_size,
         "max_num_seqs": max_num_seqs,
         "max_model_len": max_model_len,
+        "gpu_memory_utilization": gpu_memory_utilization,
     }
+    if max_num_batched_tokens is not None:
+        kwargs["max_num_batched_tokens"] = max_num_batched_tokens
     if linear_backend:
         kwargs["linear_backend"] = linear_backend
     if speculative_model:
@@ -159,6 +164,8 @@ def _build_model_configs(args: argparse.Namespace) -> list[DynamoVLLMModelConfig
                 tensor_parallel_size=args.translation_tensor_parallel_size,
                 max_num_seqs=args.max_num_seqs,
                 max_model_len=args.max_model_len,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+                max_num_batched_tokens=args.max_num_batched_tokens,
                 speculative_model=None if args.disable_speculative else args.translation_speculative_model,
                 num_speculative_tokens=args.num_speculative_tokens,
                 linear_backend=args.translation_linear_backend,
@@ -173,6 +180,8 @@ def _build_model_configs(args: argparse.Namespace) -> list[DynamoVLLMModelConfig
                 tensor_parallel_size=args.evaluation_tensor_parallel_size,
                 max_num_seqs=args.max_num_seqs,
                 max_model_len=args.max_model_len,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+                max_num_batched_tokens=args.max_num_batched_tokens,
                 speculative_model=None if args.disable_speculative else args.evaluation_speculative_model,
                 num_speculative_tokens=args.num_speculative_tokens,
                 linear_backend=args.evaluation_linear_backend,
@@ -448,6 +457,8 @@ def main() -> int:  # noqa: PLR0915
     parser.add_argument("--disable-speculative", action="store_true")
     parser.add_argument("--max-num-seqs", type=int, default=256)
     parser.add_argument("--max-model-len", type=int, default=32768)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.92)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=None)
     parser.add_argument("--translation-linear-backend", default=None)
     parser.add_argument("--evaluation-linear-backend", default=None)
     parser.add_argument("--translation-disable-deep-gemm", action="store_true")

@@ -6,6 +6,9 @@ paths:
   - name: model_weights_path
     host_path: /raid/praateekm/hf_cache/hub
     container_path: /model_weights
+  - name: hf_home_path
+    host_path: /raid/praateekm/hf_cache
+    container_path: /hf_home
 
 sinks: []
 delete_scratch: false
