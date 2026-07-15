@@ -17,6 +17,11 @@ set -ex
 
 mkdir -p "/tmp/curator/results/${BRANCH_NAME}"
 
+if [[ "${ENTRY_NAME}" == video_* ]]; then
+  bash /opt/Curator/docker/common/install_h264_support.sh --with-libopenh264
+  ffmpeg -hide_banner -encoders 2>&1 | grep -w libopenh264
+fi
+
 cd /opt/Curator
 uv pip install GitPython pynvml pyyaml rich
 

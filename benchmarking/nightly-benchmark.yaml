@@ -864,6 +864,7 @@ entries:
       --executor=xenna
       --video-dir={dataset:videos,mp4}
       --model-dir={dataset:videos_model_weights,files}
+      --transcode-encoder=libopenh264
       --video-limit=1000
     timeout_s: 400
     sink_data:
@@ -890,6 +891,7 @@ entries:
       --executor=xenna
       --no-generate-embeddings
       --video-dir={dataset:videos,mp4}
+      --transcode-encoder=libopenh264
       --video-limit=1000
     timeout_s: 400
     sink_data:
@@ -919,6 +921,7 @@ entries:
       --generate-captions
       --no-generate-embeddings
       --enhance-captions
+      --transcode-encoder=libopenh264
       --video-limit=256
     timeout_s: 1800
     sink_data:
@@ -979,6 +982,7 @@ entries:
       --motion-filter=enable
       --aesthetic-threshold=3.5
       --transnetv2-frame-decoder-mode ffmpeg_cpu
+      --transcode-encoder=libopenh264
       --video-limit=1000
     timeout_s: 500
     sink_data:
