@@ -25,8 +25,14 @@ fi
 cd /opt/Curator
 uv pip install GitPython pynvml pyyaml rich
 
+if [ -n "${NEMO_CI_SESSION_NAME:-}" ]; then
+  SESSION_NAME="${NEMO_CI_SESSION_NAME}"
+else
+  SESSION_NAME="benchmark_run_${CI_PIPELINE_ID}"
+fi
+
 python benchmarking/run.py \
   --config /opt/Curator/benchmarking/nightly-benchmark.yaml \
   --config /opt/Curator/benchmarking/test-paths.yaml \
-  --session-name "benchmark_run_${CI_PIPELINE_ID}" \
+  --session-name "${SESSION_NAME}" \
   --entries "${ENTRY_NAME}"
