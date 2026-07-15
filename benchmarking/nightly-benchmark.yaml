@@ -866,7 +866,7 @@ entries:
       --model-dir={dataset:videos_model_weights,files}
       --transcode-encoder=libopenh264
       --video-limit=1000
-    timeout_s: 400
+    timeout_s: 1200
     sink_data:
       - name: slack
         ping_on_failure:
@@ -893,7 +893,7 @@ entries:
       --video-dir={dataset:videos,mp4}
       --transcode-encoder=libopenh264
       --video-limit=1000
-    timeout_s: 400
+    timeout_s: 1200
     sink_data:
       - name: slack
         ping_on_failure:
@@ -984,7 +984,7 @@ entries:
       --transnetv2-frame-decoder-mode ffmpeg_cpu
       --transcode-encoder=libopenh264
       --video-limit=1000
-    timeout_s: 500
+    timeout_s: 1200
     sink_data:
       - name: slack
         ping_on_failure:
