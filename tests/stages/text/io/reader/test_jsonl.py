@@ -55,6 +55,7 @@ class TestJsonlReaderWithoutIdGenerator:
             result = stage.process(task)
             df = result.to_pandas()
             assert CURATOR_DEDUP_ID_STR not in df.columns
+            assert isinstance(df["text"].dtype, pd.ArrowDtype)
             assert len(df) == 2  # Each file has 2 rows
 
     def test_columns_selection(self, file_group_tasks: list[FileGroupTask]) -> None:
@@ -80,12 +81,14 @@ class TestJsonlReaderWithoutIdGenerator:
 
         def fake_read_json(_path: object, *_args: object, **kwargs: object) -> pd.DataFrame:
             seen["storage_options"] = kwargs.get("storage_options") if isinstance(kwargs, dict) else None
+            seen["dtype_backend"] = kwargs.get("dtype_backend") if isinstance(kwargs, dict) else None
             return pd.DataFrame({"a": [1]})
 
         monkeypatch.setattr(pd, "read_json", fake_read_json)
 
         out = stage.process(task)
         assert seen["storage_options"] == {"auto_mkdir": True}
+        assert seen["dtype_backend"] == "pyarrow"
         df = out.to_pandas()
         assert len(df) == 1
 

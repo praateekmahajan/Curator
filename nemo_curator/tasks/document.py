@@ -46,7 +46,7 @@ class DocumentBatch(Task[pa.Table | pd.DataFrame]):
         if isinstance(self.data, pd.DataFrame):
             return self.data
         elif isinstance(self.data, pa.Table):
-            return self.data.to_pandas()
+            return self.data.to_pandas(types_mapper=pd.ArrowDtype)
         else:
             msg = f"Cannot convert {type(self.data)} to Pandas DataFrame"
             raise TypeError(msg)

@@ -65,6 +65,8 @@ class JsonlReaderStage(BaseReader):
             raise ValueError(msg)
         else:
             read_kwargs["lines"] = True
+        if "dtype_backend" not in read_kwargs:
+            read_kwargs["dtype_backend"] = "pyarrow"
 
         dfs = []
         for file_path in paths:
