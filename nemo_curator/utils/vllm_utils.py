@@ -120,12 +120,6 @@ def create_vllm_llm(  # noqa: PLR0913
         (e.g. ``gpu_memory_utilization``, ``max_num_batched_tokens``). Keys here
         override the explicit defaults above when they collide.
     """
-    import os
-    import random
-    import time
-
-    from vllm import LLM
-
     if limit_mm_per_prompt is None:
         limit_mm_per_prompt = {"image": 1}
 
@@ -138,6 +132,23 @@ def create_vllm_llm(  # noqa: PLR0913
         "enforce_eager": enforce_eager,
         **extra_engine_kwargs,
     }
+
+    return create_vllm_llm_with_retry(max_port_retries=max_port_retries, **engine_kwargs)
+
+
+def create_vllm_llm_with_retry(*, max_port_retries: int = 3, **engine_kwargs: object) -> "vllm.LLM":  # noqa: F821,UP037
+    """Create a vLLM engine with port-collision retries and no added engine defaults.
+
+    This is the configuration-preserving primitive for existing stages that
+    already construct their complete ``LLM`` keyword arguments. New callers
+    that want Curator's standard multimodal defaults should use
+    :func:`create_vllm_llm` instead.
+    """
+    import os
+    import random
+    import time
+
+    from vllm import LLM
 
     for attempt in range(1, max_port_retries + 1):
         free_port = pick_free_port()
