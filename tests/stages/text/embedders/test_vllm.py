@@ -25,6 +25,7 @@ with suppress(ImportError):
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import torch
 
 from nemo_curator.tasks import DocumentBatch
@@ -58,6 +59,8 @@ class TestVLLMEmbeddingModelStage:
         assert stage.model_identifier == TEST_MODEL
         assert stage.text_field == "text"
         assert stage.embedding_field == "embeddings"
+        assert stage.retained_fields is None
+        assert stage.model_inference_batch_size == 1024
         assert stage.pretokenize is True
         assert stage.verbose is False
         assert stage.model is None
@@ -72,6 +75,8 @@ class TestVLLMEmbeddingModelStage:
             model_identifier=TEST_MODEL,
             text_field="content",
             embedding_field="emb",
+            retained_fields=["id", "content", "id"],
+            model_inference_batch_size=17,
             pretokenize=True,
             cache_dir="/tmp/cache",  # noqa: S108
             hf_token="test-token",  # noqa: S106
@@ -81,13 +86,15 @@ class TestVLLMEmbeddingModelStage:
         assert stage.model_identifier == TEST_MODEL
         assert stage.text_field == "content"
         assert stage.embedding_field == "emb"
+        assert stage.retained_fields == ["id", "content"]
+        assert stage.model_inference_batch_size == 17
         assert stage.pretokenize is True
         assert stage.cache_dir == "/tmp/cache"  # noqa: S108
         assert stage.hf_token == "test-token"  # noqa: S105
         assert stage.verbose is True
 
         assert stage.inputs() == (["data"], ["content"])
-        assert stage.outputs() == (["data"], ["content", "emb"])
+        assert stage.outputs() == (["data"], ["id", "content", "emb"])
 
         assert stage.resources.gpus == 1
         assert stage.resources.cpus == 1
@@ -123,14 +130,14 @@ class TestVLLMEmbeddingModelStage:
             )
             return f"/resolved/snapshots/{model_identifier}"
 
-        class _FakeLLM:
-            def __init__(self, model: str, **kwargs: Any) -> None:  # noqa: ANN401
-                captured["llm"] = {"model": model, "kwargs": kwargs}
+        def _fake_create_vllm_llm(*, model: str, **kwargs: Any) -> object:  # noqa: ANN401
+            captured["llm"] = {"model": model, "kwargs": kwargs}
+            return object()
 
         import nemo_curator.stages.text.embedders.vllm as _vllm_mod
 
         monkeypatch.setattr(_vllm_mod, "snapshot_download", _fake_snapshot_download)
-        monkeypatch.setattr(_vllm_mod, "LLM", _FakeLLM)
+        monkeypatch.setattr(_vllm_mod, "create_vllm_llm_with_retry", _fake_create_vllm_llm)
 
         stage.setup_on_node()
 
@@ -143,6 +150,83 @@ class TestVLLMEmbeddingModelStage:
         # vLLM receives the resolved snapshot path (not the repo ID)
         assert captured["llm"]["model"] == f"/resolved/snapshots/{TEST_MODEL}"
         assert captured["llm"]["kwargs"]["download_dir"] == str(cache_dir)
+
+    def test_process_returns_projected_arrow_float32_embeddings(self) -> None:
+        class _PoolingOutput:
+            def __init__(self, values: list[float]):
+                self.outputs = type("Outputs", (), {"data": torch.tensor(values, dtype=torch.bfloat16)})()
+
+        class _FakeModel:
+            def __init__(self):
+                self.call: dict[str, Any] | None = None
+
+            def encode(self, prompts: list[str], **kwargs: object) -> list[_PoolingOutput]:
+                self.call = {"prompts": prompts, **kwargs}
+                return [_PoolingOutput([1.0, 2.0]), _PoolingOutput([3.0, 4.0])]
+
+        stage = VLLMEmbeddingModelStage(
+            model_identifier=TEST_MODEL,
+            pretokenize=False,
+            retained_fields=["_curator_dedup_id", "adlr_id"],
+        )
+        fake_model = _FakeModel()
+        stage.model = fake_model  # type: ignore[assignment]
+        batch = DocumentBatch(
+            dataset_name="test_dataset",
+            data=pd.DataFrame(
+                {
+                    "text": ["first", "second"],
+                    "_curator_dedup_id": [10, 11],
+                    "adlr_id": ["a", "b"],
+                }
+            ).convert_dtypes(dtype_backend="pyarrow"),
+        )
+
+        result = stage.process(batch)
+
+        assert isinstance(result.data, pa.Table)
+        assert result.data.column_names == ["_curator_dedup_id", "adlr_id", "embeddings"]
+        embedding_type = result.data.schema.field("embeddings").type
+        assert pa.types.is_list(embedding_type)
+        assert embedding_type.value_type == pa.float32()
+        assert result.data["embeddings"].to_pylist() == [[1.0, 2.0], [3.0, 4.0]]
+        assert fake_model.call is not None
+        assert fake_model.call["pooling_task"] == "embed"
+
+    def test_process_chunks_rows_and_preserves_embedding_order(self) -> None:
+        class _PoolingOutput:
+            def __init__(self, value: float):
+                self.outputs = type("Outputs", (), {"data": torch.tensor([value], dtype=torch.bfloat16)})()
+
+        class _FakeModel:
+            def __init__(self):
+                self.calls: list[list[str]] = []
+
+            def encode(self, prompts: list[str], **_: object) -> list[_PoolingOutput]:
+                self.calls.append(prompts)
+                return [_PoolingOutput(float(prompt)) for prompt in prompts]
+
+        stage = VLLMEmbeddingModelStage(
+            model_identifier=TEST_MODEL,
+            pretokenize=False,
+            retained_fields=["id"],
+            model_inference_batch_size=2,
+        )
+        fake_model = _FakeModel()
+        stage.model = fake_model  # type: ignore[assignment]
+        batch = DocumentBatch(
+            dataset_name="test_dataset",
+            data=pd.DataFrame({"text": ["0", "1", "2", "3", "4"], "id": [10, 11, 12, 13, 14]}),
+        )
+
+        result = stage.process(batch)
+
+        assert fake_model.calls == [["0", "1"], ["2", "3"], ["4"]]
+        assert result.data["embeddings"].to_pylist() == [[0.0], [1.0], [2.0], [3.0], [4.0]]
+
+    def test_rejects_nonpositive_model_inference_batch_size(self) -> None:
+        with pytest.raises(ValueError, match="model_inference_batch_size must be positive"):
+            VLLMEmbeddingModelStage(model_identifier=TEST_MODEL, model_inference_batch_size=0)
 
     @pytest.mark.parametrize("pretokenize", [True, False])
     def test_vllm_produces_valid_embeddings(
