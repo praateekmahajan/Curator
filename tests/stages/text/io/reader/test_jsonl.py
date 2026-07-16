@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+import ray
 
 from nemo_curator.stages.deduplication.id_generator import (
     CURATOR_DEDUP_ID_STR,
@@ -127,6 +128,41 @@ class TestJsonlReaderWithoutIdGenerator:
 
 class TestJsonlReaderWithIdGenerator:
     """Test JSONL reader with ID generation."""
+
+    def test_id_generator_path_mapping(self) -> None:
+        stage = JsonlReaderStage(
+            id_generator_path_mapping={
+                "/physical/data": "/logical/data",
+                "/physical/data/specific": "/logical/specific",
+            }
+        )
+
+        assert stage._map_id_generator_paths("/physical/data/file.jsonl") == "/logical/data/file.jsonl"
+        assert stage._map_id_generator_paths(["/physical/data/specific/a.jsonl", "/unmapped/b.jsonl"]) == [
+            "/logical/specific/a.jsonl",
+            "/unmapped/b.jsonl",
+        ]
+        assert stage._map_id_generator_paths("/physical/dataset/file.jsonl") == "/physical/dataset/file.jsonl"
+
+    def test_composite_passes_id_generator_path_mapping(self) -> None:
+        mapping = {"/physical/data": "/logical/data"}
+        reader_stage = JsonlReader(
+            file_paths="/physical/data",
+            id_generator_path_mapping=mapping,
+        ).decompose()[-1]
+
+        assert reader_stage.id_generator_path_mapping == mapping
+
+    @pytest.mark.usefixtures("ray_client_with_id_generator")
+    def test_assign_ids_uses_prefix_of_reserved_range(self) -> None:
+        stage = JsonlReaderStage(_assign_ids=True)
+        stage.setup()
+        ray.get(stage.id_generator.register_batch.remote("file.jsonl", 10))
+
+        result = stage._assign_ids_func("file.jsonl", pd.DataFrame({"text": ["a", "b", "c"]}))
+
+        assert result[CURATOR_DEDUP_ID_STR].tolist() == [0, 1, 2]
+        assert isinstance(result[CURATOR_DEDUP_ID_STR].dtype, pd.ArrowDtype)
 
     @pytest.mark.usefixtures("ray_client_with_id_generator")
     def test_sequential_id_generation_and_assignment(self, file_group_tasks: list[FileGroupTask]) -> None:

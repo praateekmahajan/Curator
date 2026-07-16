@@ -100,6 +100,7 @@ class JsonlReader(CompositeStage[EmptyTask, DocumentBatch]):
     file_extensions: list[str] = field(default_factory=lambda: FILETYPE_TO_DEFAULT_EXTENSIONS["jsonl"])
     _generate_ids: bool = False
     _assign_ids: bool = False
+    id_generator_path_mapping: dict[str, str] = field(default_factory=dict)
     name: str = "jsonl_reader"
 
     def __post_init__(self):
@@ -114,6 +115,13 @@ class JsonlReader(CompositeStage[EmptyTask, DocumentBatch]):
             msg = f"Converting DocumentBatch to {self.task_type} is not supported yet."
             raise NotImplementedError(msg)
 
+        reader_stage = JsonlReaderStage(
+            fields=self.fields,
+            read_kwargs=(self.read_kwargs or {}),
+            _generate_ids=self._generate_ids,
+            _assign_ids=self._assign_ids,
+            id_generator_path_mapping=self.id_generator_path_mapping,
+        )
         return [
             FilePartitioningStage(
                 file_paths=self.file_paths,
@@ -124,12 +132,7 @@ class JsonlReader(CompositeStage[EmptyTask, DocumentBatch]):
                 if self.read_kwargs is not None
                 else None,
             ),
-            JsonlReaderStage(
-                fields=self.fields,
-                read_kwargs=(self.read_kwargs or {}),
-                _generate_ids=self._generate_ids,
-                _assign_ids=self._assign_ids,
-            ),
+            reader_stage,
         ]
 
     def get_description(self) -> str:
