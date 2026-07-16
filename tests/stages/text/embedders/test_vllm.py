@@ -14,6 +14,7 @@
 
 from contextlib import suppress
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 import pytest
@@ -222,6 +223,55 @@ class TestVLLMEmbeddingModelStage:
         result = stage.process(batch)
 
         assert fake_model.calls == [["0", "1"], ["2", "3"], ["4"]]
+        assert result.data["embeddings"].to_pylist() == [[0.0], [1.0], [2.0], [3.0], [4.0]]
+
+    def test_process_prepares_exactly_one_chunk_ahead(self) -> None:
+        second_chunk_prepared = Event()
+        third_chunk_prepared = Event()
+
+        class _PoolingOutput:
+            def __init__(self, value: float):
+                self.outputs = type("Outputs", (), {"data": torch.tensor([value], dtype=torch.bfloat16)})()
+
+        class _DoubleBufferedStage(VLLMEmbeddingModelStage):
+            def _prepare_input_chunk(
+                self, text_column: pa.ChunkedArray, offset: int, chunk_size: int
+            ) -> tuple[list[Any], float]:
+                result = super()._prepare_input_chunk(text_column, offset, chunk_size)
+                if offset == 2:
+                    second_chunk_prepared.set()
+                elif offset == 4:
+                    third_chunk_prepared.set()
+                return result
+
+        class _FakeModel:
+            def __init__(self):
+                self.num_calls = 0
+
+            def encode(self, prompts: list[str], **_: object) -> list[_PoolingOutput]:
+                if self.num_calls == 0:
+                    assert second_chunk_prepared.wait(timeout=1)
+                    assert not third_chunk_prepared.is_set()
+                self.num_calls += 1
+                return [_PoolingOutput(float(prompt)) for prompt in prompts]
+
+        stage = _DoubleBufferedStage(
+            model_identifier=TEST_MODEL,
+            pretokenize=False,
+            retained_fields=["id"],
+            model_inference_batch_size=2,
+        )
+        fake_model = _FakeModel()
+        stage.model = fake_model  # type: ignore[assignment]
+        batch = DocumentBatch(
+            dataset_name="test_dataset",
+            data=pd.DataFrame({"text": ["0", "1", "2", "3", "4"], "id": [10, 11, 12, 13, 14]}),
+        )
+
+        result = stage.process(batch)
+
+        assert fake_model.num_calls == 3
+        assert third_chunk_prepared.is_set()
         assert result.data["embeddings"].to_pylist() == [[0.0], [1.0], [2.0], [3.0], [4.0]]
 
     def test_rejects_nonpositive_model_inference_batch_size(self) -> None:

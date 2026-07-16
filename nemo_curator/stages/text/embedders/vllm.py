@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import gc
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -31,6 +32,7 @@ from nemo_curator.utils.vllm_utils import create_vllm_llm_with_retry
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from concurrent.futures import Future
 
     from transformers import AutoTokenizer
     from vllm import LLM
@@ -213,11 +215,43 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     def _iter_prepared_chunks(
         self, text_column: pa.ChunkedArray, num_rows: int
     ) -> Iterator[tuple[int, int, list[Any], float]]:
-        """Prepare bounded input chunks for model inference."""
-        for offset in range(0, num_rows, self.model_inference_batch_size):
-            chunk_size = min(self.model_inference_batch_size, num_rows - offset)
-            input_data, tokenization_time = self._prepare_input_chunk(text_column, offset, chunk_size)
-            yield offset, chunk_size, input_data, tokenization_time
+        """Prepare one chunk ahead while the caller embeds the current chunk."""
+        chunk_specs = iter(
+            (offset, min(self.model_inference_batch_size, num_rows - offset))
+            for offset in range(0, num_rows, self.model_inference_batch_size)
+        )
+        pending_offset, pending_chunk_size = next(chunk_specs)
+
+        # The yielded chunk and one pending future are the only prepared chunks
+        # resident at once. The generator cannot submit a third chunk until its
+        # caller finishes embedding the yielded chunk and requests the next one.
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="vllm-tokenizer") as executor:
+            pending_input: Future[tuple[list[Any], float]] = executor.submit(
+                self._prepare_input_chunk,
+                text_column,
+                pending_offset,
+                pending_chunk_size,
+            )
+            while True:
+                input_data, tokenization_time = pending_input.result()
+                try:
+                    next_offset, next_chunk_size = next(chunk_specs)
+                except StopIteration:
+                    next_input = None
+                else:
+                    next_input = executor.submit(
+                        self._prepare_input_chunk,
+                        text_column,
+                        next_offset,
+                        next_chunk_size,
+                    )
+
+                yield pending_offset, pending_chunk_size, input_data, tokenization_time
+                if next_input is None:
+                    break
+                pending_offset = next_offset
+                pending_chunk_size = next_chunk_size
+                pending_input = next_input
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:
         input_table = batch.to_pyarrow()
