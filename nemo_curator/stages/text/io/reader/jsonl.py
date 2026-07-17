@@ -101,6 +101,7 @@ class JsonlReader(CompositeStage[EmptyTask, DocumentBatch]):
     _generate_ids: bool = False
     _assign_ids: bool = False
     id_generator_path_mapping: dict[str, str] = field(default_factory=dict)
+    read_max_workers: int | None = None
     name: str = "jsonl_reader"
 
     def __post_init__(self):
@@ -122,6 +123,13 @@ class JsonlReader(CompositeStage[EmptyTask, DocumentBatch]):
             _assign_ids=self._assign_ids,
             id_generator_path_mapping=self.id_generator_path_mapping,
         )
+        if self.read_max_workers is not None:
+            from nemo_curator.backends.utils import RayStageSpecKeys
+
+            reader_stage = reader_stage.with_(
+                ray_stage_spec={RayStageSpecKeys.MAX_WORKERS: self.read_max_workers},
+            )
+
         return [
             FilePartitioningStage(
                 file_paths=self.file_paths,

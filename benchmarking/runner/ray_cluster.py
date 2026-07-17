@@ -54,7 +54,8 @@ def setup_ray_cluster_and_env(  # noqa: PLR0913
 ) -> tuple[RayClient, Path]:
     """Setup a Ray cluster and set the RAY_ADDRESS environment variable and return the Ray client and temp dir."""
     # Create a short temp dir to avoid Unix socket path length limits
-    short_temp_path = Path(f"/tmp/ray_{uuid.uuid4().hex[:8]}")  # noqa: S108
+    ray_temp_root = Path(os.environ.get("RAY_TMPDIR", "/tmp"))
+    short_temp_path = ray_temp_root / f"ray_{uuid.uuid4().hex[:8]}"
     short_temp_path.mkdir(parents=True, exist_ok=True)
 
     # Capture stdout/stderr to a file if provided, otherwise suppress it

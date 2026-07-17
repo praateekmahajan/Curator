@@ -18,6 +18,7 @@ import pandas as pd
 import pytest
 import ray
 
+from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.deduplication.id_generator import (
     CURATOR_DEDUP_ID_STR,
 )
@@ -152,6 +153,16 @@ class TestJsonlReaderWithIdGenerator:
         ).decompose()[-1]
 
         assert reader_stage.id_generator_path_mapping == mapping
+
+    def test_composite_caps_reader_actor_autoscaling(self) -> None:
+        reader_stage = JsonlReader(
+            file_paths="/physical/data",
+            _assign_ids=True,
+            read_max_workers=4,
+        ).decompose()[-1]
+
+        assert reader_stage.num_workers() is None
+        assert reader_stage.ray_stage_spec()[RayStageSpecKeys.MAX_WORKERS] == 4
 
     @pytest.mark.usefixtures("ray_client_with_id_generator")
     def test_assign_ids_uses_prefix_of_reserved_range(self) -> None:
