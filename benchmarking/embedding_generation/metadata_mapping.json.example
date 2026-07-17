@@ -1,5 +1,11 @@
 {
   "task_metadata_field": "mapping_names",
+  "text_extraction": {
+    "content_field": "multimodal_document",
+    "text_field": "text",
+    "separator": "\n\n",
+    "merge_strategy": "separator"
+  },
   "output_dtypes": {
     "source_family_id": "int8",
     "source_dataset_id": "int16",

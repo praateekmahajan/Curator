@@ -9,7 +9,7 @@ from nemo_curator.stages.text.modules import MetadataExtractor
 from nemo_curator.tasks import DocumentBatch
 
 
-def _extractor() -> MetadataExtractor:
+def _extractor(merge_strategy: str = "separator") -> MetadataExtractor:
     return MetadataExtractor(
         metadata_mapping={
             "source_a": {
@@ -34,6 +34,8 @@ def _extractor() -> MetadataExtractor:
             "quality_rank": "int8",
             "recency_rank": "int8",
         },
+        content_field="multimodal_document",
+        merge_strategy=merge_strategy,
     )
 
 
@@ -78,4 +80,73 @@ def test_rejects_existing_output_column() -> None:
     )
 
     with pytest.raises(ValueError, match="will not overwrite"):
+        _extractor().process(batch)
+
+
+def test_preserves_existing_text_and_other_columns() -> None:
+    batch = DocumentBatch(
+        dataset_name="test",
+        data=pa.table({"text": ["already present"], "other": [7]}),
+        _metadata={"mapping_names": ["source_a"]},
+    )
+
+    result = _extractor().process(batch).to_pyarrow()
+
+    assert result["text"].to_pylist() == ["already present"]
+    assert result["other"].to_pylist() == [7]
+
+
+def test_extracts_text_blocks_and_ignores_non_text_items() -> None:
+    extractor = _extractor()
+
+    assert extractor._extract_text({"content": ["first", {"kind": "non_text"}, "second"]}) == "first\n\nsecond"
+
+
+def test_extracts_text_and_preserves_source_document() -> None:
+    batch = DocumentBatch(
+        dataset_name="test",
+        data=pa.Table.from_pylist(
+            [
+                {
+                    "multimodal_document": {
+                        "content": ["first", "second"],
+                    },
+                    "other": 7,
+                }
+            ]
+        ),
+        _metadata={"mapping_names": ["source_a"]},
+    )
+
+    result = _extractor().process(batch).to_pyarrow()
+
+    assert result["text"].to_pylist() == ["first\n\nsecond"]
+    assert result["other"].to_pylist() == [7]
+    assert "multimodal_document" in result.column_names
+
+
+@pytest.mark.parametrize(
+    ("blocks", "expected"),
+    [
+        (["first", "second"], "first second"),
+        (["first\n", "second"], "first\n\nsecond"),
+        (["first", "\nsecond"], "first\n\nsecond"),
+        (["  unchanged  "], "  unchanged  "),
+        ([], ""),
+    ],
+)
+def test_smart_merge(blocks: list[str], expected: str) -> None:
+    extractor = _extractor(merge_strategy="smart")
+
+    assert extractor._extract_text({"content": blocks}) == expected
+
+
+def test_fails_when_neither_text_nor_content_is_available() -> None:
+    batch = DocumentBatch(
+        dataset_name="test",
+        data=pa.table({"other": [7]}),
+        _metadata={"mapping_names": ["source_a"]},
+    )
+
+    with pytest.raises(ValueError, match="neither text field"):
         _extractor().process(batch)

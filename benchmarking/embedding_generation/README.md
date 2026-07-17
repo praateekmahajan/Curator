@@ -4,6 +4,8 @@ Copy `paths.yaml.example` to ignored `paths.yaml`, fill in the paths, and create
 
 `MetadataExtractor` resolves one `mapping_names` entry per input file and broadcasts its configured integer provenance/ranking values onto every row. Stable source IDs and mutable policy ranks remain in the private mapping, while the generic stage and example schema contain no dataset-specific policy. Pairwise ranking can sort `source_priority`, `quality_rank`, and `recency_rank` descending, followed by the dedup ID ascending.
 
+When `text_extraction` is configured, an existing scalar `text` column is preserved. If it is absent, the stage keeps string blocks from `<content_field>.content`, ignores non-text items, and creates `text` using either a fixed separator or whitespace-aware smart merging. Other input columns are preserved; the embedding writer removes only the temporary `text` column.
+
 Smoke test two logical shards:
 
 ```bash

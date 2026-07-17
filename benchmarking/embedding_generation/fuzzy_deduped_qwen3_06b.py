@@ -80,17 +80,22 @@ def load_metadata_extractor(path: str | Path) -> MetadataExtractor:
     metadata_mapping = payload.get("metadata_mapping")
     output_dtypes = payload.get("output_dtypes")
     task_metadata_field = payload.get("task_metadata_field", "mapping_names")
+    text_extraction = payload.get("text_extraction", {})
     if not isinstance(metadata_mapping, dict) or not isinstance(output_dtypes, dict):
         msg = f"Metadata configuration must define metadata_mapping and output_dtypes objects: {path}"
         raise TypeError(msg)
     if not isinstance(task_metadata_field, str):
         msg = f"Metadata configuration task_metadata_field must be a string: {path}"
         raise TypeError(msg)
+    if not isinstance(text_extraction, dict):
+        msg = f"Metadata configuration text_extraction must be an object: {path}"
+        raise TypeError(msg)
 
     return MetadataExtractor(
         metadata_mapping=metadata_mapping,
         output_dtypes=output_dtypes,
         task_metadata_field=task_metadata_field,
+        **text_extraction,
     )
 
 

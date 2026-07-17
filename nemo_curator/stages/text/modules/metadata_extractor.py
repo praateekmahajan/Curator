@@ -12,6 +12,41 @@ import pyarrow as pa
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import DocumentBatch
 
+DEFAULT_SEPARATOR = "\n\n"
+MERGE_STRATEGIES = ("separator", "smart")
+
+
+def _merge_separator(text_blocks: list[str], separator: str) -> str:
+    """Join text blocks verbatim with a fixed separator."""
+    return separator.join(text_blocks)
+
+
+def _merge_smart(text_blocks: list[str], _separator: str) -> str:
+    """Merge blocks with whitespace-aware boundaries."""
+    merged_text: list[str] = []
+    if len(text_blocks) > 1:
+        for index, block in enumerate(text_blocks):
+            if index == 0:
+                stripped_block = block.rstrip()
+            else:
+                stripped_block = block.lstrip()
+                if index < len(text_blocks) - 1:
+                    stripped_block = stripped_block.rstrip()
+
+                previous_block = text_blocks[index - 1]
+                if previous_block.rstrip(" \t").endswith("\n") or block.lstrip(" \t").startswith("\n"):
+                    merged_text.append("\n\n")
+                else:
+                    merged_text.append(" ")
+
+            merged_text.append(stripped_block)
+    else:
+        merged_text = text_blocks
+    return "".join(merged_text)
+
+
+_MERGERS = {"separator": _merge_separator, "smart": _merge_smart}
+
 
 @dataclass
 class MetadataExtractor(ProcessingStage[DocumentBatch, DocumentBatch]):
@@ -24,6 +59,10 @@ class MetadataExtractor(ProcessingStage[DocumentBatch, DocumentBatch]):
     metadata_mapping: dict[str, dict[str, int]]
     output_dtypes: dict[str, str]
     task_metadata_field: str = "mapping_names"
+    content_field: str | None = None
+    text_field: str = "text"
+    separator: str = DEFAULT_SEPARATOR
+    merge_strategy: str = "separator"
     name: str = "metadata_extractor"
 
     def __post_init__(self) -> None:
@@ -33,6 +72,10 @@ class MetadataExtractor(ProcessingStage[DocumentBatch, DocumentBatch]):
         if not self.output_dtypes:
             msg = "output_dtypes must not be empty"
             raise ValueError(msg)
+        if self.merge_strategy not in _MERGERS:
+            msg = f"merge_strategy must be one of {MERGE_STRATEGIES}, got {self.merge_strategy!r}"
+            raise ValueError(msg)
+        self._merge = _MERGERS[self.merge_strategy]
 
         expected_fields = set(self.output_dtypes)
         for lookup_key, values in self.metadata_mapping.items():
@@ -66,7 +109,10 @@ class MetadataExtractor(ProcessingStage[DocumentBatch, DocumentBatch]):
         return ["data"], []
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], list(self.output_dtypes)
+        output_fields = list(self.output_dtypes)
+        if self.content_field is not None:
+            output_fields.append(self.text_field)
+        return ["data"], output_fields
 
     def _resolve_values(self, task: DocumentBatch) -> dict[str, int]:
         raw_keys: Any = task._metadata.get(self.task_metadata_field)
@@ -87,9 +133,31 @@ class MetadataExtractor(ProcessingStage[DocumentBatch, DocumentBatch]):
             raise ValueError(msg)
         return self.metadata_mapping[matches[0]]
 
+    def _extract_text(self, document: object) -> str:
+        if isinstance(document, dict):
+            content = document.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                text_blocks = [item for item in content if isinstance(item, str)]
+                return self._merge(text_blocks, self.separator)
+        return ""
+
+    def _add_text_if_missing(self, table: pa.Table) -> pa.Table:
+        if self.text_field in table.column_names or self.content_field is None:
+            return table
+        if self.content_field not in table.column_names:
+            msg = (
+                f"Input has neither text field {self.text_field!r} nor configured content field {self.content_field!r}"
+            )
+            raise ValueError(msg)
+
+        texts = [self._extract_text(document) for document in table[self.content_field].to_pylist()]
+        return table.append_column(self.text_field, pa.array(texts, type=pa.string()))
+
     def process(self, task: DocumentBatch) -> DocumentBatch:
         values = self._resolve_values(task)
-        table = task.to_pyarrow()
+        table = self._add_text_if_missing(task.to_pyarrow())
         collisions = sorted(set(table.column_names) & set(values))
         if collisions:
             msg = f"MetadataExtractor will not overwrite existing columns: {collisions}"
