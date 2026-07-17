@@ -88,6 +88,15 @@ class TestPairwiseCosineSimilarityBatched:
         )
         np.testing.assert_array_equal(max_indices_ref.tolist(), max_indices_test.tolist())
 
+    @pytest.mark.parametrize("batch_size", [1, 2])
+    def test_negative_similarity_is_not_replaced_by_masked_zero(self, batch_size: int) -> None:
+        embeddings = torch.tensor([[1.0, 0.0], [-1.0, 0.0]], dtype=torch.float32)
+
+        max_similarity, max_indices = pairwise_cosine_similarity_batched(embeddings, batch_size)
+
+        np.testing.assert_array_equal(max_indices.tolist(), [0, 0])
+        np.testing.assert_allclose(max_similarity.tolist(), [0.0, -1.0])
+
 
 @pytest.mark.gpu
 class TestPairwiseCosineSimilarityStage:

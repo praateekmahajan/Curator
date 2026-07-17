@@ -40,7 +40,7 @@ def pairwise_cosine_similarity_batched(
 ) -> tuple["cp.ndarray", "cp.ndarray"] | tuple[np.ndarray, np.ndarray]:
     """
     Computes pairwise cosine similarity between cluster items,
-    then replace to diagonal with zeros to ignore self similarity.
+    considering only earlier rows as candidate neighbors.
     This function is useful for large clusters where the pairwise similarity matrix
     does not fit into memory.
     We use a batched approach to compute the pairwise similarity matrix in batches.
@@ -54,15 +54,20 @@ def pairwise_cosine_similarity_batched(
     cluster_reps = cluster_reps.to(device)
     max_similarity = torch.zeros(cluster_reps.shape[0], dtype=torch.float32, device=device)
     max_indices = torch.zeros(cluster_reps.shape[0], dtype=torch.int64, device=device)
+    row_indices = torch.arange(cluster_reps.shape[0], device=device).unsqueeze(1)
     for start_idx in range(0, cluster_reps.shape[0], batch_size):
         end_idx = min(start_idx + batch_size, cluster_reps.shape[0])
         batch = cluster_reps[start_idx:end_idx]
         pairwise_sim_matrix = torch.mm(cluster_reps, batch.T)
-        triu_sim_matrix = torch.triu(pairwise_sim_matrix, diagonal=1 - start_idx)
-        del batch, pairwise_sim_matrix
-        max_values_and_indices = torch.max(triu_sim_matrix, dim=0)
+        column_indices = torch.arange(start_idx, end_idx, device=device).unsqueeze(0)
+        pairwise_sim_matrix.masked_fill_(row_indices >= column_indices, -torch.inf)
+        max_values_and_indices = torch.max(pairwise_sim_matrix, dim=0)
+        if start_idx == 0:
+            max_values_and_indices.values[0] = 0.0
+            max_values_and_indices.indices[0] = 0
         max_similarity[start_idx:end_idx] = max_values_and_indices[0]
         max_indices[start_idx:end_idx] = max_values_and_indices[1]
+        del batch, pairwise_sim_matrix, column_indices
 
     if device == "cuda":
         return cp.asarray(max_similarity), cp.asarray(max_indices)
