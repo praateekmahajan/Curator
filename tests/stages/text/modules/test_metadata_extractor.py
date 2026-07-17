@@ -7,6 +7,7 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 
+from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.text.embedders.vllm import VLLMEmbeddingModelStage
 from nemo_curator.stages.text.io.reader.jsonl import JsonlReaderStage
 from nemo_curator.stages.text.modules import MetadataExtractor
@@ -39,6 +40,10 @@ def _extractor(
         merge_strategy=merge_strategy,
         retained_input_fields=retained_input_fields,
     )
+
+
+def test_is_plain_transformer_not_pipeline_stage() -> None:
+    assert not isinstance(_extractor(), ProcessingStage)
 
 
 @pytest.mark.parametrize(

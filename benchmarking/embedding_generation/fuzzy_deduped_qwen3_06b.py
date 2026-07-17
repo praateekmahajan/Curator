@@ -9,8 +9,9 @@ import argparse
 import json
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -38,6 +39,9 @@ from nemo_curator.stages.deduplication.id_generator import (
 from nemo_curator.stages.text.io.reader.jsonl import JsonlReaderStage
 from nemo_curator.stages.text.modules import MetadataExtractor
 from nemo_curator.tasks.utils import TaskPerfUtils
+
+if TYPE_CHECKING:
+    from nemo_curator.tasks import DocumentBatch, FileGroupTask
 
 
 def load_metadata_extractor(path: str | Path) -> MetadataExtractor:
@@ -69,6 +73,32 @@ def load_metadata_extractor(path: str | Path) -> MetadataExtractor:
     )
 
 
+@dataclass
+class MetadataExtractingJsonlReaderStage(JsonlReaderStage):
+    """Read JSONL and emit only the compact, metadata-enriched document batch."""
+
+    metadata_extractor: MetadataExtractor | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.metadata_extractor is None:
+            msg = "metadata_extractor must be configured"
+            raise ValueError(msg)
+
+    def outputs(self) -> tuple[list[str], list[str]]:
+        task_outputs, field_outputs = super().outputs()
+        if self.metadata_extractor is None:  # pragma: no cover - guarded by __post_init__
+            return task_outputs, field_outputs
+        _, metadata_outputs = self.metadata_extractor.outputs()
+        return task_outputs, list(dict.fromkeys([*field_outputs, *metadata_outputs]))
+
+    def process(self, task: FileGroupTask) -> DocumentBatch:
+        batch = super().process(task)
+        if self.metadata_extractor is None:  # pragma: no cover - guarded by __post_init__
+            return batch
+        return self.metadata_extractor.process(batch)
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     output_path = Path(args.output_path).absolute()
     checkpoint_dir = Path(args.checkpoint_dir).absolute()
@@ -79,7 +109,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     variation = EmbeddingModelVariation(args.model_variation)
     max_seq_length = _resolve_max_seq_length(args.model_identifier, cache_dir=args.cache_dir)
 
-    reader = JsonlReaderStage(fields=None, _assign_ids=True)
+    reader = MetadataExtractingJsonlReaderStage(
+        fields=None,
+        _assign_ids=True,
+        metadata_extractor=metadata_extractor,
+    )
     if args.reader_max_workers is not None:
         reader = reader.with_(ray_stage_spec={RayStageSpecKeys.MAX_WORKERS: args.reader_max_workers})
 
@@ -124,7 +158,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 manifest_max_rows=args.manifest_max_rows,
             ),
             reader,
-            metadata_extractor,
             *embedding_stages,
             writer,
         ],

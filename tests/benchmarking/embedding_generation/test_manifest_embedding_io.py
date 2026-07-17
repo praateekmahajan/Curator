@@ -10,12 +10,103 @@ import pyarrow.parquet as pq
 import pytest
 
 import benchmarking.embedding_generation.manifest as manifest_module
+from benchmarking.embedding_generation.fuzzy_deduped_qwen3_06b import (
+    MetadataExtractingJsonlReaderStage,
+)
 from benchmarking.embedding_generation.manifest import ManifestFilePartitioningStage
 from benchmarking.embedding_generation.prepare_smoke_manifest import prepare_smoke_manifest
 from benchmarking.embedding_generation.writer import MirroredParquetWriter
+from nemo_curator.backends.base import BaseStageAdapter
 from nemo_curator.backends.slurm_array import SlurmArrayConfig
 from nemo_curator.stages.deduplication.id_generator import CURATOR_DEDUP_ID_STR
-from nemo_curator.tasks import DocumentBatch, EmptyTask
+from nemo_curator.stages.text.modules import MetadataExtractor
+from nemo_curator.tasks import DocumentBatch, EmptyTask, FileGroupTask
+
+
+def test_metadata_extracting_reader_emits_compact_embedding_input(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    input_path.write_text(
+        json.dumps(
+            {
+                CURATOR_DEDUP_ID_STR: 7,
+                "multimodal_document": {"content": ["first", "second"]},
+                "unused": "drop me",
+            }
+        )
+        + "\n"
+    )
+    extractor = MetadataExtractor(
+        metadata_mapping={
+            "source_a": {
+                "source_family_id": 1,
+                "quality_rank": 180,
+                "recency_rank": 0,
+            }
+        },
+        output_dtypes={
+            "source_family_id": "int8",
+            "quality_rank": "int16",
+            "recency_rank": "int8",
+        },
+        content_field="multimodal_document",
+        retained_input_fields=[CURATOR_DEDUP_ID_STR, "text"],
+    )
+    reader = MetadataExtractingJsonlReaderStage(metadata_extractor=extractor)
+    task = FileGroupTask(
+        dataset_name="test",
+        data=[str(input_path)],
+        _metadata={"mapping_names": ["source_a"]},
+    )
+
+    result = reader.process(task).to_pyarrow()
+
+    assert result.column_names == [
+        CURATOR_DEDUP_ID_STR,
+        "text",
+        "source_family_id",
+        "quality_rank",
+        "recency_rank",
+    ]
+    assert result["text"].to_pylist() == ["first\n\nsecond"]
+    assert result["quality_rank"].to_pylist() == [180]
+    assert "unused" not in result.column_names
+
+
+def test_metadata_extracting_reader_declares_generated_fields() -> None:
+    extractor = MetadataExtractor(
+        metadata_mapping={"source_a": {"source_family_id": 1}},
+        output_dtypes={"source_family_id": "int8"},
+        content_field="multimodal_document",
+        retained_input_fields=[CURATOR_DEDUP_ID_STR, "text"],
+    )
+    reader = MetadataExtractingJsonlReaderStage(
+        _assign_ids=True,
+        metadata_extractor=extractor,
+    )
+
+    assert reader.outputs() == (["data"], [CURATOR_DEDUP_ID_STR, "source_family_id", "text"])
+
+
+def test_metadata_extraction_uses_only_reader_task_boundary(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    input_path.write_text('{"text":"hello"}\n')
+    extractor = MetadataExtractor(
+        metadata_mapping={"source_a": {"source_family_id": 1}},
+        output_dtypes={"source_family_id": "int8"},
+    )
+    reader = MetadataExtractingJsonlReaderStage(metadata_extractor=extractor)
+    task = FileGroupTask(
+        dataset_name="test",
+        data=[str(input_path)],
+        _metadata={"mapping_names": ["source_a"]},
+    )
+    task._set_task_id("0", "source")
+
+    [result] = BaseStageAdapter(reader).process_batch([task])
+
+    assert result.task_id == "0_source_0"
+    assert len(result._stage_perf) == 1
+    assert result.to_pyarrow()["source_family_id"].to_pylist() == [1]
 
 
 def test_writer_emits_only_generated_fields(tmp_path: Path) -> None:

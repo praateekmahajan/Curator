@@ -10,7 +10,6 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 
-from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import DocumentBatch
 
 DEFAULT_SEPARATOR = "\n\n"
@@ -50,11 +49,13 @@ _MERGERS = {"separator": _merge_separator, "smart": _merge_smart}
 
 
 @dataclass
-class MetadataExtractor(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """Broadcast configured integer metadata onto every row in a document batch.
+class MetadataExtractor:
+    """Transform a document batch by extracting text and broadcasting metadata.
 
     The lookup key comes from task metadata, so file-level provenance can become
-    ordinary columns without inspecting or parsing every document.
+    ordinary columns without inspecting or parsing every document. This is a
+    plain Python transformer rather than a ``ProcessingStage``: callers decide
+    which execution stage owns the work and its task/checkpoint boundary.
     """
 
     metadata_mapping: dict[str, dict[str, int]]
@@ -65,7 +66,6 @@ class MetadataExtractor(ProcessingStage[DocumentBatch, DocumentBatch]):
     separator: str = DEFAULT_SEPARATOR
     merge_strategy: str = "separator"
     retained_input_fields: list[str] | None = None
-    name: str = "metadata_extractor"
 
     def __post_init__(self) -> None:
         if not self.metadata_mapping:
