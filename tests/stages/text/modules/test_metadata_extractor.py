@@ -1,16 +1,22 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from pathlib import Path
+
 import pandas as pd
 import pyarrow as pa
 import pytest
 
 from nemo_curator.stages.text.embedders.vllm import VLLMEmbeddingModelStage
+from nemo_curator.stages.text.io.reader.jsonl import JsonlReaderStage
 from nemo_curator.stages.text.modules import MetadataExtractor
 from nemo_curator.tasks import DocumentBatch
 
 
-def _extractor(merge_strategy: str = "separator") -> MetadataExtractor:
+def _extractor(
+    merge_strategy: str = "separator",
+    retained_input_fields: list[str] | None = None,
+) -> MetadataExtractor:
     return MetadataExtractor(
         metadata_mapping={
             "source_a": {
@@ -37,6 +43,7 @@ def _extractor(merge_strategy: str = "separator") -> MetadataExtractor:
         },
         content_field="multimodal_document",
         merge_strategy=merge_strategy,
+        retained_input_fields=retained_input_fields,
     )
 
 
@@ -84,18 +91,25 @@ def test_rejects_existing_output_column() -> None:
         _extractor().process(batch)
 
 
-def test_preserves_existing_text_and_other_columns() -> None:
+def test_preserves_existing_text_from_reader_shaped_pandas_input() -> None:
     batch = DocumentBatch(
         dataset_name="test",
-        data=pa.table({"text": ["already present"], "other": [7]}),
+        data=pd.DataFrame(
+            {
+                "_curator_dedup_id": pd.array([7], dtype="int64[pyarrow]"),
+                "text": ["already present"],
+                "other": [99],
+            }
+        ),
         _metadata={"mapping_names": ["source_a"]},
     )
 
-    output_batch = _extractor().process(batch)
+    output_batch = _extractor(retained_input_fields=["_curator_dedup_id", "text"]).process(batch)
     result = output_batch.to_pyarrow()
 
+    assert result["_curator_dedup_id"].to_pylist() == [7]
     assert result["text"].to_pylist() == ["already present"]
-    assert result["other"].to_pylist() == [7]
+    assert "other" not in result.column_names
     assert VLLMEmbeddingModelStage("unused").validate_input(output_batch)
 
 
@@ -127,6 +141,29 @@ def test_extracts_text_and_preserves_source_document() -> None:
     assert result["text"].to_pylist() == ["first\n\nsecond"]
     assert result["other"].to_pylist() == [7]
     assert "multimodal_document" in result.column_names
+    assert VLLMEmbeddingModelStage("unused").validate_input(output_batch)
+
+
+def test_extracts_reader_shaped_heterogeneous_content_before_arrow_conversion(tmp_path: Path) -> None:
+    input_path = tmp_path / "structured.jsonl"
+    input_path.write_text('{"multimodal_document":{"content":["first",{"kind":"non_text"},"second"]},"other":99}\n')
+    frame = JsonlReaderStage().read_data([str(input_path)])
+    assert isinstance(frame, pd.DataFrame)
+    frame["_curator_dedup_id"] = pd.array([7], dtype="int64[pyarrow]")
+
+    batch = DocumentBatch(
+        dataset_name="test",
+        data=frame,
+        _metadata={"mapping_names": ["source_b"]},
+    )
+
+    output_batch = _extractor(retained_input_fields=["_curator_dedup_id", "text"]).process(batch)
+    result = output_batch.to_pyarrow()
+
+    assert result["_curator_dedup_id"].to_pylist() == [7]
+    assert result["text"].to_pylist() == ["first\n\nsecond"]
+    assert "multimodal_document" not in result.column_names
+    assert "other" not in result.column_names
     assert VLLMEmbeddingModelStage("unused").validate_input(output_batch)
 
 

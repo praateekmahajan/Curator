@@ -6,7 +6,7 @@ The current smoke workflow intentionally uses the existing ID registry and runti
 
 `MetadataExtractor` resolves one `mapping_names` entry per input file and broadcasts its configured integer provenance/ranking values onto every row. Stable source IDs and mutable policy ranks remain in the private mapping, while the generic stage and example schema contain no dataset-specific policy. Pairwise ranking can sort `source_priority`, `quality_rank`, and `recency_rank` descending, followed by the dedup ID ascending.
 
-When `text_extraction` is configured, an existing scalar `text` column is preserved. If it is absent, the stage keeps string blocks from `<content_field>.content`, ignores non-text items, and creates `text` using either a fixed separator or whitespace-aware smart merging. The extractor preserves other input columns until the writer selects the requested output schema.
+When `text_extraction` is configured, an existing scalar `text` column is preserved. If it is absent, the stage keeps string blocks from `<content_field>.content`, ignores non-text items, and creates `text` using either a fixed separator or whitespace-aware smart merging. Configure `retained_input_fields` as `[_curator_dedup_id, text]` for embedding generation so heterogeneous nested payloads are removed before conversion to Arrow and only model inputs/provenance continue through the GPU stages.
 
 Production Parquet contains only `_curator_dedup_id`, `embeddings`, and configured integer metadata. Source-specific IDs and payload columns are intentionally excluded.
 

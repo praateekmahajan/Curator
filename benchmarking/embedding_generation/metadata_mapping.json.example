@@ -4,7 +4,8 @@
     "content_field": "multimodal_document",
     "text_field": "text",
     "separator": "\n\n",
-    "merge_strategy": "separator"
+    "merge_strategy": "separator",
+    "retained_input_fields": ["_curator_dedup_id", "text"]
   },
   "output_dtypes": {
     "source_family_id": "int8",

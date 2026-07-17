@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 
 from nemo_curator.stages.base import ProcessingStage
@@ -63,6 +64,7 @@ class MetadataExtractor(ProcessingStage[DocumentBatch, DocumentBatch]):
     text_field: str = "text"
     separator: str = DEFAULT_SEPARATOR
     merge_strategy: str = "separator"
+    retained_input_fields: list[str] | None = None
     name: str = "metadata_extractor"
 
     def __post_init__(self) -> None:
@@ -76,6 +78,7 @@ class MetadataExtractor(ProcessingStage[DocumentBatch, DocumentBatch]):
             msg = f"merge_strategy must be one of {MERGE_STRATEGIES}, got {self.merge_strategy!r}"
             raise ValueError(msg)
         self._merge = _MERGERS[self.merge_strategy]
+        self._validate_retained_input_fields()
 
         expected_fields = set(self.output_dtypes)
         for lookup_key, values in self.metadata_mapping.items():
@@ -104,6 +107,15 @@ class MetadataExtractor(ProcessingStage[DocumentBatch, DocumentBatch]):
                 msg = f"Metadata field {field!r} must use an integer dtype, got {dtype!r}"
                 raise TypeError(msg)
             self._arrow_types[field] = arrow_type
+
+    def _validate_retained_input_fields(self) -> None:
+        if self.retained_input_fields is not None:
+            if len(self.retained_input_fields) != len(set(self.retained_input_fields)):
+                msg = "retained_input_fields must not contain duplicates"
+                raise ValueError(msg)
+            if self.content_field is not None and self.text_field not in self.retained_input_fields:
+                msg = f"retained_input_fields must include configured text field {self.text_field!r}"
+                raise ValueError(msg)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
@@ -155,9 +167,41 @@ class MetadataExtractor(ProcessingStage[DocumentBatch, DocumentBatch]):
         texts = [self._extract_text(document) for document in table[self.content_field].to_pylist()]
         return table.append_column(self.text_field, pa.array(texts, type=pa.string()))
 
+    def _prepare_table(self, task: DocumentBatch) -> pa.Table:
+        """Extract text before Arrow sees heterogeneous nested payloads."""
+        if isinstance(task.data, pd.DataFrame):
+            frame = task.data
+            if self.text_field not in frame.columns and self.content_field is not None:
+                if self.content_field not in frame.columns:
+                    msg = (
+                        f"Input has neither text field {self.text_field!r} nor configured "
+                        f"content field {self.content_field!r}"
+                    )
+                    raise ValueError(msg)
+                frame = frame.copy()
+                texts = [self._extract_text(document) for document in frame[self.content_field].tolist()]
+                frame[self.text_field] = pd.array(texts, dtype="string[pyarrow]")
+
+            if self.retained_input_fields is not None:
+                missing_fields = [field for field in self.retained_input_fields if field not in frame.columns]
+                if missing_fields:
+                    msg = f"Input is missing retained fields: {missing_fields}"
+                    raise ValueError(msg)
+                frame = frame[self.retained_input_fields]
+            return pa.Table.from_pandas(frame, preserve_index=False)
+
+        table = self._add_text_if_missing(task.to_pyarrow())
+        if self.retained_input_fields is not None:
+            missing_fields = [field for field in self.retained_input_fields if field not in table.column_names]
+            if missing_fields:
+                msg = f"Input is missing retained fields: {missing_fields}"
+                raise ValueError(msg)
+            table = table.select(self.retained_input_fields)
+        return table
+
     def process(self, task: DocumentBatch) -> DocumentBatch:
         values = self._resolve_values(task)
-        table = self._add_text_if_missing(task.to_pyarrow())
+        table = self._prepare_table(task)
         collisions = sorted(set(table.column_names) & set(values))
         if collisions:
             msg = f"MetadataExtractor will not overwrite existing columns: {collisions}"
