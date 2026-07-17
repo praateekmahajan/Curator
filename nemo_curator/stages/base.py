@@ -119,6 +119,10 @@ class ProcessingStage(ABC, Generic[X, Y], metaclass=StageMeta):
     # resumability layer to mark the counter-decrement boundary.
     is_source_stage: bool = False
     is_sink_stage: bool = False
+    # Source stages that already select work using the active Slurm array
+    # configuration can opt out of the adapter's hash-based source filtering.
+    # Array completion manifests and checkpointing remain enabled.
+    is_slurm_array_prepartitioned: bool = False
     # Whether this stage is safe to run under resumability (``checkpoint_path``).
     # Defaults to True; set False only on stages whose input→output mapping isn't
     # source-attributable (shuffle / fan-in, e.g. the dedup shuffle/LSH/connected-

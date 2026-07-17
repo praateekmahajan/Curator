@@ -222,6 +222,7 @@ def run_embedding_generation_benchmark(
     executor: str,
     dataset_size_gb: float | None,
     load_dataset_ratio: float | None,
+    max_input_files: int | None,
     id_generator_path: str | None,
     id_path_mapping_json: str | None,
     metadata_fields: list[str] | None,
@@ -236,6 +237,7 @@ def run_embedding_generation_benchmark(
     embedding_pooling: str,
     input_format: str = "parquet",
     cache_dir: str | None = None,
+    mirror_output_paths: bool = False,
     **kwargs: Any,  # noqa: ANN401, ARG001
 ) -> dict[str, Any]:
     """Run the embedding generation benchmark and collect comprehensive metrics."""
@@ -250,6 +252,7 @@ def run_embedding_generation_benchmark(
     logger.info(f"Output path: {output_path}")
     logger.info(f"Dataset size: {dataset_size_gb} GB")
     logger.info(f"Load dataset ratio: {load_dataset_ratio}")
+    logger.info(f"Maximum input files: {max_input_files}")
     logger.info(f"ID generator: {id_generator_path}")
     id_path_mapping = json.loads(id_path_mapping_json) if id_path_mapping_json else {}
     if not isinstance(id_path_mapping, dict) or not all(
@@ -270,6 +273,7 @@ def run_embedding_generation_benchmark(
     logger.info(f"Model KV cache memory bytes: {model_kv_cache_memory_bytes}")
     logger.info(f"Embedding pooling: {embedding_pooling}")
     logger.info(f"Input format: {input_format}")
+    logger.info(f"Mirror output paths: {mirror_output_paths}")
     logger.info(f"Executor: {executor}")
 
     run_start_time = time.perf_counter()
@@ -278,9 +282,11 @@ def run_embedding_generation_benchmark(
     input_files = load_dataset_files(
         input_path,
         dataset_size_gb=dataset_size_gb,
-        dataset_ratio=load_dataset_ratio,
+        dataset_ratio=1.0 if max_input_files is not None else load_dataset_ratio,
         keep_extensions=keep_ext,
     )
+    if max_input_files is not None:
+        input_files = sorted(input_files)[:max_input_files]
     logger.info(f"Selected {len(input_files)} input files")
     if id_generator_path is not None:
         id_generator = IdGeneratorBase.from_disk(id_generator_path, path_mapping=id_path_mapping)
@@ -344,16 +350,31 @@ def run_embedding_generation_benchmark(
             fields=["text", *metadata_fields],
             _generate_ids=False,
         )
-    writer = ParquetWriter(
-        path=str(output_path),
-        fields=output_fields,
-        write_kwargs={
-            "compression": "zstd",
-            "compression_level": 3,
-            "use_byte_stream_split": ["embeddings.list.element"],
-            "use_dictionary": [field for field in output_fields if field != "embeddings"],
-        },
-    )
+    if mirror_output_paths:
+        from benchmarking.embedding_generation.writer import MirroredParquetWriter
+
+        writer = MirroredParquetWriter(
+            path=str(output_path),
+            source_root=str(input_path),
+            fields=output_fields,
+            write_kwargs={
+                "compression": "zstd",
+                "compression_level": 3,
+                "use_byte_stream_split": ["embeddings.list.element"],
+                "use_dictionary": False,
+            },
+        )
+    else:
+        writer = ParquetWriter(
+            path=str(output_path),
+            fields=output_fields,
+            write_kwargs={
+                "compression": "zstd",
+                "compression_level": 3,
+                "use_byte_stream_split": ["embeddings.list.element"],
+                "use_dictionary": [field for field in output_fields if field != "embeddings"],
+            },
+        )
 
     pipeline = Pipeline(
         name="embedding_generation_pipeline",
@@ -402,6 +423,7 @@ def run_embedding_generation_benchmark(
         "params": {
             "max_seq_length": max_seq_length,
             "load_dataset_ratio": load_dataset_ratio,
+            "max_input_files": max_input_files,
             "id_generator_path": id_generator_path,
             "id_path_mapping": id_path_mapping,
             "metadata_fields": metadata_fields,
@@ -438,6 +460,7 @@ def main() -> int:
     size_group.add_argument(
         "--load-dataset-ratio", type=float, default=None, help="Fraction of input files to process"
     )
+    size_group.add_argument("--max-input-files", type=int, default=None, help="Exact maximum number of input files")
     parser.add_argument(
         "--id-generator-path",
         default=None,
@@ -508,6 +531,11 @@ def main() -> int:
         "--cache-dir",
         default=None,
         help="HuggingFace cache directory for model weights (uses default HF cache if not set)",
+    )
+    parser.add_argument(
+        "--mirror-output-paths",
+        action="store_true",
+        help="Mirror each source file's relative path under the Parquet output root",
     )
 
     args = parser.parse_args()

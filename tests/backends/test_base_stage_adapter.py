@@ -88,6 +88,22 @@ class TestBaseStageAdapter:
         }
         assert [task.data for task in results] == [["a.parquet"]]
 
+    def test_prepartitioned_source_skips_slurm_array_filtering(self, monkeypatch: MonkeyPatch) -> None:
+        slurm_array = SlurmArrayConfig(shard_index=0, total_shards=2)
+
+        monkeypatch.setattr(base_module, "resolve_slurm_array_config", lambda _is_source_stage: slurm_array)
+
+        def unexpected_filter(*_args: object) -> list[Task]:
+            pytest.fail("prepartitioned sources must not be filtered a second time")
+
+        monkeypatch.setattr(base_module, "filter_slurm_array_source_tasks", unexpected_filter)
+
+        stage = _SourceFanoutStage(partitions=[["a.parquet"], ["b.parquet"]])
+        stage.is_slurm_array_prepartitioned = True
+        results = base_module.BaseStageAdapter(stage).process_batch([EmptyTask()])
+
+        assert [task.data for task in results] == [["a.parquet"], ["b.parquet"]]
+
     def test_source_stage_failed_task_raises_before_retry_bookkeeping(self, monkeypatch: MonkeyPatch) -> None:
         calls = {"resolve_config": 0, "record_failed_tasks": 0, "filter_tasks": 0}
         slurm_array = SlurmArrayConfig(shard_index=0, total_shards=1)

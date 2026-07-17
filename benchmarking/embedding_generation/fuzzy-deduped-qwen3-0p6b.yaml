@@ -1,0 +1,41 @@
+sinks:
+  - name: slack
+    enabled: false
+
+gpu_stats_recorder:
+  interval_s: 1.0
+
+delete_scratch: false
+object_store_size: 68719476736
+gpu_mem_use_warning_threshold: 0.01
+
+ray:
+  num_cpus: 144
+  num_gpus: 4
+  enable_object_spilling: false
+
+entries:
+  - name: embedding_qwen3_06b_${NEMO_CURATOR_SLURM_ARRAY_SHARD_INDEX}
+    enabled: true
+    script: "{curator_repo_dir}/benchmarking/embedding_generation/fuzzy_deduped_qwen3_06b.py"
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --manifest-path={manifest_path}
+      --path-mapping-json={path_mapping_path}
+      --id-generator-path={id_generator_path}
+      --source-root={dedup_source_root}
+      --output-path={embeddings_root}/embedding-try
+      --checkpoint-dir={checkpoint_dir}
+      --require-min-files-per-shard=16
+      --manifest-max-rows=4000000
+      --executor=ray_data
+      --reader-max-workers=4
+      --model-identifier=Qwen/Qwen3-Embedding-0.6B
+      --model-variation=vllm_text_pretokenized
+      --model-inference-batch-size=10000
+      --model-num-workers=16
+      --model-worker-gpus=0.25
+      --model-gpu-memory-utilization=0.2
+      --model-kv-cache-memory-bytes=8589934592
+      --cache-dir={model_weights_path}/hub
+    timeout_s: 14280

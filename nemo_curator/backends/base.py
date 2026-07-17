@@ -116,9 +116,7 @@ class BaseStageAdapter:
         is_source_stage = getattr(self.stage, "is_source_stage", False)
         failed_tasks = [r for r in results if isinstance(r, FailedTask)]
         if failed_tasks and is_source_stage:
-            msg = (
-                f"Source stage {self.stage.name} emitted FailedTask, which is not supported."
-            )
+            msg = f"Source stage {self.stage.name} emitted FailedTask, which is not supported."
             raise ValueError(msg)
 
         # Record failed tasks for later inspection or retry bookkeeping.
@@ -134,7 +132,11 @@ class BaseStageAdapter:
 
         # Filter tasks based on the Slurm array configuration.
         slurm_array = resolve_slurm_array_config(is_source_stage=is_source_stage)
-        if slurm_array is not None and is_source_stage:
+        if (
+            slurm_array is not None
+            and is_source_stage
+            and not getattr(self.stage, "is_slurm_array_prepartitioned", False)
+        ):
             results = filter_slurm_array_source_tasks(results, slurm_array, self.stage.name)
 
         # Opt-in resumability: fire per-source deltas (no-op when no actor registered).

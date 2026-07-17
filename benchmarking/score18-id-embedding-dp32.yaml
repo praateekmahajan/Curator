@@ -101,6 +101,31 @@ entries:
       --cache-dir={dataset:text_models_hf_cache,files}
     timeout_s: 14100
 
+  - name: score18_qwen_dp16_prebuffered_with_ids
+    enabled: true
+    script: embedding_generation_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --output-path={session_entry_dir}/scratch/parquet
+      --executor=ray_data
+      --input-path={dataset:score18,jsonl}
+      --input-format=jsonl
+      --max-input-files=288
+      --id-generator-path={dataset:score18_id_generator,json}
+      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --metadata-field=adlr_id
+      --reader-max-workers=4
+      --model-identifier=Qwen/Qwen3-Embedding-0.6B
+      --model-variation=vllm_text_pretokenized
+      --model-inference-batch-size=10000
+      --model-num-workers=16
+      --model-worker-gpus=0.25
+      --model-gpu-memory-utilization=0.2
+      --model-kv-cache-memory-bytes=8589934592
+      --cache-dir={dataset:text_models_hf_cache,files}
+      --mirror-output-paths
+    timeout_s: 14100
+
   - name: score18_harrier_dp8_with_ids
     enabled: true
     script: embedding_generation_benchmark.py
@@ -193,6 +218,30 @@ entries:
       --model-kv-cache-memory-bytes=1073741824
       --cache-dir={dataset:text_models_hf_cache,files}
     timeout_s: 6900
+
+  - name: score18_harrier_dp32_prebuffered_with_ids
+    enabled: true
+    script: embedding_generation_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --output-path={session_entry_dir}/scratch/parquet
+      --executor=ray_data
+      --input-path={dataset:score18,jsonl}
+      --input-format=jsonl
+      --max-input-files=288
+      --id-generator-path={dataset:score18_id_generator,json}
+      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --metadata-field=adlr_id
+      --reader-max-workers=4
+      --model-identifier=microsoft/harrier-oss-v1-270m
+      --model-variation=vllm_text_pretokenized
+      --model-inference-batch-size=10000
+      --model-num-workers=32
+      --model-worker-gpus=0.125
+      --model-kv-cache-memory-bytes=1073741824
+      --cache-dir={dataset:text_models_hf_cache,files}
+      --mirror-output-paths
+    timeout_s: 14100
   - name: score18_qwen_dp64_with_ids
     enabled: true
     script: embedding_generation_benchmark.py
