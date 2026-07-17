@@ -20,12 +20,12 @@ sys.path.insert(0, str(_CURATOR_REPO_DIR))
 sys.path.insert(0, str(_BENCHMARKING_SCRIPTS_DIR))
 
 from benchmarking.embedding_generation.manifest import ManifestFilePartitioningStage
+from benchmarking.embedding_generation.metrics import summarize_vllm_stage_metrics
 from benchmarking.embedding_generation.writer import MirroredParquetWriter
 from benchmarking.scripts.embedding_generation_benchmark import (
     EmbeddingModelVariation,
     _create_embedding_stages,
     _resolve_max_seq_length,
-    summarize_vllm_stage_metrics,
 )
 from benchmarking.scripts.utils import setup_executor, write_benchmark_results
 from nemo_curator.backends.utils import RayStageSpecKeys

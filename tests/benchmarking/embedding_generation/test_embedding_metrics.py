@@ -3,7 +3,7 @@
 
 import numpy as np
 
-from benchmarking.scripts.embedding_generation_benchmark import summarize_vllm_stage_metrics
+from benchmarking.embedding_generation.metrics import summarize_vllm_stage_metrics
 
 
 def test_summarize_vllm_stage_metrics() -> None:
