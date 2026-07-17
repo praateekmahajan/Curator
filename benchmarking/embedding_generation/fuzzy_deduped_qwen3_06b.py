@@ -34,7 +34,7 @@ from nemo_curator.stages.deduplication.id_generator import (
     create_id_generator_actor,
     kill_id_generator_actor,
 )
-from nemo_curator.stages.text.io.reader import JsonlReaderStage
+from nemo_curator.stages.text.io.reader.jsonl import JsonlReaderStage
 from nemo_curator.stages.text.modules import MetadataExtractor
 from nemo_curator.tasks.utils import TaskPerfUtils
 
