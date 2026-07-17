@@ -2,9 +2,23 @@
 
 Copy `paths.yaml.example` to ignored `paths.yaml`, fill in the paths, and create a private metadata mapping using `metadata_mapping.json.example` as its schema. Keep the real mapping outside the repository and set `metadata_mapping_path` to it.
 
+Prepare the runtime manifest once. The source-path mapping is used only here; array jobs read `dedup_path` and deterministic row-ID ranges directly from the enriched manifest.
+
+```bash
+python -m benchmarking.embedding_generation.prepare_manifest \
+  --input-manifest=/path/to/inventory.jsonl \
+  --path-mapping=/path/to/dataset_path_mapping.json \
+  --output-manifest=/path/to/runtime-manifest.jsonl \
+  --output-id-registry=/path/to/id_generator.json
+```
+
+The compatible ID registry also contains `id_lookup` records with the physical file, manifest index, ID range, and row count. Resolve an ID to its file by range and calculate `row_offset = id - id_start`. Runtime jobs do not need the historical ID registry, container mount aliases, or path mapping.
+
 `MetadataExtractor` resolves one `mapping_names` entry per input file and broadcasts its configured integer provenance/ranking values onto every row. Stable source IDs and mutable policy ranks remain in the private mapping, while the generic stage and example schema contain no dataset-specific policy. Pairwise ranking can sort `source_priority`, `quality_rank`, and `recency_rank` descending, followed by the dedup ID ascending.
 
-When `text_extraction` is configured, an existing scalar `text` column is preserved. If it is absent, the stage keeps string blocks from `<content_field>.content`, ignores non-text items, and creates `text` using either a fixed separator or whitespace-aware smart merging. Other input columns are preserved; the embedding writer removes only the temporary `text` column.
+When `text_extraction` is configured, an existing scalar `text` column is preserved. If it is absent, the stage keeps string blocks from `<content_field>.content`, ignores non-text items, and creates `text` using either a fixed separator or whitespace-aware smart merging. The extractor preserves other input columns until the writer selects the requested output schema.
+
+Production Parquet contains only `_curator_dedup_id`, `embeddings`, and configured integer metadata. Source-specific IDs and payload columns are intentionally excluded.
 
 Smoke test two logical shards:
 

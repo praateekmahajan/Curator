@@ -19,7 +19,7 @@ _BENCHMARKING_SCRIPTS_DIR = _CURATOR_REPO_DIR / "benchmarking" / "scripts"
 sys.path.insert(0, str(_CURATOR_REPO_DIR))
 sys.path.insert(0, str(_BENCHMARKING_SCRIPTS_DIR))
 
-from benchmarking.embedding_generation.manifest import ManifestFilePartitioningStage
+from benchmarking.embedding_generation.manifest import ManifestFilePartitioningStage, ManifestIdAssignmentStage
 from benchmarking.embedding_generation.writer import MirroredParquetWriter
 from benchmarking.scripts.embedding_generation_benchmark import (
     EmbeddingModelVariation,
@@ -29,45 +29,10 @@ from benchmarking.scripts.embedding_generation_benchmark import (
 from benchmarking.scripts.utils import setup_executor, write_benchmark_results
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.pipeline import Pipeline
-from nemo_curator.stages.deduplication.id_generator import (
-    CURATOR_DEDUP_ID_STR,
-    create_id_generator_actor,
-    kill_id_generator_actor,
-)
+from nemo_curator.stages.deduplication.id_generator import CURATOR_DEDUP_ID_STR
 from nemo_curator.stages.text.io.reader import JsonlReaderStage
 from nemo_curator.stages.text.modules import MetadataExtractor
 from nemo_curator.tasks.utils import TaskPerfUtils
-
-
-def load_id_path_mapping(path: str | Path) -> dict[str, str]:
-    """Load dedup-runtime to ID-registry path-prefix mappings."""
-    payload = json.loads(Path(path).read_text())
-    if not isinstance(payload, list):
-        msg = f"Path mapping must contain a JSON list: {path}"
-        raise TypeError(msg)
-
-    result: dict[str, str] = {}
-    for index, record in enumerate(payload):
-        if not isinstance(record, dict):
-            msg = f"Path mapping record {index} must be a JSON object"
-            raise TypeError(msg)
-        runtime_prefix = record.get("dedup_path")
-        registry_prefix = record.get("container_mounted_dedup_source_path")
-        if not isinstance(runtime_prefix, str) or not isinstance(registry_prefix, str):
-            msg = (
-                f"Path mapping record {index} must contain string dedup_path and "
-                "container_mounted_dedup_source_path fields"
-            )
-            raise TypeError(msg)
-        if runtime_prefix in result and result[runtime_prefix] != registry_prefix:
-            msg = f"Conflicting mappings for dedup path {runtime_prefix}"
-            raise ValueError(msg)
-        result[runtime_prefix.rstrip("/")] = registry_prefix.rstrip("/")
-
-    if not result:
-        msg = f"Path mapping contains no records: {path}"
-        raise ValueError(msg)
-    return result
 
 
 def load_metadata_extractor(path: str | Path) -> MetadataExtractor:
@@ -105,12 +70,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     output_path.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    id_path_mapping = load_id_path_mapping(args.path_mapping_json)
     metadata_extractor = load_metadata_extractor(args.metadata_mapping_json)
     variation = EmbeddingModelVariation(args.model_variation)
     max_seq_length = _resolve_max_seq_length(args.model_identifier, cache_dir=args.cache_dir)
 
-    reader = JsonlReaderStage(fields=None, _assign_ids=True)
+    reader = JsonlReaderStage(fields=None)
     if args.reader_max_workers is not None:
         reader = reader.with_(ray_stage_spec={RayStageSpecKeys.MAX_WORKERS: args.reader_max_workers})
 
@@ -132,7 +96,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     writer = MirroredParquetWriter(
         path=str(output_path),
         source_root=args.source_root,
-        fields=None,
+        fields=[CURATOR_DEDUP_ID_STR, "embeddings", *metadata_extractor.output_dtypes],
+        drop_fields=[],
         write_kwargs={
             "compression": "zstd",
             "compression_level": 3,
@@ -145,11 +110,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         stages=[
             ManifestFilePartitioningStage(
                 manifest_path=args.manifest_path,
-                path_mapping=id_path_mapping,
                 required_minimum_files_per_shard=args.require_min_files_per_shard,
                 manifest_max_rows=args.manifest_max_rows,
             ),
             reader,
+            ManifestIdAssignmentStage(),
             metadata_extractor,
             *embedding_stages,
             writer,
@@ -159,20 +124,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     logger.info("Manifest: {}", args.manifest_path)
     logger.info("Output root: {}", output_path)
     logger.info("Checkpoint root: {}", checkpoint_dir)
-    logger.info("ID path mappings: {}", len(id_path_mapping))
 
     started = time.perf_counter()
-    create_id_generator_actor(args.id_generator_path, path_mapping=id_path_mapping)
-    try:
-        output_tasks = (
-            pipeline.run(
-                setup_executor(args.executor),
-                checkpoint_path=checkpoint_dir,
-            )
-            or []
+    output_tasks = (
+        pipeline.run(
+            setup_executor(args.executor),
+            checkpoint_path=checkpoint_dir,
         )
-    finally:
-        kill_id_generator_actor()
+        or []
+    )
     elapsed = time.perf_counter() - started
 
     num_documents = sum(task._stage_perf[-1].num_items_processed for task in output_tasks if task._stage_perf)
@@ -181,8 +141,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "params": {
             **vars(args),
             "max_seq_length": max_seq_length,
-            "id_path_mapping_count": len(id_path_mapping),
-            "output_schema": "all input columns except text, plus _curator_dedup_id and embeddings",
+            "output_schema": "_curator_dedup_id, embeddings, and configured integer metadata",
             "id_column": CURATOR_DEDUP_ID_STR,
         },
         "metrics": {
@@ -201,9 +160,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Manifest-sharded fuzzy-deduped embedding generation")
     parser.add_argument("--benchmark-results-path", required=True)
     parser.add_argument("--manifest-path", required=True)
-    parser.add_argument("--path-mapping-json", required=True)
     parser.add_argument("--metadata-mapping-json", required=True)
-    parser.add_argument("--id-generator-path", required=True)
     parser.add_argument("--source-root", required=True)
     parser.add_argument("--output-path", required=True)
     parser.add_argument("--checkpoint-dir", required=True)
