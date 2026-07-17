@@ -9,9 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
-import pyarrow as pa
-
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -20,9 +17,8 @@ from loguru import logger
 from nemo_curator.backends.slurm_array import SlurmArrayConfig, resolve_slurm_array_config
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.deduplication.id_generator import CURATOR_DEDUP_ID_STR
 from nemo_curator.stages.resources import Resources
-from nemo_curator.tasks import DocumentBatch, EmptyTask, FileGroupTask
+from nemo_curator.tasks import EmptyTask, FileGroupTask
 from nemo_curator.utils.hash_utils import get_deterministic_hash
 
 
@@ -169,49 +165,13 @@ def _validate_enriched_fields(record: dict[str, Any], line_number: int) -> None:
         raise ValueError(msg)
 
 
-@dataclass
-class ManifestIdAssignmentStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """Assign deterministic row IDs from the enriched manifest range."""
-
-    name: str = "manifest_id_assignment"
-
-    def inputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], []
-
-    def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [CURATOR_DEDUP_ID_STR]
-
-    def process(self, task: DocumentBatch) -> DocumentBatch:
-        table = task.to_pyarrow()
-        if CURATOR_DEDUP_ID_STR in table.column_names:
-            msg = f"Input already contains generated ID column {CURATOR_DEDUP_ID_STR!r}"
-            raise ValueError(msg)
-
-        id_start = task._metadata.get("id_start")
-        id_end = task._metadata.get("id_end")
-        expected_rows = task._metadata.get("manifest_num_rows")
-        values = (id_start, id_end, expected_rows)
-        if not all(isinstance(value, int) and not isinstance(value, bool) for value in values):
-            msg = "Task metadata must contain integer id_start, id_end, and manifest_num_rows"
-            raise TypeError(msg)
-        id_start = int(id_start)
-        id_end = int(id_end)
-        expected_rows = int(expected_rows)
-        if table.num_rows != expected_rows or id_end != id_start + expected_rows - 1:
-            msg = (
-                f"Manifest ID range [{id_start}, {id_end}] expects {expected_rows} rows, "
-                f"but reader produced {table.num_rows}"
-            )
-            raise ValueError(msg)
-
-        ids = pa.array(np.arange(id_start, id_end + 1, dtype=np.int64))
-        table = table.append_column(CURATOR_DEDUP_ID_STR, ids)
-        return DocumentBatch(
-            dataset_name=task.dataset_name,
-            data=table,
-            _metadata=task._metadata,
-            _stage_perf=task._stage_perf,
-        )
+def _dedup_path_for_logical_path(logical_path: str, path_mapping: dict[str, str]) -> str | None:
+    mappings = sorted(path_mapping.items(), key=lambda item: len(item[1]), reverse=True)
+    for dedup_prefix, registry_prefix in mappings:
+        normalized_prefix = registry_prefix.rstrip("/")
+        if logical_path == normalized_prefix or logical_path.startswith(f"{normalized_prefix}/"):
+            return f"{dedup_prefix.rstrip('/')}{logical_path[len(normalized_prefix) :]}"
+    return None
 
 
 def _uses_explicit_shards(records: list[dict[str, Any]]) -> bool:
@@ -256,6 +216,7 @@ class ManifestFilePartitioningStage(ProcessingStage[EmptyTask, ManifestFileGroup
     """Emit FPP=1 tasks for the active row-balanced Slurm array shard."""
 
     manifest_path: str
+    path_mapping: dict[str, str]
     required_minimum_files_per_shard: int = 1
     manifest_max_rows: int | None = None
     name: str = "manifest_file_partitioning"
@@ -296,8 +257,12 @@ class ManifestFilePartitioningStage(ProcessingStage[EmptyTask, ManifestFileGroup
             _validate_manifest_record(record, line_number, line_number - 1)
             if Path(record["path"]).suffix != ".jsonl":
                 continue
-            _validate_enriched_fields(record, line_number)
-            selected_records.append(record)
+            logical_path = record["logical_path"]
+            dedup_path = record.get("dedup_path") or _dedup_path_for_logical_path(logical_path, self.path_mapping)
+            if not isinstance(dedup_path, str):
+                msg = f"Manifest index {record['index']} is not covered by the ID path mapping"
+                raise TypeError(msg)
+            selected_records.append({**record, "dedup_path": dedup_path})
             total_rows += record["num_rows"]
             if self.manifest_max_rows is not None and total_rows >= self.manifest_max_rows:
                 break
@@ -334,8 +299,6 @@ class ManifestFilePartitioningStage(ProcessingStage[EmptyTask, ManifestFileGroup
                         _metadata={
                             "manifest_index": record["index"],
                             "manifest_num_rows": record["num_rows"],
-                            "id_start": record["id_start"],
-                            "id_end": record["id_end"],
                             "logical_path": logical_path,
                             "source_files": [dedup_path],
                             "inventory_source_file": record["path"],

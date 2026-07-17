@@ -10,7 +10,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import benchmarking.embedding_generation.manifest as manifest_module
-from benchmarking.embedding_generation.manifest import ManifestFilePartitioningStage, ManifestIdAssignmentStage
+from benchmarking.embedding_generation.manifest import ManifestFilePartitioningStage
 from benchmarking.embedding_generation.prepare_manifest import prepare_manifest
 from benchmarking.embedding_generation.prepare_smoke_manifest import prepare_smoke_manifest
 from benchmarking.embedding_generation.writer import MirroredParquetWriter
@@ -83,29 +83,6 @@ def test_prepare_manifest_writes_ranges_and_reverse_lookup(tmp_path: Path) -> No
         "id_end": 101,
         "num_rows": 2,
     }
-
-
-def test_manifest_id_assignment_uses_exact_row_offset() -> None:
-    task = DocumentBatch(
-        dataset_name="test",
-        data=pa.table({"text": ["a", "b", "c"]}),
-        _metadata={"id_start": 20, "id_end": 22, "manifest_num_rows": 3},
-    )
-
-    result = ManifestIdAssignmentStage().process(task).to_pyarrow()
-
-    assert result[CURATOR_DEDUP_ID_STR].to_pylist() == [20, 21, 22]
-
-
-def test_manifest_id_assignment_rejects_row_count_mismatch() -> None:
-    task = DocumentBatch(
-        dataset_name="test",
-        data=pa.table({"text": ["a", "b"]}),
-        _metadata={"id_start": 20, "id_end": 22, "manifest_num_rows": 3},
-    )
-
-    with pytest.raises(ValueError, match="reader produced 2"):
-        ManifestIdAssignmentStage().process(task)
 
 
 def test_writer_emits_only_generated_fields(tmp_path: Path) -> None:
@@ -199,6 +176,7 @@ def test_prepare_smoke_manifest_and_explicit_shards(tmp_path: Path, monkeypatch:
         )
         tasks = ManifestFilePartitioningStage(
             manifest_path=str(output_manifest),
+            path_mapping={"/dedup": "/logical"},
             required_minimum_files_per_shard=2,
         ).process(EmptyTask())
         selected_families.append(

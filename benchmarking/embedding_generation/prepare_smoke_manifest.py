@@ -10,7 +10,6 @@ from typing import Any
 
 from benchmarking.embedding_generation.manifest import (
     _iter_manifest_records,
-    _validate_enriched_fields,
     _validate_manifest_record,
 )
 
@@ -80,7 +79,6 @@ def prepare_smoke_manifest(  # noqa: PLR0913
     by_family: dict[int, list[dict[str, Any]]] = {first_family_id: [], second_family_id: []}
     for line_number, record in _iter_manifest_records(input_manifest):
         _validate_manifest_record(record, line_number, line_number - 1)
-        _validate_enriched_fields(record, line_number)
         family_id = _record_family(record, family_mapping)
         if family_id in by_family:
             by_family[family_id].append(record)
