@@ -15,9 +15,12 @@
 import os
 import time
 import uuid
+from pathlib import Path
 from unittest import mock
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from nemo_curator.stages.text.io.writer import ParquetWriter
@@ -27,6 +30,42 @@ from nemo_curator.tasks import DocumentBatch
 
 class TestParquetWriter:
     """Test suite for ParquetWriter with different data types."""
+
+    def test_arrow_embeddings_use_compact_defaults(self, tmp_path: Path) -> None:
+        """Arrow embedding batches use Zstd and byte-stream split without pandas."""
+        embeddings = pa.array([[1.0, 2.0], [3.0, 4.0]], type=pa.list_(pa.float32()))
+        batch = DocumentBatch(dataset_name="test", data=pa.table({"id": [1, 2], "embeddings": embeddings}))
+        writer = ParquetWriter(path=str(tmp_path))
+        writer.setup()
+
+        output_file = Path(writer.process(batch).data[0])
+        metadata = pq.ParquetFile(output_file).metadata
+        embedding_column = next(
+            metadata.row_group(0).column(i)
+            for i in range(metadata.num_columns)
+            if metadata.row_group(0).column(i).path_in_schema == "embeddings.list.element"
+        )
+
+        assert embedding_column.compression == "ZSTD"
+        assert "BYTE_STREAM_SPLIT" in embedding_column.encodings
+        assert pq.read_table(output_file).equals(batch.data)
+
+    def test_arrow_embedding_optimization_can_be_disabled(self, tmp_path: Path) -> None:
+        embeddings = pa.array([[1.0, 2.0]], type=pa.list_(pa.float32()))
+        batch = DocumentBatch(dataset_name="test", data=pa.table({"id": [1], "embeddings": embeddings}))
+        writer = ParquetWriter(path=str(tmp_path), optimize_embedding_storage=False)
+        writer.setup()
+
+        output_file = Path(writer.process(batch).data[0])
+        metadata = pq.ParquetFile(output_file).metadata
+        embedding_column = next(
+            metadata.row_group(0).column(i)
+            for i in range(metadata.num_columns)
+            if metadata.row_group(0).column(i).path_in_schema == "embeddings.list.element"
+        )
+
+        assert embedding_column.compression == "SNAPPY"
+        assert "BYTE_STREAM_SPLIT" not in embedding_column.encodings
 
     @pytest.mark.parametrize("document_batch", ["pandas", "pyarrow"], indirect=True)
     @pytest.mark.parametrize("consistent_filename", [True, False])
@@ -89,8 +128,11 @@ class TestParquetWriter:
 
         # Verify file extension and content
         assert file_path.endswith(".parquet"), "Parquet files should have .parquet extension"
-        df = pd.read_parquet(file_path)
-        pd.testing.assert_frame_equal(df, document_batch.to_pandas())
+        if isinstance(document_batch.data, pa.Table):
+            assert pq.read_table(file_path).equals(document_batch.data)
+        else:
+            df = pd.read_parquet(file_path)
+            pd.testing.assert_frame_equal(df, document_batch.to_pandas())
 
     @pytest.mark.parametrize("document_batch", ["pandas"], indirect=True)
     def test_parquet_writer_overwrite_mode(self, document_batch: DocumentBatch, tmpdir: str):
