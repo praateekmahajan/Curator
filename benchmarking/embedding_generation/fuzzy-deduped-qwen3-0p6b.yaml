@@ -15,7 +15,7 @@ ray:
   enable_object_spilling: false
 
 entries:
-  - name: embedding_qwen3_06b_${NEMO_CURATOR_SLURM_ARRAY_SHARD_INDEX}
+  - name: embedding_qwen3_06b_${NEMO_CURATOR_SLURM_ARRAY_SHARD_INDEX}_${SLURM_JOB_ID}
     enabled: true
     script: "{curator_repo_dir}/benchmarking/embedding_generation/fuzzy_deduped_qwen3_06b.py"
     args: >-

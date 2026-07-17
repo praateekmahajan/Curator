@@ -4,6 +4,8 @@ Copy `paths.yaml.example` to ignored `paths.yaml` and fill in the manifest, matc
 
 Export one `SESSION_NAME` for the logical run. Benchmark metadata is written under `benchmarking/<SESSION_NAME>`, embeddings under `results/<SESSION_NAME>`, Slurm logs under `logs/<SESSION_NAME>`, and checkpoints/runtime under `embedding-generation/<SESSION_NAME>`. Keep the canonical launch scripts versioned in this directory rather than copying mutable per-session variants.
 
+Benchmark entry names include both the logical shard index and `SLURM_JOB_ID`, so a retry keeps its own benchmark history. New array submissions already receive distinct `%A_%a` log files and runtime directories. Embeddings and checkpoints intentionally remain shared across attempts so retries resume the same logical run.
+
 The manifest `path` is the authoritative absolute fuzzy-deduplicated JSONL path. The ID registry key for one FPP=1 file is `str(uuid.uuid5(uuid.NAMESPACE_URL, path))`, using that exact string. The partitioner validates every manifest `id_start`/`id_end` against the matching registry entry before emitting tasks; a changed prefix, mount alias, or range fails instead of silently allocating new IDs.
 
 The metadata mapping remains separate because it configures text extraction and integer ranking columns; it is unrelated to ID assignment.
