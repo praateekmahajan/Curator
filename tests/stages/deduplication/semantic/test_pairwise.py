@@ -36,6 +36,8 @@ with suppress(ImportError):
     )
     from nemo_curator.stages.deduplication.semantic.pairwise_io import ClusterWiseFilePartitioningStage
     from nemo_curator.stages.deduplication.semantic.ranking import RankingStrategy
+    from nemo_curator.stages.deduplication.semantic.utils import decode_embedding_array
+    from nemo_curator.stages.text.embedders.utils import create_list_series_from_1d_or_2d_ar
     from nemo_curator.tasks import FileGroupTask
 
 
@@ -96,6 +98,16 @@ class TestPairwiseCosineSimilarityBatched:
 
         np.testing.assert_array_equal(max_indices.tolist(), [0, 0])
         np.testing.assert_allclose(max_similarity.tolist(), [0.0, -1.0])
+
+    def test_decode_fp16_uint16_storage_to_fp32(self) -> None:
+        values = cp.array([[0.25, -0.5], [1.0, 0.125]], dtype=cp.float16)
+        df = cudf.DataFrame(index=cudf.RangeIndex(len(values)))
+        df["embedding"] = create_list_series_from_1d_or_2d_ar(values.view(cp.uint16), index=df.index)
+
+        decoded = decode_embedding_array(df, "embedding", "float16")
+
+        assert decoded.dtype == cp.float32
+        cp.testing.assert_allclose(decoded, values.astype(cp.float32))
 
 
 @pytest.mark.gpu

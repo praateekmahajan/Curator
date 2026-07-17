@@ -85,6 +85,7 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
         oversampling_factor: float = 2.0,
         max_samples_per_batch: int = 1 << 15,
         fit_data_fraction: float | None = None,
+        kmeans_output_embedding_dtype: Literal["float16", "float32"] = "float16",
         # Pairwise similarity parameters
         distance_metric: Literal["cosine", "l2"] = "cosine",
         which_to_keep: Literal["hard", "easy", "random"] = "hard",
@@ -130,6 +131,7 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
             distance_metric: Distance metric for similarity ("cosine" or "l2")
             fit_data_fraction: Fraction of the dataset (in (0, 1)) used to fit the KMeans model.
                 If None, fit on the full dataset.
+            kmeans_output_embedding_dtype: Storage dtype for normalized KMeans output embeddings. Defaults to FP16 encoded as uint16 bits.
 
             # Pairwise similarity parameters
             which_to_keep: Strategy for ranking within clusters ("hard", "easy", "random")
@@ -175,6 +177,7 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
         self.oversampling_factor = oversampling_factor
         self.max_samples_per_batch = max_samples_per_batch
         self.fit_data_fraction = fit_data_fraction
+        self.kmeans_output_embedding_dtype = kmeans_output_embedding_dtype
 
         # Pairwise similarity parameters
         self.distance_metric = distance_metric
@@ -201,6 +204,10 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
         """Validate the configuration."""
         # Note: Input path validation is handled by KMeansStage and FilePartitioningStage
         # Note: duplicates_path is now automatically created, no validation needed
+
+        if self.kmeans_output_embedding_dtype not in {"float16", "float32"}:
+            msg = f"Unsupported kmeans_output_embedding_dtype: {self.kmeans_output_embedding_dtype}"
+            raise ValueError(msg)
 
         # Warn if n_clusters is too small for large datasets
         if self.n_clusters < MIN_RECOMMENDED_N_CLUSTERS:
@@ -275,6 +282,7 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
             oversampling_factor=self.oversampling_factor,
             max_samples_per_batch=self.max_samples_per_batch,
             fit_data_fraction=self.fit_data_fraction,
+            output_embedding_dtype=self.kmeans_output_embedding_dtype,
             cache_path=None,  # do not save KMeans centroids (user should run KMeansStage directly instead)
             read_kwargs=self.read_kwargs,
             write_kwargs=self.cache_kwargs,
@@ -300,6 +308,7 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
             output_path=self.pairwise_output_path,
             ranking_strategy=self.ranking_strategy,
             embedding_dim=self.embedding_dim,
+            input_embedding_dtype=self.kmeans_output_embedding_dtype,
             pairwise_batch_size=self.pairwise_batch_size,
             verbose=self.verbose,
             which_to_keep=self.which_to_keep,

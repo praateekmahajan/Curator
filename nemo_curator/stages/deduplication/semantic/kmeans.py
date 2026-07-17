@@ -66,6 +66,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         oversampling_factor: float = 2.0,
         max_samples_per_batch: int = 1 << 15,
         fit_data_fraction: float | None = None,
+        output_embedding_dtype: Literal["float16", "float32"] = "float16",
         # I/O args
         cache_path: str | None = None,
         read_kwargs: dict[dict] | None = None,
@@ -89,6 +90,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             oversampling_factor (float): The amount of points to sample in scalable k-means++ initialization for potential centroids. Increasing this value can lead to better initial centroids at the cost of memory. The total number of centroids sampled in scalable k-means++ is oversampling_factor * n_clusters * 8.
             max_samples_per_batch (int): The number of data samples to use for batches of the pairwise distance computation. This computation is done throughout both fit predict. The default should suit most cases. The total number of elements in the batched pairwise distance computation is max_samples_per_batch * n_clusters. It might become necessary to lower this number when n_clusters becomes prohibitively large.
             fit_data_fraction (float | None): Fraction of the dataset (in (0, 1)) used to fit the KMeans model. Pass None to fit on the full dataset (single-pass mode). Sampling is done at the file level: each actor draws `round(fit_data_fraction x num_actor_files)` of its files (floor of 1) for the fit. When set, uses a two-pass approach: Pass 1 reads only the embedding column from the sampled files (so IO and GPU memory in Pass 1 scale with the fraction); Pass 2 then loads each (full) original group one at a time to predict labels and write results. This dramatically reduces peak GPU memory for large datasets. If None, all rows are loaded simultaneously.
+            output_embedding_dtype: Storage dtype for normalized embeddings written after KMeans. FP16 is encoded as uint16 bit patterns for cuDF compatibility.
             cache_path (str | None): The path to save the centroids to. If None, the centroids will not be saved.
             read_kwargs (dict[dict]): Keyword arguments for the read stage.
             write_kwargs (dict[dict]): Keyword arguments for the write stage.
@@ -112,10 +114,16 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             msg = f"fit_data_fraction must be in (0, 1), got {fit_data_fraction}; pass None to fit on the full dataset"
             raise ValueError(msg)
         self.fit_data_fraction = fit_data_fraction
+        if output_embedding_dtype not in {"float16", "float32"}:
+            msg = f"Unsupported output_embedding_dtype: {output_embedding_dtype}"
+            raise ValueError(msg)
+        self.output_embedding_dtype = output_embedding_dtype
 
         self.cache_path = cache_path
         self.read_kwargs = read_kwargs.copy() if read_kwargs is not None else {}
         self.write_kwargs = write_kwargs.copy() if write_kwargs is not None else {}
+        if self.output_embedding_dtype == "float16":
+            self.write_kwargs.setdefault("compression", "zstd")
 
         check_disallowed_kwargs(self.read_kwargs, ["columns", "assign_id"])
         check_disallowed_kwargs(self.write_kwargs, ["partition_file_name", "partition_cols", "index"])
@@ -230,6 +238,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             num_rows_seen = end_idx
             # Assign distances using the fitted cluster centers
             df = self._assign_distances(df, self.embedding_field, self.kmeans.cluster_centers_)  # noqa: PLW2901
+            df = self._encode_embeddings_for_write(df, self.embedding_field)  # noqa: PLW2901
 
             output_filename = f"{tasks[0].task_id}_{i}"
             # Write results for this subgroup
@@ -391,6 +400,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             labels = self.kmeans.predict(embeddings_array, convert_dtype=False).astype(cp.int32)
             df["centroid"] = labels
             df = self._assign_distances(df, self.embedding_field, self.kmeans.cluster_centers_)
+            df = self._encode_embeddings_for_write(df, self.embedding_field)
 
             output_filename = f"{tasks[0].task_id}_{i}"
             self.write_parquet(
@@ -455,6 +465,14 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             df[embedding_col] = create_list_series_from_1d_or_2d_ar(embeddings, index=df.index)
         return df
 
+    def _encode_embeddings_for_write(self, df: "cudf.DataFrame", embedding_col: str) -> "cudf.DataFrame":
+        if self.output_embedding_dtype == "float32":
+            return df
+        embeddings = get_array_from_df(df, embedding_col)
+        fp16_bits = embeddings.astype(cp.float16).view(cp.uint16)
+        df[embedding_col] = create_list_series_from_1d_or_2d_ar(fp16_bits, index=df.index)
+        return df
+
     @staticmethod
     def _assign_distances(df: "cudf.DataFrame", embedding_col: str, centroids: "cp.ndarray") -> "cudf.DataFrame":
         """
@@ -508,6 +526,7 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
     oversampling_factor: float = 2.0
     max_samples_per_batch: int = 1 << 15
     fit_data_fraction: float | None = None
+    output_embedding_dtype: Literal["float16", "float32"] = "float16"
     cache_path: str | None = None
     """KMeans clustering stage that requires RAFT for distributed processing.
 
@@ -531,6 +550,7 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
         oversampling_factor (float): The amount of points to sample in scalable k-means++ initialization for potential centroids. Increasing this value can lead to better initial centroids at the cost of memory. The total number of centroids sampled in scalable k-means++ is oversampling_factor * n_clusters * 8.
         max_samples_per_batch (int): The number of data samples to use for batches of the pairwise distance computation. This computation is done throughout both fit predict. The default should suit most cases. The total number of elements in the batched pairwise distance computation is max_samples_per_batch * n_clusters. It might become necessary to lower this number when n_clusters becomes prohibitively large.
         fit_data_fraction (float | None): Fraction of the dataset (in (0, 1)) used to fit the KMeans model. Pass None to fit on the full dataset (single-pass mode). Sampling is done at the file level: each actor draws `round(fit_data_fraction x num_actor_files)` of its files (floor of 1) for the fit. When set, uses a two-pass approach: Pass 1 reads only the embedding column from the sampled files (so IO and GPU memory in Pass 1 scale with the fraction); Pass 2 then loads each (full) original group one at a time to predict labels and write results. This dramatically reduces peak GPU memory for large datasets. If None, all rows are loaded simultaneously.
+        output_embedding_dtype: Storage dtype for normalized embeddings written after KMeans. Defaults to FP16 encoded as uint16 bits.
         cache_path (str | None): The path to save the centroids to. If None, the centroids will not be saved.
     """
 
@@ -541,6 +561,9 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
         # decompose() / on a worker.
         if self.fit_data_fraction is not None and not 0.0 < self.fit_data_fraction < 1.0:
             msg = f"fit_data_fraction must be in (0, 1), got {self.fit_data_fraction}; pass None to fit on the full dataset"
+            raise ValueError(msg)
+        if self.output_embedding_dtype not in {"float16", "float32"}:
+            msg = f"Unsupported output_embedding_dtype: {self.output_embedding_dtype}"
             raise ValueError(msg)
 
     def decompose(self) -> list[ProcessingStage]:
@@ -571,6 +594,7 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
                 oversampling_factor=self.oversampling_factor,
                 max_samples_per_batch=self.max_samples_per_batch,
                 fit_data_fraction=self.fit_data_fraction,
+                output_embedding_dtype=self.output_embedding_dtype,
                 read_kwargs=self.read_kwargs,
                 write_kwargs=self.write_kwargs,
                 cache_path=self.cache_path,

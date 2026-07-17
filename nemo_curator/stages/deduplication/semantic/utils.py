@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
+
+import cupy as cp
 
 if TYPE_CHECKING:
     import cudf
-    import cupy as cp
 
 from typing import Any
 
@@ -30,6 +31,27 @@ def get_array_from_df(df: "cudf.DataFrame", embedding_col: str) -> "cp.ndarray":
     Convert a column of lists to a 2D array.
     """
     return df[embedding_col].list.leaves.values.reshape(len(df), -1)
+
+
+EmbeddingStorageDtype = Literal["auto", "float16", "float32"]
+
+
+def decode_embedding_array(
+    df: "cudf.DataFrame", embedding_col: str, storage_dtype: EmbeddingStorageDtype = "auto"
+) -> "cp.ndarray":
+    """Return embeddings as FP32, decoding FP16 values stored as uint16 bits."""
+    embeddings = get_array_from_df(df, embedding_col)
+    if storage_dtype == "auto":
+        storage_dtype = "float16" if embeddings.dtype == cp.uint16 else "float32"
+    if storage_dtype == "float16":
+        if embeddings.dtype != cp.uint16:
+            msg = f"Expected uint16 bit storage for float16 embeddings, got {embeddings.dtype}"
+            raise TypeError(msg)
+        return embeddings.view(cp.float16).astype(cp.float32)
+    if storage_dtype == "float32":
+        return embeddings.astype(cp.float32, copy=False)
+    msg = f"Unsupported embedding storage dtype: {storage_dtype}"
+    raise ValueError(msg)
 
 
 def break_parquet_partition_into_groups(

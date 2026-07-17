@@ -189,6 +189,35 @@ class TestKMeansStage:
 
         assert stages[0].file_extensions == [".pq"]
 
+    @pytest.mark.parametrize("output_dtype", ["float16", "float32"])
+    def test_output_embedding_dtype_is_forwarded(self, tmp_path: Path, output_dtype: str) -> None:
+        stage = KMeansStage(
+            id_field="id",
+            embedding_field="embeddings",
+            n_clusters=2,
+            input_path=str(tmp_path / "input"),
+            output_path=str(tmp_path / "output"),
+            output_embedding_dtype=output_dtype,  # type: ignore[arg-type]
+        )
+
+        write_stage = stage.decompose()[1]
+
+        assert write_stage.output_embedding_dtype == output_dtype
+
+    def test_output_embedding_dtype_defaults_to_float16(self, tmp_path: Path) -> None:
+        stage = KMeansStage(
+            id_field="id",
+            embedding_field="embeddings",
+            n_clusters=2,
+            input_path=str(tmp_path / "input"),
+            output_path=str(tmp_path / "output"),
+        )
+
+        write_stage = stage.decompose()[1]
+
+        assert write_stage.output_embedding_dtype == "float16"
+        assert write_stage.write_kwargs["compression"] == "zstd"
+
     def test_unsupported_input_filetype_raises(self, tmp_path: Path) -> None:
         stage = KMeansStage(
             id_field="id",
@@ -570,6 +599,24 @@ class TestKMeansReadFitWriteStage:
             rtol=1e-5,
             atol=1e-5,
         )
+
+    @pytest.mark.parametrize("output_dtype", ["float16", "float32"])
+    def test_encode_embeddings_for_write(self, make_stage: "KMeansReadFitWriteStage", output_dtype: str) -> None:
+        stage = make_stage(output_embedding_dtype=output_dtype)
+        df = cudf.DataFrame({"embeddings": [[0.25, -0.5], [1.0, 0.125]]})
+        original_dtype = get_array_from_df(df, "embeddings").dtype
+
+        result = stage._encode_embeddings_for_write(df, "embeddings")
+        stored = get_array_from_df(result, "embeddings")
+
+        if output_dtype == "float16":
+            assert stored.dtype == cp.uint16
+            cp.testing.assert_allclose(
+                stored.view(cp.float16).astype(cp.float32),
+                cp.array([[0.25, -0.5], [1.0, 0.125]], dtype=cp.float32),
+            )
+        else:
+            assert stored.dtype == original_dtype
 
     @pytest.mark.parametrize("bad_fraction", [0.0, 1.0, -0.001, 1.001])
     def test_fit_data_fraction_validation(self, tmp_path: Path, bad_fraction: float) -> None:

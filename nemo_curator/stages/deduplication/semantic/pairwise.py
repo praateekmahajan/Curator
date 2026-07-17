@@ -31,7 +31,7 @@ from nemo_curator.utils.file_utils import check_disallowed_kwargs
 
 from .pairwise_io import ClusterWiseFilePartitioningStage
 from .ranking import RankingStrategy
-from .utils import break_parquet_partition_into_groups, get_array_from_df
+from .utils import EmbeddingStorageDtype, break_parquet_partition_into_groups, decode_embedding_array
 
 
 def pairwise_cosine_similarity_batched(
@@ -88,6 +88,7 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
         pairwise_batch_size: int = 1024,
         verbose: bool = False,
         embedding_dim: int | None = None,
+        input_embedding_dtype: EmbeddingStorageDtype = "auto",
         read_kwargs: dict[str, Any] | None = None,
         write_kwargs: dict[str, Any] | None = None,
     ):
@@ -101,6 +102,7 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
             pairwise_batch_size: Batch size for pairwise similarity computation.
             verbose: Whether to print verbose output.
             embedding_dim: Embedding dimension for memory estimation.
+            input_embedding_dtype: Storage dtype of the embedding list. ``auto`` detects uint16 FP16 bit storage.
             read_kwargs: Kwargs for reading parquet files.
             write_kwargs: Kwargs for writing parquet files.
         """
@@ -109,6 +111,10 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
         self.output_path = output_path
         self.pairwise_batch_size = pairwise_batch_size
         self.embedding_dim = embedding_dim
+        if input_embedding_dtype not in {"auto", "float16", "float32"}:
+            msg = f"Unsupported input_embedding_dtype: {input_embedding_dtype}"
+            raise ValueError(msg)
+        self.input_embedding_dtype = input_embedding_dtype
         self.ranking_strategy = ranking_strategy
         self.verbose = verbose
         self.read_kwargs = read_kwargs.copy() if read_kwargs is not None else {}
@@ -198,7 +204,7 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
         metadata_dfs, embedding_arrays = [], []
         for df in dfs:
             metadata_dfs.append(df[metadata_cols])
-            embedding_arrays.append(get_array_from_df(df, self.embedding_field))
+            embedding_arrays.append(decode_embedding_array(df, self.embedding_field, self.input_embedding_dtype))
 
         metadata_cluster_df = cudf.concat(metadata_dfs, ignore_index=True).reset_index(drop=True)
 
@@ -269,6 +275,7 @@ class PairwiseStage(CompositeStage[EmptyTask, FileGroupTask]):
 
     # Optional parameters
     embedding_dim: int | None = None
+    input_embedding_dtype: EmbeddingStorageDtype = "auto"
     pairwise_batch_size: int = 1024
     verbose: bool = False
     read_kwargs: dict[str, Any] | None = None
@@ -281,6 +288,9 @@ class PairwiseStage(CompositeStage[EmptyTask, FileGroupTask]):
     def __post_init__(self):
         """Initialize parent class after dataclass initialization."""
         super().__init__()
+        if self.input_embedding_dtype not in {"auto", "float16", "float32"}:
+            msg = f"Unsupported input_embedding_dtype: {self.input_embedding_dtype}"
+            raise ValueError(msg)
         if self.ranking_strategy is None:
             if self.which_to_keep == "random":
                 self.ranking_strategy = RankingStrategy(
@@ -321,6 +331,7 @@ class PairwiseStage(CompositeStage[EmptyTask, FileGroupTask]):
                 verbose=self.verbose,
                 ranking_strategy=self.ranking_strategy,
                 embedding_dim=self.embedding_dim,
+                input_embedding_dtype=self.input_embedding_dtype,
                 read_kwargs=self.read_kwargs,
                 write_kwargs=self.write_kwargs,
             ),
