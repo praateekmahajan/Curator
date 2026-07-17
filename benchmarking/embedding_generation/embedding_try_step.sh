@@ -14,6 +14,12 @@ if [[ "${PYTHON_PATH}" != "${CURATOR_DIR}/.venv/bin/python" ]]; then
     exit 2
 fi
 
+SITE_PACKAGES="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+CUDA_RUNTIME_LIB="${SITE_PACKAGES}/nvidia/cu13/lib"
+if [[ -d "${CUDA_RUNTIME_LIB}" ]]; then
+    export LD_LIBRARY_PATH="${CUDA_RUNTIME_LIB}:${LD_LIBRARY_PATH:-}"
+fi
+
 cd "${CURATOR_DIR}"
 exec python benchmarking/run.py \
     --config "${PIPELINE_CONFIG}" \
