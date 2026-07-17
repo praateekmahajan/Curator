@@ -21,24 +21,18 @@ def _extractor(
         metadata_mapping={
             "source_a": {
                 "source_family_id": 0,
-                "source_dataset_id": 10,
-                "source_priority": 0,
-                "quality_rank": 13,
+                "quality_rank": 130,
                 "recency_rank": 1,
             },
             "source_b": {
                 "source_family_id": 1,
-                "source_dataset_id": 20,
-                "source_priority": 1,
                 "quality_rank": 0,
                 "recency_rank": 0,
             },
         },
         output_dtypes={
             "source_family_id": "int8",
-            "source_dataset_id": "int16",
-            "source_priority": "int8",
-            "quality_rank": "int8",
+            "quality_rank": "int16",
             "recency_rank": "int8",
         },
         content_field="multimodal_document",
@@ -64,9 +58,9 @@ def test_broadcasts_integer_metadata(
 
     assert result.num_rows == 2
     assert result.schema.field("source_family_id").type == pa.int8()
-    assert result.schema.field("source_dataset_id").type == pa.int16()
-    expected_priority = 0 if mapping_names == ["source_a"] else 1
-    assert result["source_priority"].to_pylist() == [expected_priority, expected_priority]
+    assert result.schema.field("quality_rank").type == pa.int16()
+    expected_family = 0 if mapping_names == ["source_a"] else 1
+    assert result["source_family_id"].to_pylist() == [expected_family, expected_family]
 
 
 def test_rejects_unknown_mapping() -> None:

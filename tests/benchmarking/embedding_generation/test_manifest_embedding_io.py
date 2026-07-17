@@ -95,7 +95,7 @@ def test_writer_emits_only_generated_fields(tmp_path: Path) -> None:
             {
                 CURATOR_DEDUP_ID_STR: [1],
                 "embeddings": [[0.1, 0.2]],
-                "source_priority": [1],
+                "quality_rank": [130],
                 "adlr_id": [99],
                 "sample_id": ["legacy"],
                 "text": ["temporary"],
@@ -106,14 +106,14 @@ def test_writer_emits_only_generated_fields(tmp_path: Path) -> None:
     writer = MirroredParquetWriter(
         path=str(output_root),
         source_root=str(source_root),
-        fields=[CURATOR_DEDUP_ID_STR, "embeddings", "source_priority"],
+        fields=[CURATOR_DEDUP_ID_STR, "embeddings", "quality_rank"],
         drop_fields=[],
     )
 
     output_task = writer.process(task)
 
     table = pq.read_table(output_task.data[0])
-    assert table.column_names == [CURATOR_DEDUP_ID_STR, "embeddings", "source_priority"]
+    assert table.column_names == [CURATOR_DEDUP_ID_STR, "embeddings", "quality_rank"]
 
 
 def test_prepare_smoke_manifest_and_explicit_shards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

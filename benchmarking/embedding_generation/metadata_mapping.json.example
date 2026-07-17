@@ -9,28 +9,19 @@
   },
   "output_dtypes": {
     "source_family_id": "int8",
-    "source_dataset_id": "int16",
-    "source_priority": "int8",
-    "quality_rank": "int8",
-    "recency_rank": "int8",
-    "ranking_policy_id": "int16"
+    "quality_rank": "int16",
+    "recency_rank": "int8"
   },
   "metadata_mapping": {
     "source_a": {
       "source_family_id": 0,
-      "source_dataset_id": 10,
-      "source_priority": 0,
-      "quality_rank": 13,
-      "recency_rank": 1,
-      "ranking_policy_id": 1
+      "quality_rank": 130,
+      "recency_rank": 1
     },
     "source_b": {
       "source_family_id": 1,
-      "source_dataset_id": 20,
-      "source_priority": 1,
       "quality_rank": 0,
-      "recency_rank": 0,
-      "ranking_policy_id": 1
+      "recency_rank": 0
     }
   }
 }

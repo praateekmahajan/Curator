@@ -4,7 +4,9 @@ Copy `paths.yaml.example` to ignored `paths.yaml`, fill in the manifest, path ma
 
 The current smoke workflow intentionally uses the existing ID registry and runtime-to-registry path mapping. This is temporary until a new manifest and ID registry are generated directly from the fuzzy-deduplicated files.
 
-`MetadataExtractor` resolves one `mapping_names` entry per input file and broadcasts its configured integer provenance/ranking values onto every row. Stable source IDs and mutable policy ranks remain in the private mapping, while the generic stage and example schema contain no dataset-specific policy. Pairwise ranking can sort `source_priority`, `quality_rank`, and `recency_rank` descending, followed by the dedup ID ascending.
+`MetadataExtractor` resolves one `mapping_names` entry per input file and broadcasts three configured integer ranking values onto every row. Pairwise ranking sorts `source_family_id`, `quality_rank`, and `recency_rank` descending, followed by the dedup ID ascending. Family rank takes precedence globally; spaced quality ranks preserve special-source placement without overloading recency; recency breaks ties only within a quality bucket.
+
+The private policy uses family `1` above family `0`. Family `1` quality levels are `super_low=-1`, `low=0`, `mid=1`, and `high=2`. Family `0` score folders use `score * 10`, leaving integer gaps for special sources: `score17=170`, `MQ=175`, `Reddit=176`, `score18=180`, `MHQ=185`, `OpenWebText=186`, `score19=190`, `HQ=195`, `CC-NEWS=196`, and `BigScience=197`. Within matching score folders, recency is `CC99=0`, `CC8=1`, and the newest crawl family is `2`.
 
 When `text_extraction` is configured, an existing scalar `text` column is preserved. If it is absent, the stage keeps string blocks from `<content_field>.content`, ignores non-text items, and creates `text` using either a fixed separator or whitespace-aware smart merging. Configure `retained_input_fields` as `[_curator_dedup_id, text]` for embedding generation so heterogeneous nested payloads are removed before conversion to Arrow and only model inputs/provenance continue through the GPU stages.
 
