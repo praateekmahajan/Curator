@@ -9,5 +9,6 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec bash "${SCRIPT_DIR}/embedding_try_worker_environment.sh"
+CURATOR_DIR="${CURATOR_DIR:-${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR is not set}}"
+export CURATOR_DIR
+exec bash "${CURATOR_DIR}/benchmarking/embedding_generation/embedding_try_worker_environment.sh"
