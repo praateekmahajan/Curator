@@ -26,7 +26,7 @@ entries:
       --output-path={embeddings_root}/embedding-try
       --checkpoint-dir={checkpoint_dir}
       --require-min-files-per-shard=16
-      --manifest-max-rows=4000000
+      --keep-text
       --executor=ray_data
       --reader-max-workers=4
       --model-identifier=Qwen/Qwen3-Embedding-0.6B

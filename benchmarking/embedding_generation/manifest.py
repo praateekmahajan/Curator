@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 from loguru import logger
 
-from nemo_curator.backends.slurm_array import resolve_slurm_array_config
+from nemo_curator.backends.slurm_array import SlurmArrayConfig, resolve_slurm_array_config
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.deduplication.id_generator import CURATOR_DEDUP_ID_STR
@@ -214,6 +214,43 @@ class ManifestIdAssignmentStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         )
 
 
+def _uses_explicit_shards(records: list[dict[str, Any]]) -> bool:
+    flags = ["shard_index" in record for record in records]
+    if any(flags) and not all(flags):
+        msg = "Either every manifest record must define shard_index or none may define it"
+        raise ValueError(msg)
+    return all(flags)
+
+
+def _resolve_record_shard(
+    record: dict[str, Any],
+    prefix_rows: int,
+    total_rows: int,
+    slurm_array: SlurmArrayConfig,
+    use_explicit_shards: bool,
+) -> tuple[int, int]:
+    if not use_explicit_shards:
+        shard_offset = min(
+            prefix_rows * slurm_array.total_shards // total_rows,
+            slurm_array.total_shards - 1,
+        )
+        return slurm_array.minimum_shard_index + shard_offset, shard_offset
+
+    shard_index = record["shard_index"]
+    if isinstance(shard_index, bool) or not isinstance(shard_index, int):
+        msg = f"Manifest index {record['index']} shard_index must be an integer"
+        raise TypeError(msg)
+    shard_offset = shard_index - slurm_array.minimum_shard_index
+    if not 0 <= shard_offset < slurm_array.total_shards:
+        msg = (
+            f"Manifest index {record['index']} has shard_index={shard_index}; expected "
+            f"[{slurm_array.minimum_shard_index}, "
+            f"{slurm_array.minimum_shard_index + slurm_array.total_shards - 1}]"
+        )
+        raise ValueError(msg)
+    return shard_index, shard_offset
+
+
 @dataclass
 class ManifestFilePartitioningStage(ProcessingStage[EmptyTask, ManifestFileGroupTask]):
     """Emit FPP=1 tasks for the active row-balanced Slurm array shard."""
@@ -272,10 +309,16 @@ class ManifestFilePartitioningStage(ProcessingStage[EmptyTask, ManifestFileGroup
         tasks: list[ManifestFileGroupTask] = []
         shard_file_counts = [0] * slurm_array.total_shards
         shard_row_counts = [0] * slurm_array.total_shards
+        use_explicit_shards = _uses_explicit_shards(selected_records)
         prefix_rows = 0
         for record in selected_records:
-            shard_offset = min(prefix_rows * slurm_array.total_shards // total_rows, slurm_array.total_shards - 1)
-            shard_index = slurm_array.minimum_shard_index + shard_offset
+            shard_index, shard_offset = _resolve_record_shard(
+                record,
+                prefix_rows,
+                total_rows,
+                slurm_array,
+                use_explicit_shards,
+            )
             shard_file_counts[shard_offset] += 1
             shard_row_counts[shard_offset] += record["num_rows"]
 

@@ -93,10 +93,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         metadata_fields=None,
     )
 
+    output_fields = [CURATOR_DEDUP_ID_STR]
+    if args.keep_text:
+        output_fields.append(metadata_extractor.text_field)
+    output_fields.extend(["embeddings", *metadata_extractor.output_dtypes])
     writer = MirroredParquetWriter(
         path=str(output_path),
         source_root=args.source_root,
-        fields=[CURATOR_DEDUP_ID_STR, "embeddings", *metadata_extractor.output_dtypes],
+        fields=output_fields,
         drop_fields=[],
         write_kwargs={
             "compression": "zstd",
@@ -141,7 +145,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "params": {
             **vars(args),
             "max_seq_length": max_seq_length,
-            "output_schema": "_curator_dedup_id, embeddings, and configured integer metadata",
+            "output_schema": output_fields,
             "id_column": CURATOR_DEDUP_ID_STR,
         },
         "metrics": {
@@ -171,6 +175,7 @@ def parse_args() -> argparse.Namespace:
         help="Fail if the fixed TOTAL_SHARDS partition gives any shard fewer files",
     )
     parser.add_argument("--manifest-max-rows", type=int, default=None)
+    parser.add_argument("--keep-text", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--executor", default="ray_data", choices=["ray_data"])
     parser.add_argument("--reader-max-workers", type=int, default=4)
     parser.add_argument("--model-identifier", default="Qwen/Qwen3-Embedding-0.6B")

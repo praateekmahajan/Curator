@@ -20,13 +20,23 @@ When `text_extraction` is configured, an existing scalar `text` column is preser
 
 Production Parquet contains only `_curator_dedup_id`, `embeddings`, and configured integer metadata. Source-specific IDs and payload columns are intentionally excluded.
 
-Smoke test two logical shards:
+Build the private smoke manifest from the enriched runtime manifest. It selects the smallest files and writes explicit shard assignments: 16 files from the first family, 16 from the second, and an 8+8 mixed shard.
+
+```bash
+python -m benchmarking.embedding_generation.prepare_smoke_manifest \
+  --input-manifest=/path/to/runtime-manifest.jsonl \
+  --metadata-mapping=/path/to/metadata_mapping.json \
+  --output-manifest=/path/to/smoke-manifest.jsonl \
+  --first-family-id=0 --second-family-id=1 --files-per-shard=16
+```
+
+Smoke test three logical shards. The smoke YAML enables `--keep-text`, so output contains the generated ID, text used by the embedder, embedding, and integer metadata.
 
 ```bash
 export ARRAY_RUNTIME_ROOT=/path/to/runtime
 export ARRAY_LOG_DIR=/path/to/logs
 mkdir -p "$ARRAY_RUNTIME_ROOT" "$ARRAY_LOG_DIR"
-TOTAL_SHARDS=2 sbatch --array=0-1 \
+TOTAL_SHARDS=3 sbatch --array=0-2 \
   --output="$ARRAY_LOG_DIR/%A_%a.out" --error="$ARRAY_LOG_DIR/%A_%a.err" \
   benchmarking/embedding_generation/submit_embedding_try.sbatch
 ```
