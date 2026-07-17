@@ -15,10 +15,19 @@ if [[ "${PYTHON_PATH}" != "${CURATOR_DIR}/.venv/bin/python" ]]; then
 fi
 
 SITE_PACKAGES="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
-CUDA_RUNTIME_LIB="${SITE_PACKAGES}/nvidia/cu13/lib"
-if [[ -d "${CUDA_RUNTIME_LIB}" ]]; then
-    export LD_LIBRARY_PATH="${CUDA_RUNTIME_LIB}:${LD_LIBRARY_PATH:-}"
-fi
+export CUDA_HOME="${SITE_PACKAGES}/nvidia/cu13"
+export PATH="${CURATOR_DIR}/.venv/bin:${CUDA_HOME}/bin:${PATH}"
+export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${SITE_PACKAGES}/nvidia/cublas/lib:${SITE_PACKAGES}/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH:-}"
+export CPLUS_INCLUDE_PATH="${SITE_PACKAGES}/nvidia/cublas/include:${SITE_PACKAGES}/nvidia/cuda_runtime/include:${CUDA_HOME}/include"
+export LIBRARY_PATH="${SITE_PACKAGES}/nvidia/cublas/lib:${SITE_PACKAGES}/nvidia/cuda_runtime/lib:${CUDA_HOME}/lib"
+export HF_HUB_OFFLINE=1
+export VLLM_USE_DEEP_GEMM=0
+export VLLM_MOE_USE_DEEP_GEMM=0
+export VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE=1073741824
+export VLLM_CACHE_ROOT="${RUNTIME_ROOT}/cache/vllm"
+export TRITON_CACHE_DIR="${RUNTIME_ROOT}/cache/triton"
+export CUDA_CACHE_PATH="${RUNTIME_ROOT}/cache/cuda"
+mkdir -p "${VLLM_CACHE_ROOT}" "${TRITON_CACHE_DIR}" "${CUDA_CACHE_PATH}"
 
 cd "${CURATOR_DIR}"
 exec python benchmarking/run.py \
