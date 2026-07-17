@@ -158,6 +158,9 @@ data/
 alm_output/
 benchmark_results/
 
+# Local machine paths for large semantic-dedup benchmarks.
+/benchmarking/large_semdedup_paths.yaml
+
 # Agent related files
 AGENTS.md
 CLAUDE.md

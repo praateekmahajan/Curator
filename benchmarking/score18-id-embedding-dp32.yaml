@@ -1,0 +1,240 @@
+datasets:
+  - name: score18
+    formats:
+      - type: jsonl
+        path: "{score18_path}"
+  - name: score18_id_generator
+    formats:
+      - type: json
+        path: "{id_generator_path}/fuzzy_id_generator.json"
+  - name: text_models_hf_cache
+    formats:
+      - type: files
+        path: "{model_weights_path}/hub"
+
+sinks:
+  - name: slack
+    enabled: false
+
+gpu_stats_recorder:
+  interval_s: 1.0
+
+delete_scratch: false
+object_store_size: 68719476736
+gpu_mem_use_warning_threshold: 0.01
+
+ray:
+  num_cpus: 144
+  num_gpus: 4
+  enable_object_spilling: false
+
+entries:
+  - name: score18_qwen_dp4_prebuffered_with_ids
+    enabled: true
+    script: embedding_generation_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --output-path={session_entry_dir}/scratch/parquet
+      --executor=ray_data
+      --input-path={dataset:score18,jsonl}
+      --input-format=jsonl
+      --load-dataset-ratio=0.01
+      --id-generator-path={dataset:score18_id_generator,json}
+      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --metadata-field=adlr_id
+      --reader-max-workers=4
+      --model-identifier=Qwen/Qwen3-Embedding-0.6B
+      --model-variation=vllm_text_pretokenized
+      --model-inference-batch-size=10000
+      --model-num-workers=4
+      --model-worker-gpus=1.0
+      --model-gpu-memory-utilization=0.8
+      --model-kv-cache-memory-bytes=34359738368
+      --cache-dir={dataset:text_models_hf_cache,files}
+    timeout_s: 14100
+
+  - name: score18_qwen_dp8_with_ids
+    enabled: true
+    script: embedding_generation_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --output-path={session_entry_dir}/scratch/parquet
+      --executor=ray_data
+      --input-path={dataset:score18,jsonl}
+      --input-format=jsonl
+      --load-dataset-ratio=0.01
+      --id-generator-path={dataset:score18_id_generator,json}
+      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --metadata-field=adlr_id
+      --reader-max-workers=4
+      --model-identifier=Qwen/Qwen3-Embedding-0.6B
+      --model-variation=vllm_text_pretokenized
+      --model-inference-batch-size=10000
+      --model-num-workers=8
+      --model-worker-gpus=0.5
+      --model-gpu-memory-utilization=0.4
+      --model-kv-cache-memory-bytes=17179869184
+      --cache-dir={dataset:text_models_hf_cache,files}
+    timeout_s: 14100
+
+  - name: score18_qwen_dp16_with_ids
+    enabled: true
+    script: embedding_generation_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --output-path={session_entry_dir}/scratch/parquet
+      --executor=ray_data
+      --input-path={dataset:score18,jsonl}
+      --input-format=jsonl
+      --load-dataset-ratio=0.01
+      --id-generator-path={dataset:score18_id_generator,json}
+      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --metadata-field=adlr_id
+      --reader-max-workers=4
+      --model-identifier=Qwen/Qwen3-Embedding-0.6B
+      --model-variation=vllm_text_pretokenized
+      --model-inference-batch-size=10000
+      --model-num-workers=16
+      --model-worker-gpus=0.25
+      --model-gpu-memory-utilization=0.2
+      --model-kv-cache-memory-bytes=8589934592
+      --cache-dir={dataset:text_models_hf_cache,files}
+    timeout_s: 14100
+
+  - name: score18_harrier_dp8_with_ids
+    enabled: true
+    script: embedding_generation_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --output-path={session_entry_dir}/scratch/parquet
+      --executor=ray_data
+      --input-path={dataset:score18,jsonl}
+      --input-format=jsonl
+      --load-dataset-ratio=0.01
+      --id-generator-path={dataset:score18_id_generator,json}
+      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --metadata-field=adlr_id
+      --reader-max-workers=4
+      --model-identifier=microsoft/harrier-oss-v1-270m
+      --model-variation=vllm_text_pretokenized
+      --model-inference-batch-size=10000
+      --model-num-workers=8
+      --model-worker-gpus=0.5
+      --model-kv-cache-memory-bytes=4294967296
+      --cache-dir={dataset:text_models_hf_cache,files}
+    timeout_s: 14100
+
+  - name: score18_harrier_dp16_with_ids
+    enabled: true
+    script: embedding_generation_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --output-path={session_entry_dir}/scratch/parquet
+      --executor=ray_data
+      --input-path={dataset:score18,jsonl}
+      --input-format=jsonl
+      --load-dataset-ratio=0.01
+      --id-generator-path={dataset:score18_id_generator,json}
+      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --metadata-field=adlr_id
+      --reader-max-workers=4
+      --model-identifier=microsoft/harrier-oss-v1-270m
+      --model-variation=vllm_text_pretokenized
+      --model-inference-batch-size=10000
+      --model-num-workers=16
+      --model-worker-gpus=0.25
+      --model-kv-cache-memory-bytes=2147483648
+      --cache-dir={dataset:text_models_hf_cache,files}
+    timeout_s: 14100
+
+  - name: score18_qwen_dp32_with_ids
+    enabled: true
+    script: embedding_generation_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --output-path={session_entry_dir}/scratch/parquet
+      --executor=ray_data
+      --input-path={dataset:score18,jsonl}
+      --input-format=jsonl
+      --load-dataset-ratio=0.01
+      --id-generator-path={dataset:score18_id_generator,json}
+      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --metadata-field=adlr_id
+      --reader-max-workers=4
+      --model-identifier=Qwen/Qwen3-Embedding-0.6B
+      --model-variation=vllm_text_pretokenized
+      --model-inference-batch-size=10000
+      --model-num-workers=32
+      --model-worker-gpus=0.125
+      --model-gpu-memory-utilization=0.1
+      --model-kv-cache-memory-bytes=4294967296
+      --cache-dir={dataset:text_models_hf_cache,files}
+    timeout_s: 14100
+
+  - name: score18_harrier_dp32_with_ids
+    enabled: true
+    script: embedding_generation_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --output-path={session_entry_dir}/scratch/parquet
+      --executor=ray_data
+      --input-path={dataset:score18,jsonl}
+      --input-format=jsonl
+      --load-dataset-ratio=0.01
+      --id-generator-path={dataset:score18_id_generator,json}
+      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --metadata-field=adlr_id
+      --reader-max-workers=4
+      --model-identifier=microsoft/harrier-oss-v1-270m
+      --model-variation=vllm_text_pretokenized
+      --model-inference-batch-size=10000
+      --model-num-workers=32
+      --model-worker-gpus=0.125
+      --model-kv-cache-memory-bytes=1073741824
+      --cache-dir={dataset:text_models_hf_cache,files}
+    timeout_s: 6900
+  - name: score18_qwen_dp64_with_ids
+    enabled: true
+    script: embedding_generation_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --output-path={session_entry_dir}/scratch/parquet
+      --executor=ray_data
+      --input-path={dataset:score18,jsonl}
+      --input-format=jsonl
+      --load-dataset-ratio=0.01
+      --id-generator-path={dataset:score18_id_generator,json}
+      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --metadata-field=adlr_id
+      --reader-max-workers=4
+      --model-identifier=Qwen/Qwen3-Embedding-0.6B
+      --model-variation=vllm_text_pretokenized
+      --model-inference-batch-size=10000
+      --model-num-workers=64
+      --model-worker-gpus=0.0625
+      --model-kv-cache-memory-bytes=2147483648
+      --cache-dir={dataset:text_models_hf_cache,files}
+    timeout_s: 6900
+
+  - name: score18_harrier_dp64_with_ids
+    enabled: true
+    script: embedding_generation_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --output-path={session_entry_dir}/scratch/parquet
+      --executor=ray_data
+      --input-path={dataset:score18,jsonl}
+      --input-format=jsonl
+      --load-dataset-ratio=0.01
+      --id-generator-path={dataset:score18_id_generator,json}
+      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --metadata-field=adlr_id
+      --reader-max-workers=4
+      --model-identifier=microsoft/harrier-oss-v1-270m
+      --model-variation=vllm_text_pretokenized
+      --model-inference-batch-size=10000
+      --model-num-workers=64
+      --model-worker-gpus=0.0625
+      --model-kv-cache-memory-bytes=536870912
+      --cache-dir={dataset:text_models_hf_cache,files}
+    timeout_s: 6900

@@ -1,0 +1,21 @@
+# Copy this file to large_semdedup_paths.yaml and replace every placeholder.
+# The local file is gitignored. Layer it after a benchmark definition, for example:
+# python benchmarking/run.py --config benchmarking/ray-256-embedding-benchmark.yaml \
+#   --config benchmarking/large_semdedup_paths.yaml
+
+paths:
+  - name: reddit_datasets_path
+    host_path: /path/to/reddit/benchmark/datasets
+    container_path: /path/to/reddit/benchmark/datasets
+  - name: score18_root
+    host_path: /path/to/nemotron-v3-sharded
+    container_path: /path/to/nemotron-v3-sharded
+  - name: id_generator_path
+    host_path: /path/to/id-generator-directory
+    container_path: /path/to/id-generator-directory
+  - name: model_weights_path
+    host_path: /path/to/huggingface-cache
+    container_path: /path/to/huggingface-cache
+  - name: results_path
+    host_path: /path/to/benchmark/results
+    container_path: /path/to/benchmark/results
