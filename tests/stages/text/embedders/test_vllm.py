@@ -14,6 +14,7 @@
 
 from contextlib import suppress
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -154,6 +155,47 @@ class TestVLLMEmbeddingModelStage:
     def test_rejects_nonpositive_model_inference_batch_size(self) -> None:
         with pytest.raises(ValueError, match="model_inference_batch_size must be positive"):
             VLLMEmbeddingModelStage(model_identifier=TEST_MODEL, model_inference_batch_size=0)
+
+    def test_process_reports_actual_input_token_metrics(self, sample_data: DocumentBatch) -> None:
+        token_counts = {
+            "Hello world": 2,
+            "This is a test": 4,
+            "Machine learning is great": 4,
+        }
+
+        def _encode(
+            input_data: list[str],
+            *,
+            pooling_task: str,
+            tokenization_kwargs: dict[str, int],
+            use_tqdm: bool,
+        ) -> list[SimpleNamespace]:
+            assert pooling_task == "embed"
+            assert tokenization_kwargs == {"truncate_prompt_tokens": -1}
+            assert use_tqdm is False
+            return [
+                SimpleNamespace(
+                    prompt_token_ids=list(range(token_counts[text])),
+                    outputs=SimpleNamespace(data=torch.tensor([float(token_counts[text]), 1.0])),
+                )
+                for text in input_data
+            ]
+
+        stage = VLLMEmbeddingModelStage(
+            model_identifier=TEST_MODEL,
+            pretokenize=False,
+            metadata_fields=["text"],
+            model_inference_batch_size=2,
+        )
+        stage.model = SimpleNamespace(encode=_encode)
+
+        result = stage.process(sample_data)
+        metrics = stage._consume_custom_metrics()
+
+        assert result.num_items == 3
+        assert metrics["input_tokens"] == 10
+        assert metrics["tokenization_time"] == 0
+        assert metrics["vllm_embedding_time"] >= 0
 
     @pytest.mark.parametrize("pretokenize", [True, False])
     def test_vllm_produces_valid_embeddings(

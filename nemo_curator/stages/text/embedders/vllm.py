@@ -186,7 +186,7 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         del tokenized_data
         return prompts, time.perf_counter() - t0
 
-    def _embed_chunk(self, input_data: list[Any], expected_size: int) -> tuple[np.ndarray, float]:
+    def _embed_chunk(self, input_data: list[Any], expected_size: int) -> tuple[np.ndarray, dict[str, float]]:
         if self.model is None:
             msg = "vLLM model is not initialized. Please call setup() before processing."
             raise ValueError(msg)
@@ -203,6 +203,16 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             msg = f"vLLM returned {len(vllm_output)} embeddings for a {expected_size}-row input chunk"
             raise ValueError(msg)
 
+        input_sequence_lengths = np.fromiter(
+            (len(output.prompt_token_ids) for output in vllm_output),
+            dtype=np.int64,
+            count=expected_size,
+        )
+        metrics = {
+            "vllm_embedding_time": elapsed,
+            "input_tokens": float(input_sequence_lengths.sum(dtype=np.int64)),
+        }
+
         chunk_embedding_matrix = torch.stack([output.outputs.data for output in vllm_output])
         chunk_embedding_matrix = chunk_embedding_matrix.to(device="cpu", dtype=torch.float32).contiguous()
         if chunk_embedding_matrix.ndim != _EMBEDDING_MATRIX_NDIM:
@@ -210,7 +220,7 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             raise ValueError(msg)
         chunk_embedding_numpy = chunk_embedding_matrix.numpy()
         del vllm_output
-        return chunk_embedding_numpy, elapsed
+        return chunk_embedding_numpy, metrics
 
     def _iter_prepared_chunks(
         self, text_column: pa.ChunkedArray, num_rows: int
@@ -271,13 +281,15 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         embedding_numpy: np.ndarray | None = None
         tokenization_time = 0.0
         vllm_embedding_time = 0.0
+        input_tokens = 0.0
 
         for offset, chunk_size, input_data, chunk_tokenization_time in self._iter_prepared_chunks(
             text_column, num_rows
         ):
             tokenization_time += chunk_tokenization_time
-            chunk_embedding_numpy, chunk_embedding_time = self._embed_chunk(input_data, chunk_size)
-            vllm_embedding_time += chunk_embedding_time
+            chunk_embedding_numpy, chunk_metrics = self._embed_chunk(input_data, chunk_size)
+            vllm_embedding_time += chunk_metrics["vllm_embedding_time"]
+            input_tokens += chunk_metrics["input_tokens"]
             del input_data
             if embedding_numpy is None:
                 embedding_numpy = np.empty((num_rows, chunk_embedding_numpy.shape[1]), dtype=np.float32)
@@ -297,6 +309,7 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return embedding_numpy, {
             "tokenization_time": tokenization_time,
             "vllm_embedding_time": vllm_embedding_time,
+            "input_tokens": input_tokens,
         }
 
     @staticmethod

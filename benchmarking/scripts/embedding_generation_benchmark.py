@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# ruff: noqa: C901, PLR0913, PLR0915
+# ruff: noqa: PLR0913, PLR0915
 
 """Embedding generation benchmarking script.
 
@@ -285,9 +285,7 @@ def run_embedding_generation_benchmark(
     if id_generator_path is not None:
         id_generator = IdGeneratorBase.from_disk(id_generator_path, path_mapping=id_path_mapping)
         missing_files = [
-            path
-            for path in input_files
-            if id_generator.hash_files(path) not in id_generator.batch_registry
+            path for path in input_files if id_generator.hash_files(path) not in id_generator.batch_registry
         ]
         if missing_files:
             examples = "\n".join(missing_files[:5])
@@ -374,21 +372,27 @@ def run_embedding_generation_benchmark(
     num_documents_processed = sum(task._stage_perf[-1].num_items_processed for task in output_tasks)
     throughput_docs_per_sec = num_documents_processed / run_time_taken if run_time_taken > 0 else 0
     stage_metrics = TaskPerfUtils.collect_stage_metrics(output_tasks)
+    gpu_stage_metrics = [values for stage_name, values in stage_metrics.items() if stage_name.endswith("_vllm")]
     gpu_stage_process_time_sum = sum(
-        float(values["process_time"].sum())
-        for stage_name, values in stage_metrics.items()
-        if stage_name.endswith("_vllm") and "process_time" in values
+        float(values["process_time"].sum()) for values in gpu_stage_metrics if "process_time" in values
     )
     gpu_stage_num_items_processed = sum(
-        int(values["num_items_processed"].sum())
-        for stage_name, values in stage_metrics.items()
-        if stage_name.endswith("_vllm") and "num_items_processed" in values
+        int(values["num_items_processed"].sum()) for values in gpu_stage_metrics if "num_items_processed" in values
+    )
+    gpu_stage_input_tokens = sum(
+        int(values["custom.input_tokens"].sum()) for values in gpu_stage_metrics if "custom.input_tokens" in values
     )
     models_per_gpu = 1.0 / model_worker_gpus if model_worker_gpus else 0.0
     throughput_items_per_gpu_second = (
         models_per_gpu * gpu_stage_num_items_processed / gpu_stage_process_time_sum
         if gpu_stage_process_time_sum > 0
         else 0.0
+    )
+    throughput_input_tokens_per_gpu_second = (
+        models_per_gpu * gpu_stage_input_tokens / gpu_stage_process_time_sum if gpu_stage_process_time_sum > 0 else 0.0
+    )
+    input_sequence_length_mean = (
+        gpu_stage_input_tokens / gpu_stage_num_items_processed if gpu_stage_num_items_processed > 0 else 0.0
     )
 
     logger.success(f"Benchmark completed in {run_time_taken:.2f}s")
@@ -414,8 +418,10 @@ def run_embedding_generation_benchmark(
             "throughput_docs_per_sec": throughput_docs_per_sec,
             "gpu_stage_process_time_sum_s": gpu_stage_process_time_sum,
             "gpu_stage_num_items_processed": gpu_stage_num_items_processed,
+            "input_sequence_length_mean": input_sequence_length_mean,
             "models_per_gpu": models_per_gpu,
             "throughput_items_per_gpu_second": throughput_items_per_gpu_second,
+            "throughput_input_tokens_per_gpu_second": throughput_input_tokens_per_gpu_second,
         },
         "tasks": output_tasks,
     }
