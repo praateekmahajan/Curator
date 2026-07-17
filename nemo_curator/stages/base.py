@@ -18,6 +18,7 @@ import contextlib
 import copy
 import time
 from abc import ABC, ABCMeta, abstractmethod
+from collections.abc import Mapping
 from inspect import isabstract
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar, cast, final
 
@@ -194,8 +195,11 @@ class ProcessingStage(ABC, Generic[X, Y], metaclass=StageMeta):
 
         # Check required columns exist
         missing_data_attrs = []
+        data_columns = getattr(task.data, "column_names", getattr(task.data, "columns", ()))
         for attr in required_data_attrs:
-            if not hasattr(task.data, attr):
+            is_mapping_key = isinstance(task.data, Mapping) and attr in task.data
+            is_named_column = attr in data_columns
+            if not hasattr(task.data, attr) and not is_mapping_key and not is_named_column:
                 missing_data_attrs.append(attr)
 
         # Log warning with missing attributes

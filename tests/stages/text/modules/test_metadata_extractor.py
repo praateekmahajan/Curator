@@ -5,6 +5,7 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 
+from nemo_curator.stages.text.embedders.vllm import VLLMEmbeddingModelStage
 from nemo_curator.stages.text.modules import MetadataExtractor
 from nemo_curator.tasks import DocumentBatch
 
@@ -90,10 +91,12 @@ def test_preserves_existing_text_and_other_columns() -> None:
         _metadata={"mapping_names": ["source_a"]},
     )
 
-    result = _extractor().process(batch).to_pyarrow()
+    output_batch = _extractor().process(batch)
+    result = output_batch.to_pyarrow()
 
     assert result["text"].to_pylist() == ["already present"]
     assert result["other"].to_pylist() == [7]
+    assert VLLMEmbeddingModelStage("unused").validate_input(output_batch)
 
 
 def test_extracts_text_blocks_and_ignores_non_text_items() -> None:
@@ -118,11 +121,13 @@ def test_extracts_text_and_preserves_source_document() -> None:
         _metadata={"mapping_names": ["source_a"]},
     )
 
-    result = _extractor().process(batch).to_pyarrow()
+    output_batch = _extractor().process(batch)
+    result = output_batch.to_pyarrow()
 
     assert result["text"].to_pylist() == ["first\n\nsecond"]
     assert result["other"].to_pylist() == [7]
     assert "multimodal_document" in result.column_names
+    assert VLLMEmbeddingModelStage("unused").validate_input(output_batch)
 
 
 @pytest.mark.parametrize(
