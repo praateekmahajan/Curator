@@ -6,6 +6,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --mem=920G
 #SBATCH --time=04:00:00
+#SBATCH --exclusive
 
 set -euo pipefail
 

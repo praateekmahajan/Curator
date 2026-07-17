@@ -22,6 +22,8 @@ python -m benchmarking.embedding_generation.prepare_smoke_manifest \
 
 Smoke test three logical shards. The smoke YAML enables `--keep-text`, so output contains the generated ID, text used by the embedder, embedding, and integer metadata.
 
+The launcher requests all four GPUs and uses `--exclusive`, guaranteeing one array task per node. Keep those settings together: an exclusive job must use every GPU on its allocated node. A launcher that intentionally requests only one GPU must omit `--exclusive` and first verify on a small run that Slurm correctly coallocates it on a shared node.
+
 ```bash
 export ARRAY_RUNTIME_ROOT=/path/to/runtime
 export ARRAY_LOG_DIR=/path/to/logs
