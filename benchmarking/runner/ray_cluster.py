@@ -15,6 +15,7 @@
 
 import os
 import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -54,7 +55,7 @@ def setup_ray_cluster_and_env(  # noqa: PLR0913
 ) -> tuple[RayClient, Path]:
     """Setup a Ray cluster and set the RAY_ADDRESS environment variable and return the Ray client and temp dir."""
     # Create a short temp dir to avoid Unix socket path length limits
-    ray_temp_root = Path(os.environ.get("RAY_TMPDIR", "/tmp"))
+    ray_temp_root = Path(os.environ.get("RAY_TMPDIR", tempfile.gettempdir()))
     short_temp_path = ray_temp_root / f"ray_{uuid.uuid4().hex[:8]}"
     short_temp_path.mkdir(parents=True, exist_ok=True)
 
