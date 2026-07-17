@@ -1,8 +1,12 @@
 # Manifest embedding array
 
-Copy `paths.yaml.example` to ignored `paths.yaml`, fill in the manifest, path mapping, current ID registry, and output paths, then create a private metadata mapping using `metadata_mapping.json.example` as its schema. Keep the real mapping outside the repository.
+Copy `paths.yaml.example` to ignored `paths.yaml` and fill in the manifest, matching ID registry, metadata mapping, and output paths. The array pipeline has no source-path mapping or container-mount translation.
 
-The current smoke workflow intentionally uses the existing ID registry and runtime-to-registry path mapping. This is temporary until a new manifest and ID registry are generated directly from the fuzzy-deduplicated files.
+Export one `SESSION_NAME` for the logical run. Benchmark metadata is written under `benchmarking/<SESSION_NAME>`, embeddings under `results/<SESSION_NAME>`, Slurm logs under `logs/<SESSION_NAME>`, and checkpoints/runtime under `embedding-generation/<SESSION_NAME>`. Keep the canonical launch scripts versioned in this directory rather than copying mutable per-session variants.
+
+The manifest `path` is the authoritative absolute fuzzy-deduplicated JSONL path. The ID registry key for one FPP=1 file is `str(uuid.uuid5(uuid.NAMESPACE_URL, path))`, using that exact string. The partitioner validates every manifest `id_start`/`id_end` against the matching registry entry before emitting tasks; a changed prefix, mount alias, or range fails instead of silently allocating new IDs.
+
+The metadata mapping remains separate because it configures text extraction and integer ranking columns; it is unrelated to ID assignment.
 
 `MetadataExtractor` resolves one `mapping_names` entry per input file and broadcasts three configured integer ranking values onto every row. Pairwise ranking sorts `source_family_id`, `quality_rank`, and `recency_rank` descending, followed by the dedup ID ascending. Family rank takes precedence globally; spaced quality ranks preserve special-source placement without overloading recency; recency breaks ties only within a quality bucket.
 
@@ -10,13 +14,13 @@ The private policy uses family `1` above family `0`. Family `1` quality levels a
 
 When `text_extraction` is configured, an existing scalar `text` column is preserved. If it is absent, the stage keeps string blocks from `<content_field>.content`, ignores non-text items, and creates `text` using either a fixed separator or whitespace-aware smart merging. Configure `retained_input_fields` as `[_curator_dedup_id, text]` for embedding generation so heterogeneous nested payloads are removed before conversion to Arrow and only model inputs/provenance continue through the GPU stages.
 
-Production Parquet contains only `_curator_dedup_id`, `embeddings`, and configured integer metadata. Source-specific IDs and payload columns are intentionally excluded.
+Parquet contains `_curator_dedup_id`, `embeddings`, and configured integer metadata. With `--keep-text`, it also retains the exact text sent to the embedder. Source-specific IDs and other payload columns are intentionally excluded.
 
-Build the private smoke manifest from the inventory manifest. It selects the smallest files and writes explicit shard assignments: 16 files from the first family, 16 from the second, and an 8+8 mixed shard.
+Build a private smoke manifest from the full runtime manifest. It preserves the absolute paths and ID ranges while selecting the smallest files and writing explicit shard assignments: 16 files from the first family, 16 from the second, and an 8+8 mixed shard.
 
 ```bash
 python -m benchmarking.embedding_generation.prepare_smoke_manifest \
-  --input-manifest=/path/to/inventory-manifest.json \
+  --input-manifest=/path/to/manifest.jsonl \
   --metadata-mapping=/path/to/metadata_mapping.json \
   --output-manifest=/path/to/smoke-manifest.jsonl \
   --first-family-id=0 --second-family-id=1 --files-per-shard=16 \
@@ -30,15 +34,17 @@ Smoke test three logical shards. The smoke YAML enables `--keep-text`, so output
 The launcher requests all four GPUs and uses `--exclusive`, guaranteeing one array task per node. Keep those settings together: an exclusive job must use every GPU on its allocated node. A launcher that intentionally requests only one GPU must omit `--exclusive` and first verify on a small run that Slurm correctly coallocates it on a shared node.
 
 ```bash
-export ARRAY_RUNTIME_ROOT=/path/to/runtime
-export ARRAY_LOG_DIR=/path/to/logs
+export SESSION_NAME=embedding-slurm-array-smoke-test-20260717
+export USER_RUN_ROOT=/path/to/user/root
+export ARRAY_RUNTIME_ROOT="$USER_RUN_ROOT/embedding-generation/$SESSION_NAME/runtime"
+export ARRAY_LOG_DIR="$USER_RUN_ROOT/logs/$SESSION_NAME"
 mkdir -p "$ARRAY_RUNTIME_ROOT" "$ARRAY_LOG_DIR"
-TOTAL_SHARDS=3 sbatch --array=0-2 \
+TOTAL_SHARDS=3 sbatch --account=nemotron_n4_pre --partition=batch --qos=normal --array=0-2 \
   --output="$ARRAY_LOG_DIR/%A_%a.out" --error="$ARRAY_LOG_DIR/%A_%a.err" \
   benchmarking/embedding_generation/submit_embedding_try.sbatch
 ```
 
-For production, use the full manifest, set new output/checkpoint paths, then use `TOTAL_SHARDS=348` and `--array=0-347`. `--require-min-files-per-shard=16` only validates that fixed partition; it does not choose `S`.
+For production, use the full manifest and matching ID registry, then set new output/checkpoint paths. With `TOTAL_SHARDS=350` and `--array=0-349`, the 9,887,000,445 rows produce shards between 28,065,145 and 28,452,317 rows. `--require-min-files-per-shard=16` only validates that fixed partition; it does not choose `S`.
 
 Retry only unfinished shards, reusing the same checkpoint path:
 

@@ -17,6 +17,7 @@ from loguru import logger
 from nemo_curator.backends.slurm_array import SlurmArrayConfig, resolve_slurm_array_config
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.base import ProcessingStage
+from nemo_curator.stages.deduplication.id_generator import IdGeneratorBase
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import EmptyTask, FileGroupTask
 from nemo_curator.utils.hash_utils import get_deterministic_hash
@@ -144,13 +145,10 @@ def plan_manifest_shards(manifest_path: str | Path, target_rows_per_shard: int) 
 
 
 def _validate_enriched_fields(record: dict[str, Any], line_number: int) -> None:
-    required = {"dedup_path", "id_start", "id_end"}
+    required = {"id_start", "id_end"}
     missing = sorted(required - record.keys())
     if missing:
         msg = f"Enriched manifest line {line_number} is missing required fields: {missing}"
-        raise ValueError(msg)
-    if not isinstance(record["dedup_path"], str) or not Path(record["dedup_path"]).is_absolute():
-        msg = f"Enriched manifest line {line_number} dedup_path must be an absolute string"
         raise ValueError(msg)
     for field in ("id_start", "id_end"):
         if isinstance(record[field], bool) or not isinstance(record[field], int):
@@ -163,15 +161,6 @@ def _validate_enriched_fields(record: dict[str, Any], line_number: int) -> None:
             f"[{record['id_start']}, {record['id_end']}], expected end {expected_end}"
         )
         raise ValueError(msg)
-
-
-def _dedup_path_for_logical_path(logical_path: str, path_mapping: dict[str, str]) -> str | None:
-    mappings = sorted(path_mapping.items(), key=lambda item: len(item[1]), reverse=True)
-    for dedup_prefix, registry_prefix in mappings:
-        normalized_prefix = registry_prefix.rstrip("/")
-        if logical_path == normalized_prefix or logical_path.startswith(f"{normalized_prefix}/"):
-            return f"{dedup_prefix.rstrip('/')}{logical_path[len(normalized_prefix) :]}"
-    return None
 
 
 def _uses_explicit_shards(records: list[dict[str, Any]]) -> bool:
@@ -216,7 +205,7 @@ class ManifestFilePartitioningStage(ProcessingStage[EmptyTask, ManifestFileGroup
     """Emit FPP=1 tasks for the active row-balanced Slurm array shard."""
 
     manifest_path: str
-    path_mapping: dict[str, str]
+    id_generator_path: str
     required_minimum_files_per_shard: int = 1
     manifest_max_rows: int | None = None
     name: str = "manifest_file_partitioning"
@@ -252,17 +241,22 @@ class ManifestFilePartitioningStage(ProcessingStage[EmptyTask, ManifestFileGroup
 
         selected_records: list[dict[str, Any]] = []
         total_rows = 0
+        id_generator = IdGeneratorBase.from_disk(self.id_generator_path)
 
         for line_number, record in _iter_manifest_records(self.manifest_path):
             _validate_manifest_record(record, line_number, line_number - 1)
             if Path(record["path"]).suffix != ".jsonl":
                 continue
-            logical_path = record["logical_path"]
-            dedup_path = record.get("dedup_path") or _dedup_path_for_logical_path(logical_path, self.path_mapping)
-            if not isinstance(dedup_path, str):
-                msg = f"Manifest index {record['index']} is not covered by the ID path mapping"
-                raise TypeError(msg)
-            selected_records.append({**record, "dedup_path": dedup_path})
+            _validate_enriched_fields(record, line_number)
+            registry_range = id_generator.batch_registry.get(id_generator.hash_files(record["path"]))
+            expected_range = (record["id_start"], record["id_end"])
+            if registry_range is None or tuple(registry_range) != expected_range:
+                msg = (
+                    f"Manifest index {record['index']} path/range is absent or different in the ID registry: "
+                    f"path={record['path']!r}, manifest_range={expected_range}, registry_range={registry_range}"
+                )
+                raise ValueError(msg)
+            selected_records.append(record)
             total_rows += record["num_rows"]
             if self.manifest_max_rows is not None and total_rows >= self.manifest_max_rows:
                 break
@@ -289,19 +283,18 @@ class ManifestFilePartitioningStage(ProcessingStage[EmptyTask, ManifestFileGroup
 
             if shard_index == slurm_array.shard_index:
                 logical_path = record["logical_path"]
-                dedup_path = record["dedup_path"]
+                source_path = record["path"]
                 tasks.append(
                     ManifestFileGroupTask(
                         dataset_name="fuzzy_deduped_data",
-                        data=[dedup_path],
+                        data=[source_path],
                         logical_path=logical_path,
                         reader_config={},
                         _metadata={
                             "manifest_index": record["index"],
                             "manifest_num_rows": record["num_rows"],
                             "logical_path": logical_path,
-                            "source_files": [dedup_path],
-                            "inventory_source_file": record["path"],
+                            "source_files": [source_path],
                             "source_root": record.get("source_root"),
                             "mapping_names": record.get("mapping_names", []),
                         },

@@ -21,11 +21,10 @@ entries:
     args: >-
       --benchmark-results-path={session_entry_dir}
       --manifest-path={manifest_path}
-      --path-mapping-json={path_mapping_path}
       --metadata-mapping-json={metadata_mapping_path}
       --id-generator-path={id_generator_path}
       --source-root={dedup_source_root}
-      --output-path={embeddings_root}/embedding-try
+      --output-path={embeddings_root}
       --checkpoint-dir={checkpoint_dir}
       --require-min-files-per-shard=16
       --keep-text

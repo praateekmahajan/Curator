@@ -10,6 +10,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CURATOR_DIR="${CURATOR_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 : "${ARRAY_RUNTIME_ROOT:?Set ARRAY_RUNTIME_ROOT to a protected shared directory}"
+export SESSION_NAME="${SESSION_NAME:-embedding-try}"
 export RUNTIME_ROOT="${ARRAY_RUNTIME_ROOT}/${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
 SHORT_RUNTIME="/tmp/et_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
 

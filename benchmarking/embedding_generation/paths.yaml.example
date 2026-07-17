@@ -1,20 +1,18 @@
 paths:
   - name: manifest_path
-    host_path: /path/to/manifest.json
-  - name: path_mapping_path
-    host_path: /path/to/dataset_path_mapping.json
+    host_path: /path/to/manifest.jsonl
   - name: metadata_mapping_path
     host_path: /path/to/metadata_mapping.json
   - name: dedup_source_root
     host_path: /path/to/fuzzy-deduped-data
   - name: id_generator_path
-    host_path: /path/to/fuzzy_id_generator.json
+    host_path: /path/to/id_generator.json
   - name: model_weights_path
     host_path: /path/to/huggingface/cache
   - name: embeddings_root
-    host_path: /path/to/embeddings
+    host_path: /path/to/results/${SESSION_NAME}
   # TODO: use a new shared directory for each logical run; retries reuse it.
   - name: checkpoint_dir
-    host_path: /path/to/checkpoints/embedding-try
+    host_path: /path/to/embedding-generation/${SESSION_NAME}/checkpoints
   - name: results_path
-    host_path: /path/to/benchmarking-results
+    host_path: /path/to/benchmarking

@@ -11,78 +11,11 @@ import pytest
 
 import benchmarking.embedding_generation.manifest as manifest_module
 from benchmarking.embedding_generation.manifest import ManifestFilePartitioningStage
-from benchmarking.embedding_generation.prepare_manifest import prepare_manifest
 from benchmarking.embedding_generation.prepare_smoke_manifest import prepare_smoke_manifest
 from benchmarking.embedding_generation.writer import MirroredParquetWriter
 from nemo_curator.backends.slurm_array import SlurmArrayConfig
 from nemo_curator.stages.deduplication.id_generator import CURATOR_DEDUP_ID_STR
 from nemo_curator.tasks import DocumentBatch, EmptyTask
-
-
-def _write_input_manifest(path: Path) -> None:
-    records = [
-        {
-            "index": 0,
-            "path": "/inventory/a.jsonl",
-            "logical_path": "/logical/a.jsonl",
-            "num_rows": 2,
-            "mapping_names": ["source_a"],
-            "error": None,
-        },
-        {
-            "index": 1,
-            "path": "/inventory/b.jsonl",
-            "logical_path": "/logical/nested/b.jsonl",
-            "num_rows": 3,
-            "mapping_names": ["source_b"],
-            "error": None,
-        },
-    ]
-    path.write_text("".join(json.dumps(record) + "\n" for record in records))
-
-
-def test_prepare_manifest_writes_ranges_and_reverse_lookup(tmp_path: Path) -> None:
-    input_manifest = tmp_path / "input.jsonl"
-    path_mapping = tmp_path / "mapping.json"
-    output_manifest = tmp_path / "runtime.jsonl"
-    output_registry = tmp_path / "id_generator.json"
-    _write_input_manifest(input_manifest)
-    path_mapping.write_text(
-        json.dumps(
-            [
-                {
-                    "dedup_path": "/dedup",
-                    "container_mounted_dedup_source_path": "/logical",
-                }
-            ]
-        )
-    )
-
-    summary = prepare_manifest(
-        input_manifest=input_manifest,
-        path_mapping=path_mapping,
-        output_manifest=output_manifest,
-        output_id_registry=output_registry,
-        start_id=100,
-    )
-
-    records = [json.loads(line) for line in output_manifest.read_text().splitlines()]
-    assert [(record["id_start"], record["id_end"]) for record in records] == [(100, 101), (102, 104)]
-    assert [record["dedup_path"] for record in records] == ["/dedup/a.jsonl", "/dedup/nested/b.jsonl"]
-    assert summary == {"num_files": 2, "num_rows": 5, "start_id": 100, "next_id": 105}
-
-    registry = json.loads(output_registry.read_text())
-    first_key = str(uuid.uuid5(uuid.NAMESPACE_URL, "/dedup/a.jsonl"))
-    assert registry["next_id"] == 105
-    assert registry["batch_registry"][first_key] == [100, 101]
-    assert registry["id_lookup"][0] == {
-        "key": first_key,
-        "manifest_index": 0,
-        "path": "/dedup/a.jsonl",
-        "id_start": 100,
-        "id_end": 101,
-        "num_rows": 2,
-    }
 
 
 def test_writer_emits_only_generated_fields(tmp_path: Path) -> None:
@@ -128,7 +61,6 @@ def test_prepare_smoke_manifest_and_explicit_shards(tmp_path: Path, monkeypatch:
                 "index": index,
                 "path": f"/inventory/{index}.jsonl",
                 "logical_path": f"/logical/{index}.jsonl",
-                "dedup_path": f"/dedup/{index}.jsonl",
                 "num_rows": index + 1,
                 "id_start": index * 10,
                 "id_end": index * 10 + index,
@@ -137,6 +69,18 @@ def test_prepare_smoke_manifest_and_explicit_shards(tmp_path: Path, monkeypatch:
             }
         )
     input_manifest.write_text("".join(json.dumps(record) + "\n" for record in records))
+    id_generator = tmp_path / "id_generator.json"
+    id_generator.write_text(
+        json.dumps(
+            {
+                "next_id": 60,
+                "batch_registry": {
+                    str(uuid.uuid5(uuid.NAMESPACE_URL, record["path"])): [record["id_start"], record["id_end"]]
+                    for record in records
+                },
+            }
+        )
+    )
     metadata_mapping.write_text(
         json.dumps(
             {
@@ -176,7 +120,7 @@ def test_prepare_smoke_manifest_and_explicit_shards(tmp_path: Path, monkeypatch:
         )
         tasks = ManifestFilePartitioningStage(
             manifest_path=str(output_manifest),
-            path_mapping={"/dedup": "/logical"},
+            id_generator_path=str(id_generator),
             required_minimum_files_per_shard=2,
         ).process(EmptyTask())
         selected_families.append(

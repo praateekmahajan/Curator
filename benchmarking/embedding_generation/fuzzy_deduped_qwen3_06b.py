@@ -40,37 +40,6 @@ from nemo_curator.stages.text.modules import MetadataExtractor
 from nemo_curator.tasks.utils import TaskPerfUtils
 
 
-def load_id_path_mapping(path: str | Path) -> dict[str, str]:
-    """Load dedup-runtime to ID-registry path-prefix mappings."""
-    payload = json.loads(Path(path).read_text())
-    if not isinstance(payload, list):
-        msg = f"Path mapping must contain a JSON list: {path}"
-        raise TypeError(msg)
-
-    result: dict[str, str] = {}
-    for index, record in enumerate(payload):
-        if not isinstance(record, dict):
-            msg = f"Path mapping record {index} must be a JSON object"
-            raise TypeError(msg)
-        runtime_prefix = record.get("dedup_path")
-        registry_prefix = record.get("container_mounted_dedup_source_path")
-        if not isinstance(runtime_prefix, str) or not isinstance(registry_prefix, str):
-            msg = (
-                f"Path mapping record {index} must contain string dedup_path and "
-                "container_mounted_dedup_source_path fields"
-            )
-            raise TypeError(msg)
-        if runtime_prefix in result and result[runtime_prefix] != registry_prefix:
-            msg = f"Conflicting mappings for dedup path {runtime_prefix}"
-            raise ValueError(msg)
-        result[runtime_prefix.rstrip("/")] = registry_prefix.rstrip("/")
-
-    if not result:
-        msg = f"Path mapping contains no records: {path}"
-        raise ValueError(msg)
-    return result
-
-
 def load_metadata_extractor(path: str | Path) -> MetadataExtractor:
     """Load file-level integer metadata without embedding policy data in code."""
     payload = json.loads(Path(path).read_text())
@@ -106,7 +75,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     output_path.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    id_path_mapping = load_id_path_mapping(args.path_mapping_json)
     metadata_extractor = load_metadata_extractor(args.metadata_mapping_json)
     variation = EmbeddingModelVariation(args.model_variation)
     max_seq_length = _resolve_max_seq_length(args.model_identifier, cache_dir=args.cache_dir)
@@ -151,7 +119,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         stages=[
             ManifestFilePartitioningStage(
                 manifest_path=args.manifest_path,
-                path_mapping=id_path_mapping,
+                id_generator_path=args.id_generator_path,
                 required_minimum_files_per_shard=args.require_min_files_per_shard,
                 manifest_max_rows=args.manifest_max_rows,
             ),
@@ -165,10 +133,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     logger.info("Manifest: {}", args.manifest_path)
     logger.info("Output root: {}", output_path)
     logger.info("Checkpoint root: {}", checkpoint_dir)
-    logger.info("ID path mappings: {}", len(id_path_mapping))
+    logger.info("ID generator: {}", args.id_generator_path)
 
     started = time.perf_counter()
-    create_id_generator_actor(args.id_generator_path, path_mapping=id_path_mapping)
+    create_id_generator_actor(args.id_generator_path)
     try:
         output_tasks = (
             pipeline.run(
@@ -208,7 +176,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Manifest-sharded fuzzy-deduped embedding generation")
     parser.add_argument("--benchmark-results-path", required=True)
     parser.add_argument("--manifest-path", required=True)
-    parser.add_argument("--path-mapping-json", required=True)
     parser.add_argument("--metadata-mapping-json", required=True)
     parser.add_argument("--id-generator-path", required=True)
     parser.add_argument("--source-root", required=True)
