@@ -86,6 +86,36 @@ class EmbeddingModelVariation(Enum):
     VLLM_TEXT_PRETOKENIZED = "vllm_text_pretokenized"
 
 
+def summarize_vllm_stage_metrics(
+    stage_metrics: dict[str, dict[str, Any]],
+    model_worker_gpus: float,
+) -> dict[str, float | int]:
+    """Derive comparable per-GPU throughput and sequence metrics for vLLM stages."""
+    gpu_stage_metrics = [values for stage_name, values in stage_metrics.items() if stage_name.endswith("_vllm")]
+    process_time_sum = sum(
+        float(values["process_time"].sum()) for values in gpu_stage_metrics if "process_time" in values
+    )
+    num_items_processed = sum(
+        int(values["num_items_processed"].sum()) for values in gpu_stage_metrics if "num_items_processed" in values
+    )
+    input_tokens = sum(
+        int(values["custom.input_tokens"].sum()) for values in gpu_stage_metrics if "custom.input_tokens" in values
+    )
+    models_per_gpu = 1.0 / model_worker_gpus if model_worker_gpus else 0.0
+    throughput_items = models_per_gpu * num_items_processed / process_time_sum if process_time_sum > 0 else 0.0
+    throughput_tokens = models_per_gpu * input_tokens / process_time_sum if process_time_sum > 0 else 0.0
+    sequence_length_mean = input_tokens / num_items_processed if num_items_processed > 0 else 0.0
+    return {
+        "gpu_stage_process_time_sum_s": process_time_sum,
+        "gpu_stage_num_items_processed": num_items_processed,
+        "gpu_stage_input_tokens": input_tokens,
+        "input_sequence_length_mean": sequence_length_mean,
+        "models_per_gpu": models_per_gpu,
+        "throughput_items_per_gpu_second": throughput_items,
+        "throughput_input_tokens_per_gpu_second": throughput_tokens,
+    }
+
+
 def _resolve_max_seq_length(model_identifier: str, cache_dir: str | None = None) -> int:
     """Resolve max_seq_length from the sentence-transformers config.
 
@@ -393,28 +423,7 @@ def run_embedding_generation_benchmark(
     num_documents_processed = sum(task._stage_perf[-1].num_items_processed for task in output_tasks)
     throughput_docs_per_sec = num_documents_processed / run_time_taken if run_time_taken > 0 else 0
     stage_metrics = TaskPerfUtils.collect_stage_metrics(output_tasks)
-    gpu_stage_metrics = [values for stage_name, values in stage_metrics.items() if stage_name.endswith("_vllm")]
-    gpu_stage_process_time_sum = sum(
-        float(values["process_time"].sum()) for values in gpu_stage_metrics if "process_time" in values
-    )
-    gpu_stage_num_items_processed = sum(
-        int(values["num_items_processed"].sum()) for values in gpu_stage_metrics if "num_items_processed" in values
-    )
-    gpu_stage_input_tokens = sum(
-        int(values["custom.input_tokens"].sum()) for values in gpu_stage_metrics if "custom.input_tokens" in values
-    )
-    models_per_gpu = 1.0 / model_worker_gpus if model_worker_gpus else 0.0
-    throughput_items_per_gpu_second = (
-        models_per_gpu * gpu_stage_num_items_processed / gpu_stage_process_time_sum
-        if gpu_stage_process_time_sum > 0
-        else 0.0
-    )
-    throughput_input_tokens_per_gpu_second = (
-        models_per_gpu * gpu_stage_input_tokens / gpu_stage_process_time_sum if gpu_stage_process_time_sum > 0 else 0.0
-    )
-    input_sequence_length_mean = (
-        gpu_stage_input_tokens / gpu_stage_num_items_processed if gpu_stage_num_items_processed > 0 else 0.0
-    )
+    vllm_metrics = summarize_vllm_stage_metrics(stage_metrics, model_worker_gpus)
 
     logger.success(f"Benchmark completed in {run_time_taken:.2f}s")
     logger.success(f"Processed {num_documents_processed} documents")
@@ -438,12 +447,7 @@ def run_embedding_generation_benchmark(
             "time_taken_s": run_time_taken,
             "num_documents_processed": num_documents_processed,
             "throughput_docs_per_sec": throughput_docs_per_sec,
-            "gpu_stage_process_time_sum_s": gpu_stage_process_time_sum,
-            "gpu_stage_num_items_processed": gpu_stage_num_items_processed,
-            "input_sequence_length_mean": input_sequence_length_mean,
-            "models_per_gpu": models_per_gpu,
-            "throughput_items_per_gpu_second": throughput_items_per_gpu_second,
-            "throughput_input_tokens_per_gpu_second": throughput_input_tokens_per_gpu_second,
+            **vllm_metrics,
         },
         "tasks": output_tasks,
     }

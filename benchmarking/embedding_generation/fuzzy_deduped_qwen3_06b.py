@@ -25,6 +25,7 @@ from benchmarking.scripts.embedding_generation_benchmark import (
     EmbeddingModelVariation,
     _create_embedding_stages,
     _resolve_max_seq_length,
+    summarize_vllm_stage_metrics,
 )
 from benchmarking.scripts.utils import setup_executor, write_benchmark_results
 from nemo_curator.backends.utils import RayStageSpecKeys
@@ -182,6 +183,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     num_documents = sum(task._stage_perf[-1].num_items_processed for task in output_tasks if task._stage_perf)
     stage_metrics = TaskPerfUtils.collect_stage_metrics(output_tasks)
+    vllm_metrics = summarize_vllm_stage_metrics(stage_metrics, args.model_worker_gpus)
     return {
         "params": {
             **vars(args),
@@ -196,6 +198,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "throughput_docs_per_sec": num_documents / elapsed if elapsed else 0.0,
             "num_output_files": len(output_tasks),
             "stage_names": sorted(stage_metrics),
+            **vllm_metrics,
         },
         "tasks": output_tasks,
     }
