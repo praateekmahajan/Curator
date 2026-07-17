@@ -52,6 +52,66 @@ def _take_smallest(records: list[dict[str, Any]], count: int) -> list[dict[str, 
     return sorted(records, key=lambda record: (record["num_rows"], record["index"]))[:count]
 
 
+def _take_until_target_rows(
+    records: list[dict[str, Any]],
+    target_rows: int,
+    minimum_files: int,
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    selected_rows = 0
+    for record in records:
+        selected.append(record)
+        selected_rows += record["num_rows"]
+        if len(selected) >= minimum_files and selected_rows >= target_rows:
+            return selected
+    msg = (
+        f"Could not select at least {minimum_files} files and {target_rows} rows; "
+        f"only {len(selected)} files and {selected_rows} rows are available"
+    )
+    raise ValueError(msg)
+
+
+def _select_shard_records(
+    by_family: dict[int, list[dict[str, Any]]],
+    first_family_id: int,
+    second_family_id: int,
+    files_per_shard: int,
+    target_rows_per_shard: int | None,
+) -> dict[int, list[dict[str, Any]]]:
+    mixed_per_family = files_per_shard // 2
+    if target_rows_per_shard is None:
+        required_per_family = files_per_shard + mixed_per_family
+        selected_by_family = {
+            family_id: _take_smallest(records, required_per_family) for family_id, records in by_family.items()
+        }
+        return {
+            0: selected_by_family[first_family_id][:files_per_shard],
+            1: selected_by_family[second_family_id][:files_per_shard],
+            2: [
+                *selected_by_family[first_family_id][files_per_shard:],
+                *selected_by_family[second_family_id][files_per_shard:],
+            ],
+        }
+
+    ordered_by_family = {
+        family_id: sorted(records, key=lambda record: record["index"]) for family_id, records in by_family.items()
+    }
+    pure_first = _take_until_target_rows(ordered_by_family[first_family_id], target_rows_per_shard, files_per_shard)
+    pure_second = _take_until_target_rows(ordered_by_family[second_family_id], target_rows_per_shard, files_per_shard)
+    mixed_target_per_family = (target_rows_per_shard + 1) // 2
+    mixed_first = _take_until_target_rows(
+        ordered_by_family[first_family_id][len(pure_first) :], mixed_target_per_family, mixed_per_family
+    )
+    mixed_second = _take_until_target_rows(
+        ordered_by_family[second_family_id][len(pure_second) :], mixed_target_per_family, mixed_per_family
+    )
+    return {
+        0: pure_first,
+        1: pure_second,
+        2: [*mixed_first, *mixed_second],
+    }
+
+
 def prepare_smoke_manifest(  # noqa: PLR0913
     input_manifest: str | Path,
     metadata_mapping: str | Path,
@@ -60,6 +120,7 @@ def prepare_smoke_manifest(  # noqa: PLR0913
     second_family_id: int,
     files_per_shard: int = 16,
     family_field: str = "source_family_id",
+    target_rows_per_shard: int | None = None,
 ) -> dict[str, Any]:
     """Build three explicit shards: first-family, second-family, and mixed."""
     if files_per_shard <= 0 or files_per_shard % 2:
@@ -67,6 +128,9 @@ def prepare_smoke_manifest(  # noqa: PLR0913
         raise ValueError(msg)
     if first_family_id == second_family_id:
         msg = "first_family_id and second_family_id must differ"
+        raise ValueError(msg)
+    if target_rows_per_shard is not None and target_rows_per_shard <= 0:
+        msg = "target_rows_per_shard must be positive"
         raise ValueError(msg)
 
     output_manifest = Path(output_manifest)
@@ -83,19 +147,13 @@ def prepare_smoke_manifest(  # noqa: PLR0913
         if family_id in by_family:
             by_family[family_id].append(record)
 
-    mixed_per_family = files_per_shard // 2
-    required_per_family = files_per_shard + mixed_per_family
-    selected_by_family = {
-        family_id: _take_smallest(records, required_per_family) for family_id, records in by_family.items()
-    }
-    shard_records = {
-        0: selected_by_family[first_family_id][:files_per_shard],
-        1: selected_by_family[second_family_id][:files_per_shard],
-        2: [
-            *selected_by_family[first_family_id][files_per_shard:],
-            *selected_by_family[second_family_id][files_per_shard:],
-        ],
-    }
+    shard_records = _select_shard_records(
+        by_family,
+        first_family_id,
+        second_family_id,
+        files_per_shard,
+        target_rows_per_shard,
+    )
 
     summary: dict[str, Any] = {"total_files": 0, "total_rows": 0, "shards": {}}
     output_tmp = output_manifest.with_suffix(f"{output_manifest.suffix}.incomplete")
@@ -137,6 +195,7 @@ def main() -> int:
     parser.add_argument("--second-family-id", type=int, required=True)
     parser.add_argument("--files-per-shard", type=int, default=16)
     parser.add_argument("--family-field", default="source_family_id")
+    parser.add_argument("--target-rows-per-shard", type=int)
     args = parser.parse_args()
     summary = prepare_smoke_manifest(
         input_manifest=args.input_manifest,
@@ -146,6 +205,7 @@ def main() -> int:
         second_family_id=args.second_family_id,
         files_per_shard=args.files_per_shard,
         family_field=args.family_field,
+        target_rows_per_shard=args.target_rows_per_shard,
     )
     print(json.dumps(summary, sort_keys=True))
     return 0

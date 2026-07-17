@@ -17,8 +17,11 @@ python -m benchmarking.embedding_generation.prepare_smoke_manifest \
   --input-manifest=/path/to/inventory-manifest.json \
   --metadata-mapping=/path/to/metadata_mapping.json \
   --output-manifest=/path/to/smoke-manifest.jsonl \
-  --first-family-id=0 --second-family-id=1 --files-per-shard=16
+  --first-family-id=0 --second-family-id=1 --files-per-shard=16 \
+  --target-rows-per-shard=1632000
 ```
+
+At 680 rows/second/GPU on a four-GPU node, 1,632,000 rows is approximately ten minutes of embedding work per shard. The row target is applied in addition to the 16-file minimum. The mixed shard receives approximately half its rows from each family, and no file is reused across shards.
 
 Smoke test three logical shards. The smoke YAML enables `--keep-text`, so output contains the generated ID, text used by the embedder, embedding, and integer metadata.
 

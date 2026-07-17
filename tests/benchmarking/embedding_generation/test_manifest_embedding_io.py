@@ -186,6 +186,50 @@ def test_prepare_smoke_manifest_and_explicit_shards(tmp_path: Path, monkeypatch:
     assert selected_families == [[0, 0], [1, 1], [0, 1]]
 
 
+def test_prepare_smoke_manifest_selects_disjoint_row_targets(tmp_path: Path) -> None:
+    input_manifest = tmp_path / "runtime.jsonl"
+    metadata_mapping = tmp_path / "metadata.json"
+    output_manifest = tmp_path / "smoke.jsonl"
+    records = [
+        {
+            "index": index,
+            "path": f"/inventory/{index}.jsonl",
+            "logical_path": f"/logical/{index}.jsonl",
+            "num_rows": 40,
+            "mapping_names": [f"family_{index % 2}"],
+            "error": None,
+        }
+        for index in range(16)
+    ]
+    input_manifest.write_text("".join(json.dumps(record) + "\n" for record in records))
+    metadata_mapping.write_text(
+        json.dumps(
+            {
+                "metadata_mapping": {
+                    "family_0": {"source_family_id": 0},
+                    "family_1": {"source_family_id": 1},
+                }
+            }
+        )
+    )
+
+    summary = prepare_smoke_manifest(
+        input_manifest=input_manifest,
+        metadata_mapping=metadata_mapping,
+        output_manifest=output_manifest,
+        first_family_id=0,
+        second_family_id=1,
+        files_per_shard=2,
+        target_rows_per_shard=100,
+    )
+
+    assert summary["shards"]["0"]["num_rows"] >= 100
+    assert summary["shards"]["1"]["num_rows"] >= 100
+    assert summary["shards"]["2"]["num_rows"] >= 100
+    selected = [json.loads(line) for line in output_manifest.read_text().splitlines()]
+    assert len({record["inventory_index"] for record in selected}) == len(selected)
+
+
 def test_smoke_writer_can_retain_text(tmp_path: Path) -> None:
     source_root = tmp_path / "source"
     source_file = source_root / "input.jsonl"
