@@ -160,6 +160,7 @@ benchmark_results/
 
 # Local machine paths for large semantic-dedup benchmarks.
 /benchmarking/large_semdedup_paths.yaml
+/benchmarking/ray-256-embedding-benchmark.yaml
 
 # Agent related files
 AGENTS.md

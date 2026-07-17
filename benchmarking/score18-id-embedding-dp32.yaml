@@ -40,7 +40,7 @@ entries:
       --input-format=jsonl
       --load-dataset-ratio=0.01
       --id-generator-path={dataset:score18_id_generator,json}
-      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --id-path-mapping-json='{ "{score18_root}": "/score18-dataset" }'
       --metadata-field=adlr_id
       --reader-max-workers=4
       --model-identifier=Qwen/Qwen3-Embedding-0.6B
@@ -64,7 +64,7 @@ entries:
       --input-format=jsonl
       --load-dataset-ratio=0.01
       --id-generator-path={dataset:score18_id_generator,json}
-      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --id-path-mapping-json='{ "{score18_root}": "/score18-dataset" }'
       --metadata-field=adlr_id
       --reader-max-workers=4
       --model-identifier=Qwen/Qwen3-Embedding-0.6B
@@ -88,7 +88,7 @@ entries:
       --input-format=jsonl
       --load-dataset-ratio=0.01
       --id-generator-path={dataset:score18_id_generator,json}
-      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --id-path-mapping-json='{ "{score18_root}": "/score18-dataset" }'
       --metadata-field=adlr_id
       --reader-max-workers=4
       --model-identifier=Qwen/Qwen3-Embedding-0.6B
@@ -112,7 +112,7 @@ entries:
       --input-format=jsonl
       --load-dataset-ratio=0.01
       --id-generator-path={dataset:score18_id_generator,json}
-      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --id-path-mapping-json='{ "{score18_root}": "/score18-dataset" }'
       --metadata-field=adlr_id
       --reader-max-workers=4
       --model-identifier=microsoft/harrier-oss-v1-270m
@@ -135,7 +135,7 @@ entries:
       --input-format=jsonl
       --load-dataset-ratio=0.01
       --id-generator-path={dataset:score18_id_generator,json}
-      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --id-path-mapping-json='{ "{score18_root}": "/score18-dataset" }'
       --metadata-field=adlr_id
       --reader-max-workers=4
       --model-identifier=microsoft/harrier-oss-v1-270m
@@ -158,7 +158,7 @@ entries:
       --input-format=jsonl
       --load-dataset-ratio=0.01
       --id-generator-path={dataset:score18_id_generator,json}
-      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --id-path-mapping-json='{ "{score18_root}": "/score18-dataset" }'
       --metadata-field=adlr_id
       --reader-max-workers=4
       --model-identifier=Qwen/Qwen3-Embedding-0.6B
@@ -182,7 +182,7 @@ entries:
       --input-format=jsonl
       --load-dataset-ratio=0.01
       --id-generator-path={dataset:score18_id_generator,json}
-      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --id-path-mapping-json='{ "{score18_root}": "/score18-dataset" }'
       --metadata-field=adlr_id
       --reader-max-workers=4
       --model-identifier=microsoft/harrier-oss-v1-270m
@@ -204,7 +204,7 @@ entries:
       --input-format=jsonl
       --load-dataset-ratio=0.01
       --id-generator-path={dataset:score18_id_generator,json}
-      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --id-path-mapping-json='{ "{score18_root}": "/score18-dataset" }'
       --metadata-field=adlr_id
       --reader-max-workers=4
       --model-identifier=Qwen/Qwen3-Embedding-0.6B
@@ -227,7 +227,7 @@ entries:
       --input-format=jsonl
       --load-dataset-ratio=0.01
       --id-generator-path={dataset:score18_id_generator,json}
-      --id-path-mapping-json='{ "{score18_root}": "/nemotron-v3-sharded" }'
+      --id-path-mapping-json='{ "{score18_root}": "/score18-dataset" }'
       --metadata-field=adlr_id
       --reader-max-workers=4
       --model-identifier=microsoft/harrier-oss-v1-270m
