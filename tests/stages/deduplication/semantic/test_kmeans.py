@@ -563,6 +563,7 @@ class TestKMeansReadFitWriteStage:
         normalized_embeddings = KMeansReadFitWriteStage.normalize_embeddings_col_in_df(df, "embedding")
 
         # Assert the normalized embeddings match the expected values
+        assert get_array_from_df(normalized_embeddings, "embedding").dtype == cp.float32
         cp.testing.assert_allclose(
             get_array_from_df(normalized_embeddings, "embedding"),
             expected_normalized,
