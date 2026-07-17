@@ -3,6 +3,8 @@ paths:
     host_path: /path/to/manifest.json
   - name: path_mapping_path
     host_path: /path/to/dataset_path_mapping.json
+  - name: metadata_mapping_path
+    host_path: /path/to/metadata_mapping.json
   - name: dedup_source_root
     host_path: /path/to/fuzzy-deduped-data
   - name: id_generator_path

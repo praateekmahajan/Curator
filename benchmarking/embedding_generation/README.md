@@ -1,6 +1,8 @@
 # Manifest embedding array
 
-Copy `paths.yaml.example` to ignored `paths.yaml`, fill in the paths, and set a protected runtime/log root.
+Copy `paths.yaml.example` to ignored `paths.yaml`, fill in the paths, and create a private metadata mapping using `metadata_mapping.json.example` as its schema. Keep the real mapping outside the repository and set `metadata_mapping_path` to it.
+
+`MetadataExtractor` resolves one `mapping_names` entry per input file and broadcasts its configured integer provenance/ranking values onto every row. Stable source IDs and mutable policy ranks remain in the private mapping, while the generic stage and example schema contain no dataset-specific policy. Pairwise ranking can sort `source_priority`, `quality_rank`, and `recency_rank` descending, followed by the dedup ID ascending.
 
 Smoke test two logical shards:
 

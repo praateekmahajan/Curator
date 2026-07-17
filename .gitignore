@@ -162,6 +162,7 @@ benchmark_results/
 /benchmarking/large_semdedup_paths.yaml
 /benchmarking/ray-256-embedding-benchmark.yaml
 /benchmarking/embedding_generation/paths.yaml
+/benchmarking/embedding_generation/metadata_mapping.json
 
 # Agent related files
 AGENTS.md

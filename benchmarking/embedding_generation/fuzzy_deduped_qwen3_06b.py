@@ -35,6 +35,7 @@ from nemo_curator.stages.deduplication.id_generator import (
     kill_id_generator_actor,
 )
 from nemo_curator.stages.text.io.reader import JsonlReaderStage
+from nemo_curator.stages.text.modules import MetadataExtractor
 from nemo_curator.tasks.utils import TaskPerfUtils
 
 
@@ -69,6 +70,30 @@ def load_id_path_mapping(path: str | Path) -> dict[str, str]:
     return result
 
 
+def load_metadata_extractor(path: str | Path) -> MetadataExtractor:
+    """Load file-level integer metadata without embedding policy data in code."""
+    payload = json.loads(Path(path).read_text())
+    if not isinstance(payload, dict):
+        msg = f"Metadata configuration must contain a JSON object: {path}"
+        raise TypeError(msg)
+
+    metadata_mapping = payload.get("metadata_mapping")
+    output_dtypes = payload.get("output_dtypes")
+    task_metadata_field = payload.get("task_metadata_field", "mapping_names")
+    if not isinstance(metadata_mapping, dict) or not isinstance(output_dtypes, dict):
+        msg = f"Metadata configuration must define metadata_mapping and output_dtypes objects: {path}"
+        raise TypeError(msg)
+    if not isinstance(task_metadata_field, str):
+        msg = f"Metadata configuration task_metadata_field must be a string: {path}"
+        raise TypeError(msg)
+
+    return MetadataExtractor(
+        metadata_mapping=metadata_mapping,
+        output_dtypes=output_dtypes,
+        task_metadata_field=task_metadata_field,
+    )
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     output_path = Path(args.output_path).absolute()
     checkpoint_dir = Path(args.checkpoint_dir).absolute()
@@ -76,6 +101,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     id_path_mapping = load_id_path_mapping(args.path_mapping_json)
+    metadata_extractor = load_metadata_extractor(args.metadata_mapping_json)
     variation = EmbeddingModelVariation(args.model_variation)
     max_seq_length = _resolve_max_seq_length(args.model_identifier, cache_dir=args.cache_dir)
 
@@ -119,6 +145,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 manifest_max_rows=args.manifest_max_rows,
             ),
             reader,
+            metadata_extractor,
             *embedding_stages,
             writer,
         ],
@@ -170,6 +197,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--benchmark-results-path", required=True)
     parser.add_argument("--manifest-path", required=True)
     parser.add_argument("--path-mapping-json", required=True)
+    parser.add_argument("--metadata-mapping-json", required=True)
     parser.add_argument("--id-generator-path", required=True)
     parser.add_argument("--source-root", required=True)
     parser.add_argument("--output-path", required=True)

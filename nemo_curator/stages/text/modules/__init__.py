@@ -14,10 +14,12 @@
 
 from .add_id import AddId
 from .joiner import DocumentJoiner
+from .metadata_extractor import MetadataExtractor
 from .splitter import DocumentSplitter
 
 __all__ = [
     "AddId",
     "DocumentJoiner",
     "DocumentSplitter",
+    "MetadataExtractor",
 ]
