@@ -30,9 +30,15 @@ CURATOR_ID_GENERATOR_ACTOR_NAME = "curator_deduplication_id_generator"
 class IdGeneratorBase:
     """Base IdGenerator class without Ray decorator for testing and direct use."""
 
-    def __init__(self, start_id: int = 0, batch_registry: dict[str, tuple[int, int]] | None = None):
+    def __init__(
+        self,
+        start_id: int = 0,
+        batch_registry: dict[str, tuple[int, int]] | None = None,
+        path_mapping: dict[str, str] | None = None,
+    ):
         self.next_id = start_id
         self.batch_registry = batch_registry or {}  # {batch_hash: (min_id, max_id)}
+        self.path_mapping = path_mapping or {}
 
     def register_batch(self, files: str | list[str], count: int) -> int:
         batch_hash = self.hash_files(files)
@@ -46,7 +52,17 @@ class IdGeneratorBase:
 
     def hash_files(self, filepath: str | list[str]) -> str:
         filepath = filepath if isinstance(filepath, list) else [filepath]
-        return str(uuid.uuid5(uuid.NAMESPACE_URL, ";".join(filepath)))
+        mapped_paths = [self._map_path(path) for path in filepath]
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, ";".join(mapped_paths)))
+
+    def _map_path(self, path: str) -> str:
+        """Map a runtime path to the logical path stored in the batch registry."""
+        mappings = sorted(self.path_mapping.items(), key=lambda item: len(item[0]), reverse=True)
+        for runtime_prefix, registry_prefix in mappings:
+            normalized_runtime_prefix = runtime_prefix.rstrip("/")
+            if path == normalized_runtime_prefix or path.startswith(f"{normalized_runtime_prefix}/"):
+                return f"{registry_prefix.rstrip('/')}{path[len(normalized_runtime_prefix) :]}"
+        return path
 
     def get_batch_range(self, files: str | list[str] | None, key: str | None) -> tuple[int, int]:
         if (files is None and key is None) or (files is not None and key is not None):
@@ -70,11 +86,16 @@ class IdGeneratorBase:
             )
 
     @classmethod
-    def from_disk(cls, filepath: str, storage_options: dict[str, Any] | None = None) -> "IdGeneratorBase":
+    def from_disk(
+        cls,
+        filepath: str,
+        storage_options: dict[str, Any] | None = None,
+        path_mapping: dict[str, str] | None = None,
+    ) -> "IdGeneratorBase":
         storage_options = storage_options or {}
         with fsspec.open(filepath, mode="r", **storage_options) as f:
             data = json.load(f)
-        return cls(start_id=data["next_id"], batch_registry=data["batch_registry"])
+        return cls(start_id=data["next_id"], batch_registry=data["batch_registry"], path_mapping=path_mapping)
 
 
 @ray.remote
@@ -94,13 +115,19 @@ def kill_id_generator_actor() -> None:
     ray.kill(get_id_generator_actor())
 
 
-def create_id_generator_actor(filepath: str | None = None, storage_options: dict[str, Any] | None = None) -> None:
+def create_id_generator_actor(
+    filepath: str | None = None,
+    storage_options: dict[str, Any] | None = None,
+    path_mapping: dict[str, str] | None = None,
+) -> None:
     """Create an id generator actor.
 
     Args:
         filepath (str): Path from where we want to load the id generator state json file.
             If None, a new actor is created.
         storage_options (dict[str, Any] | None): Storage options to pass to fsspec.open.
+        path_mapping (dict[str, str] | None): Runtime-to-registry path-prefix mapping.
+            The mapping applies only in memory and is not persisted in the state file.
     """
     register_loguru_serializer()  # TODO: instead of calling before each ray.init we can call it a packages __init__
     ray.init(ignore_reinit_error=True)
@@ -109,7 +136,7 @@ def create_id_generator_actor(filepath: str | None = None, storage_options: dict
         if filepath is None:
             actor_handle = IdGenerator.options(
                 name=CURATOR_ID_GENERATOR_ACTOR_NAME, namespace=CURATOR_ID_GENERATOR_ACTOR_NAME, lifetime="detached"
-            ).remote()
+            ).remote(path_mapping=path_mapping)
         else:
             # Create actor from saved state on disk
             # First load the data from disk
@@ -119,7 +146,7 @@ def create_id_generator_actor(filepath: str | None = None, storage_options: dict
             # Create actor with loaded data
             actor_handle = IdGenerator.options(
                 name=CURATOR_ID_GENERATOR_ACTOR_NAME, namespace=CURATOR_ID_GENERATOR_ACTOR_NAME, lifetime="detached"
-            ).remote(start_id=data["next_id"], batch_registry=data["batch_registry"])
+            ).remote(start_id=data["next_id"], batch_registry=data["batch_registry"], path_mapping=path_mapping)
         # Wait for the actor to be ready, so next call to get_id_generator_actor
         # will always work.
         ray.get(actor_handle.wait.remote())

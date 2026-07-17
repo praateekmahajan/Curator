@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from inspect import signature
 from typing import Any
 
 import pyarrow as pa
@@ -29,8 +30,6 @@ class ParquetWriter(BaseWriter):
 
     # Additional kwargs for pandas.DataFrame.to_parquet
     write_kwargs: dict[str, Any] = field(default_factory=dict)
-    optimize_embedding_storage: bool = True
-    embedding_fields: list[str] = field(default_factory=lambda: ["embeddings"])
     file_extension: str = "parquet"
     name: str = "parquet_writer"
 
@@ -61,64 +60,15 @@ class ParquetWriter(BaseWriter):
         if self.fields is not None:
             table = table.select(self.fields)
 
-        embedding_fields = [
-            field_name
-            for field_name in self.embedding_fields
-            if field_name in table.column_names
-            and (
-                pa.types.is_list(table.schema.field(field_name).type)
-                or pa.types.is_large_list(table.schema.field(field_name).type)
-            )
-            and pa.types.is_floating(table.schema.field(field_name).type.value_type)
-        ]
-        if not embedding_fields:
-            return False
-
         write_kwargs = self.write_kwargs.copy()
         engine = write_kwargs.pop("engine", None)
         index = write_kwargs.pop("index", None)
         if engine not in {None, "pyarrow"} or index is True:
             return False
 
-        arrow_write_options = {
-            "allow_truncated_timestamps",
-            "coerce_timestamps",
-            "column_encoding",
-            "compression",
-            "compression_level",
-            "data_page_size",
-            "data_page_version",
-            "dictionary_pagesize_limit",
-            "encryption_properties",
-            "filesystem",
-            "flavor",
-            "row_group_size",
-            "sorting_columns",
-            "store_decimal_as_integer",
-            "store_schema",
-            "use_byte_stream_split",
-            "use_compliant_nested_type",
-            "use_deprecated_int96_timestamps",
-            "use_dictionary",
-            "version",
-            "write_batch_size",
-            "write_page_checksum",
-            "write_page_index",
-            "write_statistics",
-        }
+        arrow_write_options = set(signature(pq.write_table).parameters) - {"table", "where"}
         if not set(write_kwargs).issubset(arrow_write_options):
             return False
-
-        storage_options = {"compression", "compression_level", "use_byte_stream_split", "use_dictionary"}
-        if self.optimize_embedding_storage and embedding_fields and not storage_options.intersection(write_kwargs):
-            write_kwargs.update(
-                {
-                    "compression": "zstd",
-                    "compression_level": 3,
-                    "use_byte_stream_split": [f"{field_name}.list.element" for field_name in embedding_fields],
-                    "use_dictionary": [name for name in table.column_names if name not in embedding_fields],
-                }
-            )
 
         pq.write_table(table, file_path, **write_kwargs)
         return True

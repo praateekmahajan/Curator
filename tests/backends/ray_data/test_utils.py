@@ -33,8 +33,9 @@ class TestGetAvailableCpuGpuResources:
         # Test with Ray resources from conftest.py
         cpus, gpus = get_available_cpu_gpu_resources()
         assert cpus == 11
-        # GPU count depends on the resources assigned to the test step.
-        assert 0.0 <= gpus <= 2.0
+        # GPU count depends on whether GPU tests are running in this session
+        # Can be 0 (CPU-only) or 2 (GPU-enabled) depending on test selection
+        assert gpus in [0.0, 2.0]
 
     @pytest.mark.usefixtures("reset_head_node_cache")
     def test_get_resources_with_ignore_head_node(
@@ -75,14 +76,8 @@ class TestGetActorComputeStrategyForStage:
                     RayStageSpecKeys.MIN_WORKERS: 2,
                     RayStageSpecKeys.MAX_WORKERS: 8,
                     RayStageSpecKeys.INITIAL_WORKERS: 4,
-                    RayStageSpecKeys.MAX_TASKS_IN_FLIGHT_PER_ACTOR: 1,
                 },
-                ActorPoolStrategy(
-                    min_size=2,
-                    max_size=8,
-                    initial_size=4,
-                    max_tasks_in_flight_per_actor=1,
-                ),
+                ActorPoolStrategy(min_size=2, max_size=8, initial_size=4),
                 None,
             ),
             (
@@ -91,9 +86,8 @@ class TestGetActorComputeStrategyForStage:
                     RayStageSpecKeys.MIN_WORKERS: 1,
                     RayStageSpecKeys.MAX_WORKERS: 8,
                     RayStageSpecKeys.INITIAL_WORKERS: 2,
-                    RayStageSpecKeys.MAX_TASKS_IN_FLIGHT_PER_ACTOR: 1,
                 },
-                ActorPoolStrategy(size=3, max_tasks_in_flight_per_actor=1),
+                ActorPoolStrategy(size=3),
                 "uses num_workers=3",
             ),
         ],

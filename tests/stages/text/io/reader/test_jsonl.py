@@ -106,6 +106,15 @@ class TestJsonlReaderWithoutIdGenerator:
         first = stages[0]
         assert getattr(first, "storage_options", None) == {"anon": True}
 
+    def test_composite_reader_allows_caller_worker_limit(self) -> None:
+        """Callers can cap the decomposed reader through CompositeStage.with_."""
+        reader = JsonlReader(file_paths=[]).with_(
+            {"jsonl_reader": {"ray_stage_spec": {RayStageSpecKeys.MAX_WORKERS: 4}}}
+        )
+
+        reader_stage = reader.decompose_and_apply_with()[-1]
+        assert reader_stage.ray_stage_spec()[RayStageSpecKeys.MAX_WORKERS] == 4
+
     def test_reader_uses_storage_options_from_read_kwargs_when_task_has_none(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -129,40 +138,6 @@ class TestJsonlReaderWithoutIdGenerator:
 
 class TestJsonlReaderWithIdGenerator:
     """Test JSONL reader with ID generation."""
-
-    def test_id_generator_path_mapping(self) -> None:
-        stage = JsonlReaderStage(
-            id_generator_path_mapping={
-                "/physical/data": "/logical/data",
-                "/physical/data/specific": "/logical/specific",
-            }
-        )
-
-        assert stage._map_id_generator_paths("/physical/data/file.jsonl") == "/logical/data/file.jsonl"
-        assert stage._map_id_generator_paths(["/physical/data/specific/a.jsonl", "/unmapped/b.jsonl"]) == [
-            "/logical/specific/a.jsonl",
-            "/unmapped/b.jsonl",
-        ]
-        assert stage._map_id_generator_paths("/physical/dataset/file.jsonl") == "/physical/dataset/file.jsonl"
-
-    def test_composite_passes_id_generator_path_mapping(self) -> None:
-        mapping = {"/physical/data": "/logical/data"}
-        reader_stage = JsonlReader(
-            file_paths="/physical/data",
-            id_generator_path_mapping=mapping,
-        ).decompose()[-1]
-
-        assert reader_stage.id_generator_path_mapping == mapping
-
-    def test_composite_caps_reader_actor_autoscaling(self) -> None:
-        reader_stage = JsonlReader(
-            file_paths="/physical/data",
-            _assign_ids=True,
-            read_max_workers=4,
-        ).decompose()[-1]
-
-        assert reader_stage.num_workers() is None
-        assert reader_stage.ray_stage_spec()[RayStageSpecKeys.MAX_WORKERS] == 4
 
     @pytest.mark.usefixtures("ray_client_with_id_generator")
     def test_assign_ids_uses_prefix_of_reserved_range(self) -> None:

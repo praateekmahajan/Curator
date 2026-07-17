@@ -457,11 +457,12 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
     @staticmethod
     def normalize_embeddings_col_in_df(df: "cudf.DataFrame", embedding_col: str) -> "cudf.DataFrame":
         embeddings = get_array_from_df(df, embedding_col)
-        converted = embeddings.dtype != cp.float32
-        if converted:
+        # RAFT KMeans expects float32, while cached embeddings may be stored as float16.
+        needs_float32_conversion = embeddings.dtype != cp.float32
+        if needs_float32_conversion:
             embeddings = embeddings.astype(cp.float32)
         embeddings /= cp.linalg.norm(embeddings, axis=1, keepdims=True)
-        if converted:
+        if needs_float32_conversion:
             df[embedding_col] = create_list_series_from_1d_or_2d_ar(embeddings, index=df.index)
         return df
 

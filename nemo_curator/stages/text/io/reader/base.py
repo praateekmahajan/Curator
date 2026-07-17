@@ -42,7 +42,6 @@ class BaseReader(ProcessingStage[FileGroupTask, DocumentBatch]):
     name: str = ""
     _generate_ids: bool = False
     _assign_ids: bool = False
-    id_generator_path_mapping: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self._generate_ids and self._assign_ids:
@@ -114,33 +113,16 @@ class BaseReader(ProcessingStage[FileGroupTask, DocumentBatch]):
         raise NotImplementedError
 
     # ID helpers ----------------------------------------------------------------
-    def _map_id_generator_paths(self, filepath: str | list[str]) -> str | list[str]:
-        """Map physical read paths to the logical paths stored by the ID generator."""
-        is_list = isinstance(filepath, list)
-        paths = filepath if is_list else [filepath]
-        mappings = sorted(self.id_generator_path_mapping.items(), key=lambda item: len(item[0]), reverse=True)
-        mapped_paths = []
-        for path in paths:
-            mapped_path = path
-            for physical_prefix, logical_prefix in mappings:
-                normalized_physical_prefix = physical_prefix.rstrip("/")
-                if path == normalized_physical_prefix or path.startswith(f"{normalized_physical_prefix}/"):
-                    mapped_path = f"{logical_prefix.rstrip('/')}{path[len(normalized_physical_prefix) :]}"
-                    break
-            mapped_paths.append(mapped_path)
-        return mapped_paths if is_list else mapped_paths[0]
-
     def _assign_ids_func(self, filepath: str | list[str], df: pd.DataFrame) -> pd.DataFrame:
         from nemo_curator.stages.deduplication.id_generator import CURATOR_DEDUP_ID_STR
 
         if CURATOR_DEDUP_ID_STR not in df.columns:
-            id_filepath = self._map_id_generator_paths(filepath)
-            min_id, max_id = ray.get(self.id_generator.get_batch_range.remote(id_filepath, None))
+            min_id, max_id = ray.get(self.id_generator.get_batch_range.remote(filepath, None))
             num_rows = len(df)
             assigned_max_id = min_id + num_rows - 1
             if assigned_max_id > max_id:
                 msg = (
-                    f"Cannot assign {num_rows} IDs to {filepath}: mapped ID-generator batch {id_filepath} "
+                    f"Cannot assign {num_rows} IDs to {filepath}: ID-generator batch "
                     f"only reserves {max_id - min_id + 1} IDs in range [{min_id}, {max_id}]"
                 )
                 raise ValueError(msg)

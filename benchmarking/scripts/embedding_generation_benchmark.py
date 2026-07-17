@@ -63,7 +63,14 @@ _VLLM_WORKER_ENV_VARS = (
 
 
 def _vllm_worker_runtime_env() -> dict[str, str]:
-    """Propagate the CUDA JIT and persistent-cache setup into Ray actor processes."""
+    """Build the environment inherited by each Ray vLLM actor.
+
+    On both x86_64/amd64 and aarch64 CUDA 13 nodes, CUDA paths and cache
+    locations are copied verbatim from the benchmark launcher when present;
+    this helper does not invent architecture-specific paths. DeepGEMM is
+    disabled on both architectures because the aarch64 vLLM wheel may select
+    its warmup path even when that optional backend is unavailable.
+    """
     env_vars = {
         "VLLM_USE_DEEP_GEMM": "0",
         "VLLM_MOE_USE_DEEP_GEMM": "0",
@@ -127,15 +134,12 @@ def _create_embedding_stages(
     model_inference_batch_size: int,
     model_num_workers: int | None,
     model_worker_gpus: float | None,
-    model_max_tasks_in_flight_per_actor: int | None,
-    model_max_restarts: int | None,
     model_gpu_memory_utilization: float | None,
     model_kv_cache_memory_bytes: int | None,
     max_seq_length: int,
     embedding_pooling: str,
-    max_chars: int | None = None,
     cache_dir: str | None = None,
-    retained_fields: list[str] | None = None,
+    metadata_fields: list[str] | None = None,
 ) -> list:
     """Create the embedding stage(s) for the given model variation."""
     if model_variation in {EmbeddingModelVariation.SENTENCE_TRANSFORMER, EmbeddingModelVariation.PYTORCH_MODEL}:
@@ -185,9 +189,8 @@ def _create_embedding_stages(
             embedding_field="embeddings",
             pretokenize=model_variation == EmbeddingModelVariation.VLLM_TEXT_PRETOKENIZED,
             vllm_init_kwargs=vllm_init_kwargs,
-            retained_fields=retained_fields,
+            metadata_fields=metadata_fields,
             model_inference_batch_size=model_inference_batch_size,
-            max_chars=max_chars,
             cache_dir=cache_dir,
         )
         stage_overrides: dict[str, Any] = {}
@@ -199,16 +202,12 @@ def _create_embedding_stages(
             stage_overrides["resources"] = Resources(cpus=1.0, gpus=model_worker_gpus)
         if model_num_workers is not None:
             stage_overrides["num_workers"] = model_num_workers
-        ray_stage_spec: dict[RayStageSpecKeys, Any] = {}
-        if model_max_tasks_in_flight_per_actor is not None:
-            ray_stage_spec[RayStageSpecKeys.MAX_TASKS_IN_FLIGHT_PER_ACTOR] = model_max_tasks_in_flight_per_actor
-        if model_max_restarts is not None:
-            ray_stage_spec[RayStageSpecKeys.RAY_REMOTE_ARGS] = {
-                "max_restarts": model_max_restarts,
-                "max_task_retries": model_max_restarts,
+        stage_overrides["ray_stage_spec"] = {
+            RayStageSpecKeys.RAY_REMOTE_ARGS: {
+                "max_restarts": 1,
+                "max_task_retries": 1,
             }
-        if ray_stage_spec:
-            stage_overrides["ray_stage_spec"] = ray_stage_spec
+        }
         if stage_overrides:
             stage = stage.with_(**stage_overrides)
         return [stage]
@@ -223,7 +222,6 @@ def run_embedding_generation_benchmark(
     executor: str,
     dataset_size_gb: float | None,
     load_dataset_ratio: float | None,
-    max_input_files: int | None,
     id_generator_path: str | None,
     id_path_mapping_json: str | None,
     metadata_fields: list[str] | None,
@@ -232,14 +230,11 @@ def run_embedding_generation_benchmark(
     model_inference_batch_size: int,
     model_num_workers: int | None,
     model_worker_gpus: float | None,
-    model_max_tasks_in_flight_per_actor: int | None,
-    model_max_restarts: int | None,
     model_gpu_memory_utilization: float | None,
     model_kv_cache_memory_bytes: int | None,
     model_variation: str,
     embedding_pooling: str,
     input_format: str = "parquet",
-    max_chars: int | None = None,
     cache_dir: str | None = None,
     **kwargs: Any,  # noqa: ANN401, ARG001
 ) -> dict[str, Any]:
@@ -255,7 +250,6 @@ def run_embedding_generation_benchmark(
     logger.info(f"Output path: {output_path}")
     logger.info(f"Dataset size: {dataset_size_gb} GB")
     logger.info(f"Load dataset ratio: {load_dataset_ratio}")
-    logger.info(f"Maximum input files: {max_input_files}")
     logger.info(f"ID generator: {id_generator_path}")
     id_path_mapping = json.loads(id_path_mapping_json) if id_path_mapping_json else {}
     if not isinstance(id_path_mapping, dict) or not all(
@@ -272,13 +266,10 @@ def run_embedding_generation_benchmark(
     logger.info(f"Model inference batch size: {model_inference_batch_size}")
     logger.info(f"Model workers: {model_num_workers}")
     logger.info(f"Model worker GPUs: {model_worker_gpus}")
-    logger.info(f"Model tasks in flight per actor: {model_max_tasks_in_flight_per_actor}")
-    logger.info(f"Model maximum restarts: {model_max_restarts}")
     logger.info(f"Model GPU memory utilization: {model_gpu_memory_utilization}")
     logger.info(f"Model KV cache memory bytes: {model_kv_cache_memory_bytes}")
     logger.info(f"Embedding pooling: {embedding_pooling}")
     logger.info(f"Input format: {input_format}")
-    logger.info(f"Max chars: {max_chars}")
     logger.info(f"Executor: {executor}")
 
     run_start_time = time.perf_counter()
@@ -287,20 +278,16 @@ def run_embedding_generation_benchmark(
     input_files = load_dataset_files(
         input_path,
         dataset_size_gb=dataset_size_gb,
-        dataset_ratio=1.0 if max_input_files is not None else load_dataset_ratio,
+        dataset_ratio=load_dataset_ratio,
         keep_extensions=keep_ext,
     )
-    if max_input_files is not None:
-        input_files = sorted(input_files)[:max_input_files]
     logger.info(f"Selected {len(input_files)} input files")
     if id_generator_path is not None:
-        id_generator = IdGeneratorBase.from_disk(id_generator_path)
-        validation_reader = JsonlReader(file_paths=[], id_generator_path_mapping=id_path_mapping)
-        id_input_files = validation_reader.decompose()[-1]._map_id_generator_paths(input_files)
+        id_generator = IdGeneratorBase.from_disk(id_generator_path, path_mapping=id_path_mapping)
         missing_files = [
             path
-            for path, id_path in zip(input_files, id_input_files, strict=True)
-            if id_generator.hash_files(id_path) not in id_generator.batch_registry
+            for path in input_files
+            if id_generator.hash_files(path) not in id_generator.batch_registry
         ]
         if missing_files:
             examples = "\n".join(missing_files[:5])
@@ -312,7 +299,7 @@ def run_embedding_generation_benchmark(
             raise ValueError(msg)
     executor_obj = setup_executor(executor)
 
-    retained_fields = (
+    embedding_metadata_fields = (
         [CURATOR_DEDUP_ID_STR, *metadata_fields]
         if input_format == "jsonl" and id_generator_path is not None
         else metadata_fields
@@ -323,15 +310,12 @@ def run_embedding_generation_benchmark(
         model_inference_batch_size=model_inference_batch_size,
         model_num_workers=model_num_workers,
         model_worker_gpus=model_worker_gpus,
-        model_max_tasks_in_flight_per_actor=model_max_tasks_in_flight_per_actor,
-        model_max_restarts=model_max_restarts,
         model_gpu_memory_utilization=model_gpu_memory_utilization,
         model_kv_cache_memory_bytes=model_kv_cache_memory_bytes,
         max_seq_length=max_seq_length,
         embedding_pooling=embedding_pooling,
-        max_chars=max_chars,
         cache_dir=cache_dir,
-        retained_fields=retained_fields,
+        metadata_fields=embedding_metadata_fields,
     )
 
     if input_format == "jsonl":
@@ -345,28 +329,40 @@ def run_embedding_generation_benchmark(
             files_per_partition=1,
             fields=["text", *metadata_fields],
             _assign_ids=id_generator_path is not None,
-            id_generator_path_mapping=id_path_mapping,
-            read_max_workers=reader_max_workers,
         )
-        writer = ParquetWriter(
-            path=str(output_path),
-            fields=output_fields,
-        )
+        if reader_max_workers is not None:
+            reader = reader.with_(
+                {
+                    "jsonl_reader": {
+                        "ray_stage_spec": {RayStageSpecKeys.MAX_WORKERS: reader_max_workers},
+                    }
+                }
+            )
     else:
+        output_fields = [*metadata_fields, "embeddings"]
         reader = ParquetReader(
             file_paths=input_files,
             files_per_partition=1,
             fields=["text", *metadata_fields],
             _generate_ids=False,
         )
-        writer = ParquetWriter(path=str(output_path), fields=[*metadata_fields, "embeddings"])
+    writer = ParquetWriter(
+        path=str(output_path),
+        fields=output_fields,
+        write_kwargs={
+            "compression": "zstd",
+            "compression_level": 3,
+            "use_byte_stream_split": ["embeddings.list.element"],
+            "use_dictionary": [field for field in output_fields if field != "embeddings"],
+        },
+    )
 
     pipeline = Pipeline(
         name="embedding_generation_pipeline",
         stages=[reader, *embedding_stages, writer],
     )
     if id_generator_path is not None:
-        create_id_generator_actor(id_generator_path)
+        create_id_generator_actor(id_generator_path, path_mapping=id_path_mapping)
     try:
         output_tasks = pipeline.run(executor_obj)
     finally:
@@ -402,18 +398,14 @@ def run_embedding_generation_benchmark(
         "params": {
             "max_seq_length": max_seq_length,
             "load_dataset_ratio": load_dataset_ratio,
-            "max_input_files": max_input_files,
             "id_generator_path": id_generator_path,
             "id_path_mapping": id_path_mapping,
             "metadata_fields": metadata_fields,
             "reader_max_workers": reader_max_workers,
             "model_num_workers": model_num_workers,
             "model_worker_gpus": model_worker_gpus,
-            "model_max_tasks_in_flight_per_actor": model_max_tasks_in_flight_per_actor,
-            "model_max_restarts": model_max_restarts,
             "model_gpu_memory_utilization": model_gpu_memory_utilization,
             "model_kv_cache_memory_bytes": model_kv_cache_memory_bytes,
-            "max_chars": max_chars,
         },
         "metrics": {
             "is_success": True,
@@ -440,7 +432,6 @@ def main() -> int:
     size_group.add_argument(
         "--load-dataset-ratio", type=float, default=None, help="Fraction of input files to process"
     )
-    size_group.add_argument("--max-input-files", type=int, default=None, help="Exact maximum number of input files")
     parser.add_argument(
         "--id-generator-path",
         default=None,
@@ -469,21 +460,14 @@ def main() -> int:
         required=True,
         help="Model identifier (e.g., sentence-transformers/all-MiniLM-L6-v2)",
     )
-    parser.add_argument("--model-inference-batch-size", type=int, default=1024, help="Batch size for model inference")
+    parser.add_argument(
+        "--model-inference-batch-size",
+        type=int,
+        default=10_000,
+        help="Batch size for model inference",
+    )
     parser.add_argument("--model-num-workers", type=int, default=None, help="Ray actor count for the model stage")
     parser.add_argument("--model-worker-gpus", type=float, default=None, help="GPUs reserved per model actor")
-    parser.add_argument(
-        "--model-max-tasks-in-flight-per-actor",
-        type=int,
-        default=1,
-        help="Maximum Ray Data file tasks queued on each model actor",
-    )
-    parser.add_argument(
-        "--model-max-restarts",
-        type=int,
-        default=1,
-        help="Maximum Ray actor restarts and task retries for the model stage",
-    )
     parser.add_argument(
         "--model-gpu-memory-utilization",
         type=float,
@@ -514,7 +498,6 @@ def main() -> int:
         choices=["parquet", "jsonl"],
         help="Input file format (default: parquet)",
     )
-    parser.add_argument("--max-chars", type=int, default=None, help="Maximum characters per input text")
     parser.add_argument(
         "--cache-dir",
         default=None,

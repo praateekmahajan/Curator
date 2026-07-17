@@ -50,8 +50,8 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         text_field: str = "text",
         pretokenize: bool = True,
         embedding_field: str = "embeddings",
-        retained_fields: list[str] | None = None,
-        model_inference_batch_size: int = 1024,
+        metadata_fields: list[str] | None = None,
+        model_inference_batch_size: int = 10_000,
         max_chars: int | None = None,
         cache_dir: str | None = None,
         hf_token: str | None = None,
@@ -63,7 +63,7 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         self.text_field = text_field
         self.pretokenize = pretokenize
         self.embedding_field = embedding_field
-        self.retained_fields = list(dict.fromkeys(retained_fields)) if retained_fields is not None else None
+        self.metadata_fields = list(dict.fromkeys(metadata_fields)) if metadata_fields is not None else None
         if model_inference_batch_size <= 0:
             msg = f"model_inference_batch_size must be positive, got {model_inference_batch_size}"
             raise ValueError(msg)
@@ -88,7 +88,7 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return ["data"], [self.text_field]
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        output_fields = self.retained_fields if self.retained_fields is not None else [self.text_field]
+        output_fields = self.metadata_fields if self.metadata_fields is not None else [self.text_field]
         return ["data"], [*output_fields, self.embedding_field]
 
     def _initialize_vllm(self, local_files_only: bool) -> None:
@@ -222,9 +222,9 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         )
         pending_offset, pending_chunk_size = next(chunk_specs)
 
-        # The yielded chunk and one pending future are the only prepared chunks
-        # resident at once. The generator cannot submit a third chunk until its
-        # caller finishes embedding the yielded chunk and requests the next one.
+        # Only one future is submitted at a time, so one worker is enough to keep
+        # the next chunk preparing while the GPU embeds the current chunk. A
+        # second worker would remain idle and would not increase prefetch depth.
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="vllm-tokenizer") as executor:
             pending_input: Future[tuple[list[Any], float]] = executor.submit(
                 self._prepare_input_chunk,
@@ -253,28 +253,24 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 pending_chunk_size = next_chunk_size
                 pending_input = next_input
 
-    def process(self, batch: DocumentBatch) -> DocumentBatch:
-        input_table = batch.to_pyarrow()
+    def _select_output_table(self, input_table: pa.Table) -> pa.Table:
+        """Validate the input and select metadata retained beside embeddings."""
         if self.text_field not in input_table.column_names:
             msg = f"Input batch is missing required text field {self.text_field!r}"
             raise ValueError(msg)
 
-        retained_fields = self.retained_fields if self.retained_fields is not None else input_table.column_names
-        missing_fields = [field for field in retained_fields if field not in input_table.column_names]
+        metadata_fields = self.metadata_fields if self.metadata_fields is not None else input_table.column_names
+        missing_fields = [field for field in metadata_fields if field not in input_table.column_names]
         if missing_fields:
-            msg = f"Input batch is missing retained fields: {missing_fields}"
+            msg = f"Input batch is missing metadata fields: {missing_fields}"
             raise ValueError(msg)
+        return input_table.select(metadata_fields)
 
-        output_table = input_table.select(retained_fields)
-        metrics = {}
+    def _collect_embeddings(self, text_column: pa.ChunkedArray, num_rows: int) -> tuple[np.ndarray, dict[str, float]]:
+        """Embed input chunks and assemble one contiguous float32 matrix."""
         embedding_numpy: np.ndarray | None = None
         tokenization_time = 0.0
         vllm_embedding_time = 0.0
-        num_rows = input_table.num_rows
-        text_column = input_table[self.text_field]
-        if num_rows == 0:
-            msg = "Cannot generate embeddings for an empty document batch"
-            raise ValueError(msg)
 
         for offset, chunk_size, input_data, chunk_tokenization_time in self._iter_prepared_chunks(
             text_column, num_rows
@@ -298,11 +294,14 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         if embedding_numpy is None:
             msg = "vLLM did not return embeddings for a non-empty document batch"
             raise RuntimeError(msg)
+        return embedding_numpy, {
+            "tokenization_time": tokenization_time,
+            "vllm_embedding_time": vllm_embedding_time,
+        }
 
-        del input_table, text_column
-        metrics["tokenization_time"] = tokenization_time
-        metrics["vllm_embedding_time"] = vllm_embedding_time
-
+    @staticmethod
+    def _to_arrow_embeddings(embedding_numpy: np.ndarray) -> pa.ListArray:
+        """Build a zero-copy-compatible Arrow list array from a dense matrix."""
         embedding_values = pa.array(embedding_numpy.reshape(-1), type=pa.float32(), from_pandas=False)
         embedding_offsets = pa.array(
             np.arange(
@@ -312,7 +311,17 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 dtype=np.int64,
             )
         )
-        embedding_array = pa.ListArray.from_arrays(embedding_offsets, embedding_values)
+        return pa.ListArray.from_arrays(embedding_offsets, embedding_values)
+
+    def process(self, batch: DocumentBatch) -> DocumentBatch:
+        input_table = batch.to_pyarrow()
+        if input_table.num_rows == 0:
+            msg = "Cannot generate embeddings for an empty document batch"
+            raise ValueError(msg)
+
+        output_table = self._select_output_table(input_table)
+        embedding_numpy, metrics = self._collect_embeddings(input_table[self.text_field], input_table.num_rows)
+        embedding_array = self._to_arrow_embeddings(embedding_numpy)
 
         if self.embedding_field in output_table.column_names:
             embedding_index = output_table.column_names.index(self.embedding_field)
@@ -322,7 +331,7 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
         self._log_metrics(metrics)
 
-        del embedding_numpy, embedding_values, embedding_offsets, embedding_array
+        del embedding_numpy, embedding_array
         gc.collect()
 
         return DocumentBatch(

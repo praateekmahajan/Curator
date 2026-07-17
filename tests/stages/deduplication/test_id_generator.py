@@ -69,7 +69,26 @@ class TestIdGeneratorBase:
         # Hash should be a string
         assert isinstance(hash1, str)
 
+    def test_hash_files_maps_runtime_paths(self):
+        """Runtime path prefixes map to paths used by the persisted registry."""
+        registry_generator = IdGeneratorBase()
+        expected_hash = registry_generator.hash_files("/logical/data/file.jsonl")
+        expected_specific_hash = registry_generator.hash_files("/logical/specific/a.jsonl")
+
+        runtime_generator = IdGeneratorBase(
+            path_mapping={
+                "/physical/data": "/logical/data",
+                "/physical/data/specific": "/logical/specific",
+            }
+        )
+
+        assert runtime_generator.hash_files("/physical/data/file.jsonl") == expected_hash
+        assert runtime_generator.hash_files("/physical/dataset/file.jsonl") != expected_hash
+        assert runtime_generator.hash_files("/physical/data/specific/a.jsonl") == expected_specific_hash
+
+    def test_hash_files_list(self):
         """Test hashing a list of files."""
+
         generator = IdGeneratorBase()
         files = ["file1.txt", "file2.txt", "file3.txt"]
         hash_list1 = generator.hash_files(files)

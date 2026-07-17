@@ -79,19 +79,13 @@ class TestRayDataStageAdapter:
                     RayStageSpecKeys.MIN_WORKERS: 2,
                     RayStageSpecKeys.MAX_WORKERS: 8,
                     RayStageSpecKeys.INITIAL_WORKERS: 4,
-                    RayStageSpecKeys.MAX_TASKS_IN_FLIGHT_PER_ACTOR: 1,
                 }
             )
         )
         task_kwargs = _map_batches_kwargs(ConfigurableTaskStage())
 
         assert fixed_actor_kwargs["compute"] == ActorPoolStrategy(size=3)
-        assert autoscaling_actor_kwargs["compute"] == ActorPoolStrategy(
-            min_size=2,
-            max_size=8,
-            initial_size=4,
-            max_tasks_in_flight_per_actor=1,
-        )
+        assert autoscaling_actor_kwargs["compute"] == ActorPoolStrategy(min_size=2, max_size=8, initial_size=4)
         assert "compute" not in task_kwargs
         for kwargs in (fixed_actor_kwargs, autoscaling_actor_kwargs, task_kwargs):
             assert "concurrency" not in kwargs
