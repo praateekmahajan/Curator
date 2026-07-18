@@ -8,10 +8,12 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import yaml
 
 import benchmarking.embedding_generation.manifest as manifest_module
 from benchmarking.embedding_generation.fuzzy_deduped_qwen3_06b import (
     MetadataExtractingJsonlReaderStage,
+    _configure_object_store_memory_limit,
     _embedding_metadata_fields,
 )
 from benchmarking.embedding_generation.manifest import ManifestFilePartitioningStage
@@ -103,6 +105,34 @@ def test_embedding_metadata_fields_drop_text_unless_requested(keep_text: bool, e
     )
 
     assert _embedding_metadata_fields(extractor, keep_text) == expected
+
+
+def test_configure_object_store_memory_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    context = type("Context", (), {})()
+    monkeypatch.setattr(
+        "benchmarking.embedding_generation.fuzzy_deduped_qwen3_06b.DataContext.get_current",
+        lambda: context,
+    )
+
+    _configure_object_store_memory_limit(0.7)
+
+    assert context.override_object_store_memory_limit_fraction == 0.7
+
+
+@pytest.mark.parametrize("fraction", [0.0, -0.1, 1.1])
+def test_configure_object_store_memory_limit_rejects_invalid_fraction(fraction: float) -> None:
+    with pytest.raises(ValueError, match="must be in"):
+        _configure_object_store_memory_limit(fraction)
+
+
+def test_production_config_bounds_object_store_and_drops_text() -> None:
+    config_path = Path(__file__).parents[3] / "benchmarking/embedding_generation/fuzzy-deduped-qwen3-0p6b.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    args = config["entries"][0]["args"]
+
+    assert config["object_store_size"] == 96 * 1024**3
+    assert "--override-object-store-memory-limit-fraction=0.7" in args
+    assert "--keep-text" not in args
 
 
 def test_metadata_extraction_uses_only_reader_task_boundary(tmp_path: Path) -> None:

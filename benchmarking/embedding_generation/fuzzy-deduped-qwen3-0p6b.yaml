@@ -6,7 +6,7 @@ gpu_stats_recorder:
   interval_s: 1.0
 
 delete_scratch: false
-object_store_size: 68719476736
+object_store_size: 103079215104
 gpu_mem_use_warning_threshold: 0.01
 
 ray:
@@ -29,6 +29,7 @@ entries:
       --require-min-files-per-shard=16
       --executor=ray_data
       --reader-max-workers=4
+      --override-object-store-memory-limit-fraction=0.7
       --model-identifier=Qwen/Qwen3-Embedding-0.6B
       --model-variation=vllm_text_pretokenized
       --model-inference-batch-size=10000

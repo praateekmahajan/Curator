@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
+from ray.data import DataContext
 
 _CURATOR_REPO_DIR = Path(__file__).resolve().parents[2]
 _BENCHMARKING_SCRIPTS_DIR = _CURATOR_REPO_DIR / "benchmarking" / "scripts"
@@ -107,11 +108,21 @@ def _embedding_metadata_fields(metadata_extractor: MetadataExtractor, keep_text:
     return fields
 
 
+def _configure_object_store_memory_limit(fraction: float | None) -> None:
+    if fraction is None:
+        return
+    if not 0 < fraction <= 1:
+        msg = f"override_object_store_memory_limit_fraction must be in (0, 1], got {fraction}"
+        raise ValueError(msg)
+    DataContext.get_current().override_object_store_memory_limit_fraction = fraction
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     output_path = Path(args.output_path).absolute()
     checkpoint_dir = Path(args.checkpoint_dir).absolute()
     output_path.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    _configure_object_store_memory_limit(args.override_object_store_memory_limit_fraction)
 
     metadata_extractor = load_metadata_extractor(args.metadata_mapping_json)
     variation = EmbeddingModelVariation(args.model_variation)
@@ -233,6 +244,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-text", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--executor", default="ray_data", choices=["ray_data"])
     parser.add_argument("--reader-max-workers", type=int, default=4)
+    parser.add_argument("--override-object-store-memory-limit-fraction", type=float, default=None)
     parser.add_argument("--model-identifier", default="Qwen/Qwen3-Embedding-0.6B")
     parser.add_argument(
         "--model-variation",

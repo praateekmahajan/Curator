@@ -33,6 +33,8 @@ At 680 rows/second/GPU on a four-GPU node, 1,632,000 rows is approximately ten m
 
 The production YAML omits `--keep-text`: vLLM emits only the generated ID, embedding, and integer metadata, so text is released before its output block enters Ray's object store. A diagnostic smoke configuration may explicitly add `--keep-text`; in that case vLLM and Parquet retain the exact text sent to the embedder.
 
+The production run starts Ray with a 96 GiB object store and sets Ray Data's `override_object_store_memory_limit_fraction` to `0.7` through the pipeline CLI.
+
 The launcher requests all four GPUs and uses `--exclusive`, guaranteeing one array task per node. Keep those settings together: an exclusive job must use every GPU on its allocated node. A launcher that intentionally requests only one GPU must omit `--exclusive` and first verify on a small run that Slurm correctly coallocates it on a shared node.
 
 ```bash
