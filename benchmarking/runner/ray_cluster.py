@@ -13,11 +13,14 @@
 # limitations under the License.
 
 
+import multiprocessing
 import os
 import shutil
 import tempfile
 import time
+import traceback
 import uuid
+from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +33,7 @@ from nemo_curator.core.utils import check_ray_responsive
 
 ray_client_start_timeout_s = 30
 ray_client_start_poll_interval_s = 0.5
+ray_cluster_data_timeout_s = 120
 
 
 _RAY_CLEANUP_WAIT_S = 10
@@ -146,7 +150,31 @@ def teardown_ray_cluster_and_env(
             logger.exception("Failed to copy/remove Ray temp dir")
 
 
-def get_ray_cluster_data() -> dict[str, Any]:
+def _collect_ray_cluster_data(connection: Connection) -> None:
+    """Collect Ray resources in an isolated process.
+
+    Driver registration can block indefinitely inside Ray's native client. Keeping
+    it in a child process lets the benchmark runner enforce a hard timeout.
+    """
+    try:
+        with ray.init(ignore_reinit_error=True):
+            time.sleep(0.2)  # ray.cluster_resources() can lag immediately after init
+            connection.send((True, ray.cluster_resources()))
+    except BaseException:
+        connection.send((False, traceback.format_exc()))
+    finally:
+        connection.close()
+
+
+def _stop_process(process: multiprocessing.Process) -> None:
+    process.terminate()
+    process.join(timeout=5)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=5)
+
+
+def get_ray_cluster_data(timeout_s: int = ray_cluster_data_timeout_s) -> dict[str, Any]:
     """Get resource data from the Ray cluster.
 
     If the cluster is not responsive (e.g. crashed due to OOM), returns an empty dict
@@ -156,9 +184,29 @@ def get_ray_cluster_data() -> dict[str, Any]:
     if not check_ray_responsive():
         logger.warning("Ray cluster is not responsive, skipping cluster data collection")
         return {}
-    with ray.init(ignore_reinit_error=True):
-        time.sleep(0.2)  # ray.available_resources() returns might have a lag
-        return ray.cluster_resources()
+
+    context = multiprocessing.get_context("spawn")
+    parent_connection, child_connection = context.Pipe(duplex=False)
+    process = context.Process(target=_collect_ray_cluster_data, args=(child_connection,))
+    process.start()
+    child_connection.close()
+
+    try:
+        if not parent_connection.poll(timeout_s):
+            _stop_process(process)
+            msg = f"Timed out after {timeout_s}s while connecting a driver to the Ray cluster"
+            raise TimeoutError(msg)
+
+        succeeded, payload = parent_connection.recv()
+        process.join(timeout=5)
+        if process.is_alive():
+            _stop_process(process)
+        if not succeeded:
+            msg = f"Failed to collect Ray cluster data:\n{payload}"
+            raise RuntimeError(msg)
+        return payload
+    finally:
+        parent_connection.close()
 
 
 def _ensure_ray_client_process_started(client: RayClient, timeout_s: int, poll_interval_s: float) -> None:
