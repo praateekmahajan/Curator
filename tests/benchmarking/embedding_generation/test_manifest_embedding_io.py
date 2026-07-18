@@ -12,6 +12,7 @@ import pytest
 import benchmarking.embedding_generation.manifest as manifest_module
 from benchmarking.embedding_generation.fuzzy_deduped_qwen3_06b import (
     MetadataExtractingJsonlReaderStage,
+    _embedding_metadata_fields,
 )
 from benchmarking.embedding_generation.manifest import ManifestFilePartitioningStage
 from benchmarking.embedding_generation.prepare_smoke_manifest import prepare_smoke_manifest
@@ -85,6 +86,23 @@ def test_metadata_extracting_reader_declares_generated_fields() -> None:
     )
 
     assert reader.outputs() == (["data"], [CURATOR_DEDUP_ID_STR, "source_family_id", "text"])
+
+
+@pytest.mark.parametrize(
+    ("keep_text", "expected"),
+    [
+        (False, [CURATOR_DEDUP_ID_STR, "source_family_id"]),
+        (True, [CURATOR_DEDUP_ID_STR, "source_family_id", "text"]),
+    ],
+)
+def test_embedding_metadata_fields_drop_text_unless_requested(keep_text: bool, expected: list[str]) -> None:
+    extractor = MetadataExtractor(
+        metadata_mapping={"source_a": {"source_family_id": 1}},
+        output_dtypes={"source_family_id": "int8"},
+        content_field="multimodal_document",
+    )
+
+    assert _embedding_metadata_fields(extractor, keep_text) == expected
 
 
 def test_metadata_extraction_uses_only_reader_task_boundary(tmp_path: Path) -> None:

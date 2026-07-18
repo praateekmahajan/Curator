@@ -99,6 +99,14 @@ class MetadataExtractingJsonlReaderStage(JsonlReaderStage):
         return self.metadata_extractor.process(batch)
 
 
+def _embedding_metadata_fields(metadata_extractor: MetadataExtractor, keep_text: bool) -> list[str]:
+    """Return only columns that vLLM should retain in its output block."""
+    fields = [CURATOR_DEDUP_ID_STR, *metadata_extractor.output_dtypes]
+    if keep_text:
+        fields.append(metadata_extractor.text_field)
+    return fields
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     output_path = Path(args.output_path).absolute()
     checkpoint_dir = Path(args.checkpoint_dir).absolute()
@@ -117,6 +125,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.reader_max_workers is not None:
         reader = reader.with_(ray_stage_spec={RayStageSpecKeys.MAX_WORKERS: args.reader_max_workers})
 
+    embedding_metadata_fields = _embedding_metadata_fields(metadata_extractor, args.keep_text)
+
     embedding_stages = _create_embedding_stages(
         model_identifier=args.model_identifier,
         model_variation=variation,
@@ -128,8 +138,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         max_seq_length=max_seq_length,
         embedding_pooling=args.embedding_pooling,
         cache_dir=args.cache_dir,
-        # None preserves every input column. The writer removes only text.
-        metadata_fields=None,
+        metadata_fields=embedding_metadata_fields,
     )
 
     output_fields = [CURATOR_DEDUP_ID_STR]
