@@ -119,6 +119,7 @@ entries:
       --max-samples-per-batch=4096
     timeout_s: 1800
   - name: crawl-n55-smoke-1536-files-final-layout
+    enabled: false
     script: ../semdedup/kmeans.py
     args: >-
       --benchmark-results-path={session_entry_dir}
@@ -133,4 +134,159 @@ entries:
       --fit-data-fraction=1
       --max-iter=20
       --max-samples-per-batch=4096
+    timeout_s: 7200
+  - name: crawl-n55-smoke-2048-files
+    enabled: false
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={crawl_n55_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --input-file-limit=2048
+      --embedding-dim=1024
+      --n-clusters=128
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=1
+      --max-iter=20
+      --max-samples-per-batch=4096
+    timeout_s: 7200
+  - name: crawl-n55-smoke-2048-files-v2
+    enabled: false
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={crawl_n55_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --input-file-limit=2048
+      --embedding-dim=1024
+      --n-clusters=128
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=1
+      --max-iter=20
+      --max-samples-per-batch=4096
+    timeout_s: 7200
+  - name: crawl-n55-smoke-2048-files-preallocated-v3
+    enabled: false
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={crawl_n55_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --input-file-limit=2048
+      --embedding-dim=1024
+      --n-clusters=128
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=1
+      --max-iter=20
+      --max-samples-per-batch=4096
+    timeout_s: 7200
+  - name: crawl-n55-smoke-2048-files-preallocated-v4
+    enabled: false
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={crawl_n55_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --input-file-limit=2048
+      --embedding-dim=1024
+      --n-clusters=128
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=1
+      --max-iter=20
+      --max-samples-per-batch=4096
+    timeout_s: 7200
+  - name: crawl-n55-smoke-2048-files-preallocated-v5
+    enabled: false
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={crawl_n55_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --input-file-limit=2048
+      --embedding-dim=1024
+      --n-clusters=128
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=1
+      --max-iter=20
+      --max-samples-per-batch=4096
+    timeout_s: 7200
+  - name: crawl-n55-smoke-3072-files-preallocated-v6
+    enabled: false
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={crawl_n55_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --input-file-limit=3072
+      --embedding-dim=1024
+      --n-clusters=128
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=1
+      --max-iter=20
+      --max-samples-per-batch=4096
+    timeout_s: 7200
+  - name: crawl-n55-smoke-16-files-streaming-v7
+    enabled: false
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={crawl_n55_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --input-file-limit=16
+      --embedding-dim=1024
+      --n-clusters=128
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=1
+      --max-iter=20
+      --max-samples-per-batch=4096
+      --write-batch-size=100000
+    timeout_s: 1800
+  - name: crawl-n55-smoke-16-files-streaming-v8
+    enabled: false
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={crawl_n55_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --input-file-limit=16
+      --embedding-dim=1024
+      --n-clusters=128
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=1
+      --max-iter=20
+      --max-samples-per-batch=4096
+      --write-batch-size=100000
+    timeout_s: 1800
+  - name: crawl-n55-smoke-3072-files-streaming-v9
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={crawl_n55_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --input-file-limit=3072
+      --embedding-dim=1024
+      --n-clusters=128
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=1
+      --max-iter=20
+      --max-samples-per-batch=4096
+      --write-batch-size=100000
     timeout_s: 7200
