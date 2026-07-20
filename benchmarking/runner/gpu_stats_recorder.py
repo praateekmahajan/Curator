@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import json
+import platform
 import threading
 import time
 from pathlib import Path
@@ -47,9 +48,12 @@ class GPUStatsRecorder:
 
     HEADER: ClassVar[list[str]] = [
         "timestamp_utc",
+        "hostname",
         "gpu_id",
         "utilization_gpu_pct",
         "utilization_memory_pct",
+        "memory_used_mb",
+        "memory_total_mb",
         "temperature_c",
         "power_draw_w",
         "power_limit_w",
@@ -60,6 +64,7 @@ class GPUStatsRecorder:
     def __init__(self, output_path: Path, interval_s: float = 1.0) -> None:
         self.output_path = Path(output_path)
         self.interval_s = float(interval_s)
+        self.hostname = platform.node()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._csv_file: IO[str] | None = None
@@ -128,9 +133,12 @@ class GPUStatsRecorder:
             self._csv_writer.writerow(
                 [
                     ts,
+                    self.hostname,
                     gpu.index,
                     gpu.utilization,
                     round(mem_pct, 2),
+                    gpu.memory_used,
+                    gpu.memory_total,
                     gpu.temperature,
                     "" if gpu.power_draw is None else round(gpu.power_draw, 1),
                     "" if gpu.power_limit is None else int(gpu.power_limit),
