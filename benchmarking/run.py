@@ -18,7 +18,6 @@ import json
 import os
 import pickle
 import shutil
-import subprocess
 import sys
 import time
 import traceback
@@ -48,17 +47,18 @@ from runner.gpu_stats_recorder import GPUStatsRecorder
 from runner.path_resolver import PathResolver
 from runner.process import run_command_with_timeout
 from runner.ray_cluster import (
+    get_cluster_gpu_stats,
     get_ray_cluster_data,
     setup_ray_cluster_and_env,
     teardown_ray_cluster_and_env,
 )
 from runner.session import Session
+from runner.slurm_launcher import launch_multi_node_slurm, should_launch_multi_node_slurm
 from runner.utils import (
     assert_valid_config_dict,
     find_result,
-    get_gpu_stats,
     get_obj_for_json,
-    log_gpu_stats,
+    log_cluster_gpu_stats,
     merge_config_files,
     remove_disabled_blocks,
     resolve_env_vars,
@@ -151,7 +151,7 @@ def check_requirements_update_results(result_data: dict[str, Any], requirements:
     return meets_requirements
 
 
-def run_entry(  # noqa: PLR0913
+def run_entry(  # noqa: PLR0913, PLR0915
     entry: Entry,
     path_resolver: PathResolver,
     dataset_resolver: DatasetResolver,
@@ -163,9 +163,9 @@ def run_entry(  # noqa: PLR0913
     # scratch_path : This is the directory provided to users for saving scratch/temp data; it'll be cleaned up after the entry is done if delete_scratch is True
     # ray_cluster_path : This is the directory where Ray debug/log files are saved
     # logs_path : This is the directory where stdout/stderr and Ray startup logs are saved
-    scratch_path, ray_cluster_path, logs_path = [
-        (session_entry_path / d).absolute() for d in ["scratch", "ray_cluster", "logs"]
-    ]
+    scratch_path = (session_entry_path / "scratch").absolute()
+    ray_cluster_path = (session_entry_path / "ray_cluster").absolute()
+    logs_path = (session_entry_path / "logs").absolute()
     cmd = entry.get_command_to_run(session_entry_path, path_resolver, dataset_resolver)
     stdouterr_path = logs_path / "stdouterr.log"
     run_id = result_data.get("run_id", f"{entry.name}-{int(time.time())}")
@@ -177,8 +177,12 @@ def run_entry(  # noqa: PLR0913
     try:
         # Create subdirs individually. logs_path uses ensure_dir (not create_or_overwrite_dir)
         # to preserve any log output already written before run_entry() was called.
+        external_ray = os.environ.get("NEMO_BENCHMARK_EXTERNAL_RAY") == "1"
         for directory in [scratch_path, ray_cluster_path]:
-            create_or_overwrite_dir(directory)
+            if external_ray:
+                ensure_dir(directory)
+            else:
+                create_or_overwrite_dir(directory)
         ensure_dir(logs_path)
 
         ray_client, ray_temp_dir = setup_ray_cluster_and_env(
@@ -207,9 +211,9 @@ def run_entry(  # noqa: PLR0913
 
         # Execute command with timeout, capturing GPU stats before and after
         ray_cluster_data = get_ray_cluster_data()
-        gpu_stats_before = get_gpu_stats()
+        gpu_stats_before = get_cluster_gpu_stats()
         logger.info("\tGPU stats (before):")
-        warnings = log_gpu_stats(
+        warnings = log_cluster_gpu_stats(
             gpu_stats_before,
             warn_if_in_use=True,
             warning_threshold=entry.gpu_mem_use_warning_threshold,
@@ -223,7 +227,7 @@ def run_entry(  # noqa: PLR0913
                 output_path=session_entry_path / "gpustats.csv",
                 interval_s=gpu_stats_recorder_interval_s,
             )
-            if gpu_stats_recorder_interval_s > 0
+            if gpu_stats_recorder_interval_s > 0 and os.environ.get("NEMO_BENCHMARK_PER_NODE_GPU_STATS") != "1"
             else nullcontext()
         )
         started_exec = time.time()
@@ -237,8 +241,9 @@ def run_entry(  # noqa: PLR0913
             )
         ended_exec = time.time()
         logger.info("\tGPU stats (after):")
-        warnings += log_gpu_stats(
-            get_gpu_stats(),
+        gpu_stats_after = get_cluster_gpu_stats()
+        warnings += log_cluster_gpu_stats(
+            gpu_stats_after,
             warn_if_in_use=True,
             warning_threshold=entry.gpu_mem_use_warning_threshold,
             warning_threshold_msg="left in use after benchmark ended",
@@ -255,7 +260,9 @@ def run_entry(  # noqa: PLR0913
                 "timed_out": run_data["timed_out"],
                 "logs_dir": logs_path,
                 "ray_cluster_data": ray_cluster_data,
-                "gpu_stats": gpu_stats_before,
+                "gpu_stats": next(iter(gpu_stats_before.values()), {}),
+                "gpu_stats_by_node": gpu_stats_before,
+                "gpu_stats_after_by_node": gpu_stats_after,
                 "warnings": warnings,
             }
         )
@@ -289,18 +296,17 @@ def run_entry(  # noqa: PLR0913
         return success
 
     finally:
-        teardown_ray_cluster_and_env(ray_client, ray_temp_dir, ray_cluster_path)
+        if os.environ.get("NEMO_BENCHMARK_EXTERNAL_RAY") != "1":
+            teardown_ray_cluster_and_env(ray_client, ray_temp_dir, ray_cluster_path)
 
         # Clean up the scratch dir if configured to delete
-        if entry.delete_scratch:
+        if entry.delete_scratch and os.environ.get("NEMO_BENCHMARK_EXTERNAL_RAY") != "1":
             shutil.rmtree(scratch_path, ignore_errors=True)
 
 
 def main() -> int:  # noqa: C901, PLR0911, PLR0912, PLR0915
-    slurm_num_nodes = int(os.environ.get("SLURM_JOB_NUM_NODES", os.environ.get("SLURM_NNODES", "1")))
-    if slurm_num_nodes > 1 and os.environ.get("SLURM_NODEID") is not None and not os.environ.get("RAY_ADDRESS"):
-        slurm_runner = _this_script_dir / "semdedup/slurm_run.py"
-        return subprocess.run([sys.executable, str(slurm_runner), *sys.argv[1:]], check=False).returncode  # noqa: S603
+    if should_launch_multi_node_slurm():
+        return launch_multi_node_slurm(sys.argv[1:])
 
     parser = argparse.ArgumentParser(description="Runs the benchmarking application")
     parser.add_argument(

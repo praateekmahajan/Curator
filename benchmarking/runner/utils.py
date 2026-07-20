@@ -236,6 +236,7 @@ def log_gpu_stats(
     warn_if_in_use: bool = False,
     warning_threshold: float | None = None,
     warning_threshold_msg: str = "still in use",
+    label_prefix: str = "",
 ) -> list[str]:
     """Log GPU memory usage for each GPU as a percentage of total memory.
 
@@ -253,16 +254,41 @@ def log_gpu_stats(
     warnings = []
     for gpu_id, stats in gpu_stats.items():
         pct_used = stats["memory_used"] / stats["memory_total"] * 100
-        logger.info(f"GPU {gpu_id} : {pct_used:.1f}%")
+        logger.info(f"{label_prefix}GPU {gpu_id} : {pct_used:.1f}%")
         if warn_if_in_use:
             fraction_used = stats["memory_used"] / stats["memory_total"]
             threshold_exceeded = (
                 fraction_used > warning_threshold if warning_threshold is not None else stats["memory_used"] > 0
             )
             if threshold_exceeded:
-                msg = f"GPU {gpu_id}: {stats['memory_used']} MiB ({pct_used:.1f}% of total) {warning_threshold_msg}"
+                msg = (
+                    f"{label_prefix}GPU {gpu_id}: {stats['memory_used']} MiB "
+                    f"({pct_used:.1f}% of total) {warning_threshold_msg}"
+                )
                 logger.warning(msg)
                 warnings.append(msg)
+    return warnings
+
+
+def log_cluster_gpu_stats(
+    gpu_stats_by_node: dict[str, dict],
+    warn_if_in_use: bool = False,
+    warning_threshold: float | None = None,
+    warning_threshold_msg: str = "still in use",
+) -> list[str]:
+    """Log GPU memory use for every node in a Ray cluster."""
+    warnings = []
+    for hostname, gpu_stats in gpu_stats_by_node.items():
+        logger.info(f"Node {hostname}:")
+        warnings.extend(
+            log_gpu_stats(
+                gpu_stats,
+                warn_if_in_use=warn_if_in_use,
+                warning_threshold=warning_threshold,
+                warning_threshold_msg=warning_threshold_msg,
+                label_prefix=f"{hostname}: ",
+            )
+        )
     return warnings
 
 

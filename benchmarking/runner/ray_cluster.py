@@ -16,6 +16,7 @@
 import multiprocessing
 import os
 import shutil
+import socket
 import tempfile
 import time
 import traceback
@@ -26,7 +27,7 @@ from typing import Any
 
 import ray
 from loguru import logger
-from runner.utils import get_shm_usage
+from runner.utils import get_gpu_stats, get_shm_usage
 
 from nemo_curator.core.client import RayClient, SlurmRayClient
 from nemo_curator.core.utils import check_ray_responsive
@@ -181,6 +182,25 @@ def _collect_ray_cluster_data(connection: Connection) -> None:
         connection.close()
 
 
+def _get_local_gpu_stats() -> tuple[str, dict]:
+    return socket.gethostname(), get_gpu_stats()
+
+
+def _collect_cluster_gpu_stats(connection: Connection) -> None:
+    """Collect one GPU snapshot per alive Ray node in an isolated process."""
+    try:
+        from nemo_curator.utils.ray_utils import submit_on_each_node
+
+        with ray.init(ignore_reinit_error=True):
+            remote_fn = ray.remote(_get_local_gpu_stats)
+            snapshots = ray.get(submit_on_each_node(remote_fn, num_cpus=0))
+            connection.send((True, dict(snapshots)))
+    except BaseException:
+        connection.send((False, traceback.format_exc()))
+    finally:
+        connection.close()
+
+
 def _stop_process(process: multiprocessing.Process) -> None:
     process.terminate()
     process.join(timeout=5)
@@ -218,6 +238,36 @@ def get_ray_cluster_data(timeout_s: int = ray_cluster_data_timeout_s) -> dict[st
             _stop_process(process)
         if not succeeded:
             msg = f"Failed to collect Ray cluster data:\n{payload}"
+            raise RuntimeError(msg)
+        return payload
+    finally:
+        parent_connection.close()
+
+
+def get_cluster_gpu_stats(timeout_s: int = ray_cluster_data_timeout_s) -> dict[str, dict]:
+    """Return one GPU snapshot per alive Ray node, keyed by hostname."""
+    if not check_ray_responsive():
+        logger.warning("Ray cluster is not responsive, skipping cluster GPU stats collection")
+        return {}
+
+    context = multiprocessing.get_context("spawn")
+    parent_connection, child_connection = context.Pipe(duplex=False)
+    process = context.Process(target=_collect_cluster_gpu_stats, args=(child_connection,))
+    process.start()
+    child_connection.close()
+
+    try:
+        if not parent_connection.poll(timeout_s):
+            _stop_process(process)
+            msg = f"Timed out after {timeout_s}s while collecting cluster GPU stats"
+            raise TimeoutError(msg)
+
+        succeeded, payload = parent_connection.recv()
+        process.join(timeout=5)
+        if process.is_alive():
+            _stop_process(process)
+        if not succeeded:
+            msg = f"Failed to collect cluster GPU stats:\n{payload}"
             raise RuntimeError(msg)
         return payload
     finally:
