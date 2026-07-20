@@ -33,6 +33,15 @@ def get_array_from_df(df: "cudf.DataFrame", embedding_col: str) -> "cp.ndarray":
     return df[embedding_col].list.leaves.values.reshape(len(df), -1)
 
 
+def get_parquet_num_rows(files: list[str], storage_options: dict[str, Any] | None = None) -> int:
+    """Return the total row count from Parquet file metadata."""
+    total_rows = 0
+    for file in files:
+        with open_parquet_file(file, storage_options=storage_options) as f:
+            total_rows += pq.read_metadata(f).num_rows
+    return total_rows
+
+
 EmbeddingStorageDtype = Literal["auto", "float16", "float32"]
 
 

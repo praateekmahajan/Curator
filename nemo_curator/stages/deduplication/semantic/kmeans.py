@@ -27,7 +27,7 @@ from nemo_curator.stages.text.embedders.utils import create_list_series_from_1d_
 from nemo_curator.tasks import EmptyTask, FileGroupTask
 from nemo_curator.utils.file_utils import check_disallowed_kwargs, get_default_file_extensions
 
-from .utils import break_parquet_partition_into_groups, get_array_from_df
+from .utils import break_parquet_partition_into_groups, get_array_from_df, get_parquet_num_rows
 
 if TYPE_CHECKING:
     import cudf
@@ -42,6 +42,13 @@ from loguru import logger
 # Column names
 L2_DIST_TO_CENT_COL = "l2_dist_to_cent"
 COSINE_DIST_TO_CENT_COL = "cosine_dist_to_cent"
+
+
+@dataclass
+class _LoadedGroup:
+    frame: Any
+    start: int
+    end: int
 
 
 class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], DeduplicationIO):
@@ -158,7 +165,11 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
 
         # Break files into subgroups to avoid cudf row limits
         if self.filetype == "parquet":
-            groups = break_parquet_partition_into_groups(all_files, embedding_dim=self.embedding_dim)
+            groups = break_parquet_partition_into_groups(
+                all_files,
+                embedding_dim=self.embedding_dim,
+                storage_options=self.input_storage_options,
+            )
         elif self.filetype == "jsonl":
             # For JSONL files, just group all files together since we can't easily estimate size
             groups = [all_files]
@@ -191,54 +202,162 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         msg = f"Unsupported data type: {self.filetype}"
         raise ValueError(msg)
 
-    def _process_batch_single_pass(self, tasks: list[FileGroupTask], groups: list[list[str]]) -> list["EmptyTask"]:
-        """Single-pass approach: loads all groups simultaneously.
+    def _load_contiguous_embeddings(
+        self,
+        groups: list[list[str]],
+        columns: list[str],
+        *,
+        retain_frames: bool,
+    ) -> tuple["cp.ndarray", list[_LoadedGroup]]:
+        """Load normalized embeddings, inferring their width from the first group.
 
-        Requires peak GPU memory = sum(all groups' data). Only suitable when the
-        total dataset fits in GPU memory.
+        Multiple Parquet groups are copied directly into one preallocated array.
+        The allocation uses row counts from the remaining file footers, which are
+        an upper bound when read filters are present. A single group needs no copy.
         """
-        t0 = time.perf_counter()
-        # Maintain a list of DataFrames and embeddings arrays for later use
-        all_dfs, embeddings_arrays = [], []
+        first_frame = self._read_group(groups[0], columns)
+        first_frame = self.normalize_embeddings_col_in_df(first_frame, self.embedding_field)
+        first_embeddings = get_array_from_df(first_frame, self.embedding_field)
 
-        for group in groups:
-            df = self._read_group(group, [self.id_field, self.embedding_field, *self.metadata_fields])
-            # Normalize the embeddings
-            df = self.normalize_embeddings_col_in_df(df, self.embedding_field)
-            all_dfs.append(df)
-            # Convert embeddings to cupy array to avoid cudf row limits
-            embeddings_arrays.append(get_array_from_df(df, self.embedding_field))
+        if len(groups) == 1:
+            return first_embeddings, [_LoadedGroup(first_frame, 0, len(first_frame))]
+
+        if self.filetype != "parquet":
+            return self._concatenate_groups(
+                groups,
+                columns,
+                first_frame,
+                first_embeddings,
+                retain_frames=retain_frames,
+            )
+
+        return self._preallocate_parquet_groups(
+            groups,
+            columns,
+            first_frame,
+            first_embeddings,
+            retain_frames=retain_frames,
+        )
+
+    def _concatenate_groups(
+        self,
+        groups: list[list[str]],
+        columns: list[str],
+        first_frame: "cudf.DataFrame",
+        first_embeddings: "cp.ndarray",
+        *,
+        retain_frames: bool,
+    ) -> tuple["cp.ndarray", list[_LoadedGroup]]:
+        """Concatenate formats without cheap row-count metadata."""
+        frames = [first_frame]
+        embedding_arrays = [first_embeddings]
+        for group in groups[1:]:
+            frame = self._read_group(group, columns)
+            frame = self.normalize_embeddings_col_in_df(frame, self.embedding_field)
+            frames.append(frame)
+            embedding_arrays.append(get_array_from_df(frame, self.embedding_field))
+
+        embeddings = cp.concatenate(embedding_arrays, axis=0)
+        loaded_groups = []
+        offset = 0
+        for frame in frames:
+            end = offset + len(frame)
+            if retain_frames:
+                loaded_groups.append(_LoadedGroup(frame, offset, end))
+            offset = end
+        return embeddings, loaded_groups
+
+    def _preallocate_parquet_groups(
+        self,
+        groups: list[list[str]],
+        columns: list[str],
+        first_frame: "cudf.DataFrame",
+        first_embeddings: "cp.ndarray",
+        *,
+        retain_frames: bool,
+    ) -> tuple["cp.ndarray", list[_LoadedGroup]]:
+        """Load multiple Parquet groups into one runtime-sized array."""
+
+        remaining_files = [file for group in groups[1:] for file in group]
+        row_capacity = len(first_frame) + get_parquet_num_rows(
+            remaining_files,
+            storage_options=self.input_storage_options,
+        )
+        embedding_width = first_embeddings.shape[1]
+        embeddings = cp.empty((row_capacity, embedding_width), dtype=cp.float32)
+        loaded_groups: list[_LoadedGroup] = []
+        offset = 0
+
+        def append_group(frame: "cudf.DataFrame", group_embeddings: "cp.ndarray") -> None:
+            nonlocal offset
+            if group_embeddings.shape[1] != embedding_width:
+                msg = (
+                    f"Embedding width changed from {embedding_width} to {group_embeddings.shape[1]} "
+                    "within one KMeans actor"
+                )
+                raise ValueError(msg)
+            end = offset + len(frame)
+            if end > row_capacity:
+                msg = f"Read {end} rows, exceeding the Parquet metadata row capacity of {row_capacity}"
+                raise ValueError(msg)
+            embeddings[offset:end] = group_embeddings
+            if retain_frames:
+                metadata_frame = frame.drop(columns=[self.embedding_field])
+                loaded_groups.append(_LoadedGroup(metadata_frame, offset, end))
+            offset = end
+
+        append_group(first_frame, first_embeddings)
+        del first_frame, first_embeddings
+
+        for group in groups[1:]:
+            frame = self._read_group(group, columns)
+            frame = self.normalize_embeddings_col_in_df(frame, self.embedding_field)
+            group_embeddings = get_array_from_df(frame, self.embedding_field)
+            append_group(frame, group_embeddings)
+            del frame, group_embeddings
+
+        return embeddings[:offset], loaded_groups
+
+    def _process_batch_single_pass(self, tasks: list[FileGroupTask], groups: list[list[str]]) -> list["EmptyTask"]:
+        """Fit all rows from one contiguous array and write retained groups."""
+        t0 = time.perf_counter()
+        embeddings, loaded_groups = self._load_contiguous_embeddings(
+            groups,
+            [self.id_field, self.embedding_field, *self.metadata_fields],
+            retain_frames=True,
+        )
 
         t1 = time.perf_counter()
-        self._log_metrics({"kmeans_read_time": t1 - t0, "num_rows": sum(len(df) for df in all_dfs)})
+        self._log_metrics({"kmeans_read_time": t1 - t0, "num_rows": len(embeddings)})
         logger.debug(f"Read time: {(t1 - t0):.2f} seconds")
 
         # Fit the model cooperatively across actors, then predict on local data
-        concatenated_embeddings = cp.concatenate(embeddings_arrays, axis=0)
-        self.kmeans._fit(concatenated_embeddings, sample_weight=None, convert_dtype=False, multigpu=True)
+        self.kmeans._fit(embeddings, sample_weight=None, convert_dtype=False, multigpu=True)
 
         if self.cache_path is not None and getattr(self, "_actor_index", 0) == 0:
             os.makedirs(self.cache_path, exist_ok=True)
             cp.save(f"{self.cache_path}/kmeans_centroids.npy", self.kmeans.cluster_centers_)
             logger.info(f"Saved {self.n_clusters} KMeans centroids to {self.cache_path}/kmeans_centroids.npy")
 
-        labels = self.kmeans.predict(concatenated_embeddings, convert_dtype=False).astype(cp.int32)
+        labels = cp.asarray(self.kmeans.labels_).astype(cp.int32, copy=False)
 
         t2 = time.perf_counter()
         self._log_metric("kmeans_fit_predict_time", t2 - t1)
         logger.info(f"KMeans fit+predict time: {(t2 - t1):.2f} seconds")
 
         results = []
-        num_rows_seen = 0
-
         # Assign labels back to DataFrame and write results
-        for i, df in enumerate(all_dfs):
-            end_idx = num_rows_seen + len(df)
-            df["centroid"] = labels[num_rows_seen:end_idx]
-            num_rows_seen = end_idx
+        for i, loaded_group in enumerate(loaded_groups):
+            df = loaded_group.frame
+            if self.embedding_field not in df.columns:
+                df[self.embedding_field] = create_list_series_from_1d_or_2d_ar(
+                    embeddings[loaded_group.start : loaded_group.end],
+                    index=df.index,
+                )
+            df["centroid"] = labels[loaded_group.start : loaded_group.end]
             # Assign distances using the fitted cluster centers
-            df = self._assign_distances(df, self.embedding_field, self.kmeans.cluster_centers_)  # noqa: PLW2901
-            df = self._encode_embeddings_for_write(df, self.embedding_field)  # noqa: PLW2901
+            df = self._assign_distances(df, self.embedding_field, self.kmeans.cluster_centers_)
+            df = self._encode_embeddings_for_write(df, self.embedding_field)
 
             output_filename = f"{tasks[0].task_id}_{i}"
             # Write results for this subgroup
@@ -330,17 +449,12 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             fit_groups = [fit_files]
 
         t0 = time.perf_counter()
-        sample_embeddings_list = []
-        sampled_rows = 0
-
-        for fit_group in fit_groups:
-            df = self._read_group(fit_group, [self.embedding_field])
-            sampled_rows += len(df)
-            df = self.normalize_embeddings_col_in_df(df, self.embedding_field)
-            # .copy() detaches from the df so we can delete the df and free its memory
-            sample_embeddings_list.append(get_array_from_df(df, self.embedding_field).copy())
-            del df
-            gc.collect()
+        sampled_embeddings, fit_group_owners = self._load_contiguous_embeddings(
+            fit_groups,
+            [self.embedding_field],
+            retain_frames=False,
+        )
+        sampled_rows = len(sampled_embeddings)
 
         t1 = time.perf_counter()
         pass1_read_time = t1 - t0
@@ -349,17 +463,13 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             f"read {len(fit_files)}/{len(all_files)} files = {sampled_rows} rows"
         )
 
-        # Fit on sampled data cooperatively across all actors
-        concatenated_samples = cp.concatenate(sample_embeddings_list, axis=0)
-        del sample_embeddings_list
-        gc.collect()
         logger.info(
-            f"Fitting KMeans on {len(concatenated_samples)} sampled rows "
+            f"Fitting KMeans on {len(sampled_embeddings)} sampled rows "
             f"(fit_data_fraction={fraction:.4f}, {len(fit_files)}/{len(all_files)} files)"
         )
 
-        self.kmeans._fit(concatenated_samples, sample_weight=None, convert_dtype=False, multigpu=True)
-        del concatenated_samples
+        self.kmeans._fit(sampled_embeddings, sample_weight=None, convert_dtype=False, multigpu=True)
+        del sampled_embeddings, fit_group_owners
         gc.collect()
         # Stop the fit-time clock before centroid I/O so the metric isn't skewed
         # by disk write latency on actor 0.
