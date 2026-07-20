@@ -115,6 +115,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 max_samples_per_batch=args.max_samples_per_batch,
                 fit_data_fraction=effective_fit_data_fraction,
                 output_embedding_dtype=args.output_embedding_dtype,
+                write_batch_size=args.write_batch_size,
                 cache_path=str(centroids_path),
             )
         ],
@@ -165,6 +166,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--oversampling-factor", type=float, default=2.0)
     parser.add_argument("--max-samples-per-batch", type=int, default=32768)
     parser.add_argument("--output-embedding-dtype", choices=["float16", "float32"], default="float16")
+    parser.add_argument("--write-batch-size", type=int, default=100_000)
     return parser
 
 

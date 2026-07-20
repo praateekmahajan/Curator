@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import cupy as cp
 import numpy as np
+from cudf.io.parquet import ParquetDatasetWriter
 
 from nemo_curator.backends.base import WorkerMetadata
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
@@ -74,6 +75,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         max_samples_per_batch: int = 1 << 15,
         fit_data_fraction: float | None = None,
         output_embedding_dtype: Literal["float16", "float32"] = "float16",
+        write_batch_size: int = 100_000,
         # I/O args
         cache_path: str | None = None,
         read_kwargs: dict[dict] | None = None,
@@ -98,6 +100,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             max_samples_per_batch (int): The number of data samples to use for batches of the pairwise distance computation. This computation is done throughout both fit predict. The default should suit most cases. The total number of elements in the batched pairwise distance computation is max_samples_per_batch * n_clusters. It might become necessary to lower this number when n_clusters becomes prohibitively large.
             fit_data_fraction (float | None): Fraction of the dataset (in (0, 1)) used to fit the KMeans model. Pass None to fit on the full dataset (single-pass mode). Sampling is done at the file level: each actor draws `round(fit_data_fraction x num_actor_files)` of its files (floor of 1) for the fit. When set, uses a two-pass approach: Pass 1 reads only the embedding column from the sampled files (so IO and GPU memory in Pass 1 scale with the fraction); Pass 2 then loads each (full) original group one at a time to predict labels and write results. This dramatically reduces peak GPU memory for large datasets. If None, all rows are loaded simultaneously.
             output_embedding_dtype: Storage dtype for normalized embeddings written after KMeans. FP16 is encoded as uint16 bit patterns for cuDF compatibility.
+            write_batch_size: Maximum rows to materialize and send to the partitioned Parquet writer at once.
             cache_path (str | None): The path to save the centroids to. If None, the centroids will not be saved.
             read_kwargs (dict[dict]): Keyword arguments for the read stage.
             write_kwargs (dict[dict]): Keyword arguments for the write stage.
@@ -125,6 +128,10 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             msg = f"Unsupported output_embedding_dtype: {output_embedding_dtype}"
             raise ValueError(msg)
         self.output_embedding_dtype = output_embedding_dtype
+        if write_batch_size <= 0:
+            msg = f"write_batch_size must be positive, got {write_batch_size}"
+            raise ValueError(msg)
+        self.write_batch_size = write_batch_size
 
         self.cache_path = cache_path
         self.read_kwargs = read_kwargs.copy() if read_kwargs is not None else {}
@@ -346,40 +353,22 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         logger.info(f"KMeans fit+predict time: {(t2 - t1):.2f} seconds")
 
         results = []
-        # Assign labels back to DataFrame and write results
-        for i, loaded_group in enumerate(loaded_groups):
-            df = loaded_group.frame
-            if self.embedding_field not in df.columns:
-                df[self.embedding_field] = create_list_series_from_1d_or_2d_ar(
+        with self._create_dataset_writer(tasks) as writer:
+            for i, loaded_group in enumerate(loaded_groups):
+                self._write_partitioned_batches(
+                    writer,
+                    loaded_group.frame,
                     embeddings[loaded_group.start : loaded_group.end],
-                    index=df.index,
+                    labels[loaded_group.start : loaded_group.end],
                 )
-            df["centroid"] = labels[loaded_group.start : loaded_group.end]
-            # Assign distances using the fitted cluster centers
-            df = self._assign_distances(df, self.embedding_field, self.kmeans.cluster_centers_)
-            df = self._encode_embeddings_for_write(df, self.embedding_field)
-
-            output_filename = f"{tasks[0].task_id}_{i}"
-            # Write results for this subgroup
-            self.write_parquet(
-                df,
-                self.output_path,
-                partition_file_name=f"{output_filename}.parquet",
-                partition_cols=["centroid"],
-                index=False,
-                storage_options=self.output_storage_options,
-                **self.write_kwargs,
-            )
-
-            # Create result task for this subgroup
-            results.append(
-                EmptyTask(
-                    dataset_name=f"kmeans_group_{i}",
-                    _metadata=None,
-                    _stage_perf=[],
-                    data=None,
+                results.append(
+                    EmptyTask(
+                        dataset_name=f"kmeans_group_{i}",
+                        _metadata=None,
+                        _stage_perf=[],
+                        data=None,
+                    )
                 )
-            )
 
         t3 = time.perf_counter()
         self._log_metric("kmeans_write_time", t3 - t2)
@@ -499,40 +488,28 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         pass2_read_time = 0.0
         total_rows = 0
 
-        for i, group in enumerate(groups):
-            t_read_start = time.perf_counter()
-            df = self._read_group(group, [self.id_field, self.embedding_field, *self.metadata_fields])
-            df = self.normalize_embeddings_col_in_df(df, self.embedding_field)
-            embeddings_array = get_array_from_df(df, self.embedding_field)
-            pass2_read_time += time.perf_counter() - t_read_start
-            total_rows += len(df)
+        with self._create_dataset_writer(tasks) as writer:
+            for i, group in enumerate(groups):
+                t_read_start = time.perf_counter()
+                df = self._read_group(group, [self.id_field, self.embedding_field, *self.metadata_fields])
+                df = self.normalize_embeddings_col_in_df(df, self.embedding_field)
+                embeddings_array = get_array_from_df(df, self.embedding_field)
+                pass2_read_time += time.perf_counter() - t_read_start
+                total_rows += len(df)
 
-            labels = self.kmeans.predict(embeddings_array, convert_dtype=False).astype(cp.int32)
-            df["centroid"] = labels
-            df = self._assign_distances(df, self.embedding_field, self.kmeans.cluster_centers_)
-            df = self._encode_embeddings_for_write(df, self.embedding_field)
-
-            output_filename = f"{tasks[0].task_id}_{i}"
-            self.write_parquet(
-                df,
-                self.output_path,
-                partition_file_name=f"{output_filename}.parquet",
-                partition_cols=["centroid"],
-                index=False,
-                storage_options=self.output_storage_options,
-                **self.write_kwargs,
-            )
-            results.append(
-                EmptyTask(
-                    dataset_name=f"kmeans_group_{i}",
-                    _metadata=None,
-                    _stage_perf=[],
-                    data=None,
+                labels = self.kmeans.predict(embeddings_array, convert_dtype=False).astype(cp.int32)
+                self._write_partitioned_batches(writer, df, embeddings_array, labels)
+                results.append(
+                    EmptyTask(
+                        dataset_name=f"kmeans_group_{i}",
+                        _metadata=None,
+                        _stage_perf=[],
+                        data=None,
+                    )
                 )
-            )
 
-            del df, embeddings_array, labels
-            gc.collect()
+                del df, embeddings_array, labels
+                gc.collect()
 
         t_end = time.perf_counter()
         self._log_metric("kmeans_predict_write_time", (t_end - t_start) - pass2_read_time)
@@ -583,6 +560,43 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         fp16_bits = embeddings.astype(cp.float16).view(cp.uint16)
         df[embedding_col] = create_list_series_from_1d_or_2d_ar(fp16_bits, index=df.index)
         return df
+
+    def _create_dataset_writer(self, tasks: list[FileGroupTask]) -> ParquetDatasetWriter:
+        """Create one incremental partitioned writer per KMeans actor."""
+        supported_kwargs = {"compression", "statistics"}
+        unsupported_kwargs = set(self.write_kwargs).difference(supported_kwargs)
+        if unsupported_kwargs:
+            msg = f"Chunked KMeans output does not support write kwargs {sorted(unsupported_kwargs)}"
+            raise ValueError(msg)
+        return ParquetDatasetWriter(
+            self.output_path,
+            partition_cols=["centroid"],
+            index=False,
+            file_name_prefix=f"{tasks[0].task_id}.parquet",
+            storage_options=self.output_storage_options,
+            **self.write_kwargs,
+        )
+
+    def _write_partitioned_batches(
+        self,
+        writer: ParquetDatasetWriter,
+        source_frame: "cudf.DataFrame",
+        embeddings: "cp.ndarray",
+        labels: "cp.ndarray",
+    ) -> None:
+        """Materialize distances and encoded embeddings in bounded row batches."""
+        for start in range(0, len(source_frame), self.write_batch_size):
+            end = min(start + self.write_batch_size, len(source_frame))
+            frame = source_frame.iloc[start:end].copy(deep=False)
+            frame[self.embedding_field] = create_list_series_from_1d_or_2d_ar(
+                embeddings[start:end],
+                index=frame.index,
+            )
+            frame["centroid"] = labels[start:end]
+            frame = self._assign_distances(frame, self.embedding_field, self.kmeans.cluster_centers_)
+            frame = self._encode_embeddings_for_write(frame, self.embedding_field)
+            writer.write_table(frame)
+            del frame
 
     @staticmethod
     def _assign_distances(df: "cudf.DataFrame", embedding_col: str, centroids: "cp.ndarray") -> "cudf.DataFrame":
@@ -638,6 +652,7 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
     max_samples_per_batch: int = 1 << 15
     fit_data_fraction: float | None = None
     output_embedding_dtype: Literal["float16", "float32"] = "float16"
+    write_batch_size: int = 100_000
     cache_path: str | None = None
     """KMeans clustering stage that requires RAFT for distributed processing.
 
@@ -662,6 +677,7 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
         max_samples_per_batch (int): The number of data samples to use for batches of the pairwise distance computation. This computation is done throughout both fit predict. The default should suit most cases. The total number of elements in the batched pairwise distance computation is max_samples_per_batch * n_clusters. It might become necessary to lower this number when n_clusters becomes prohibitively large.
         fit_data_fraction (float | None): Fraction of the dataset (in (0, 1)) used to fit the KMeans model. Pass None to fit on the full dataset (single-pass mode). Sampling is done at the file level: each actor draws `round(fit_data_fraction x num_actor_files)` of its files (floor of 1) for the fit. When set, uses a two-pass approach: Pass 1 reads only the embedding column from the sampled files (so IO and GPU memory in Pass 1 scale with the fraction); Pass 2 then loads each (full) original group one at a time to predict labels and write results. This dramatically reduces peak GPU memory for large datasets. If None, all rows are loaded simultaneously.
         output_embedding_dtype: Storage dtype for normalized embeddings written after KMeans. Defaults to FP16 encoded as uint16 bits.
+        write_batch_size: Maximum rows to materialize and write at once.
         cache_path (str | None): The path to save the centroids to. If None, the centroids will not be saved.
     """
 
@@ -675,6 +691,9 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
             raise ValueError(msg)
         if self.output_embedding_dtype not in {"float16", "float32"}:
             msg = f"Unsupported output_embedding_dtype: {self.output_embedding_dtype}"
+            raise ValueError(msg)
+        if self.write_batch_size <= 0:
+            msg = f"write_batch_size must be positive, got {self.write_batch_size}"
             raise ValueError(msg)
 
     def decompose(self) -> list[ProcessingStage]:
@@ -706,6 +725,7 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
                 max_samples_per_batch=self.max_samples_per_batch,
                 fit_data_fraction=self.fit_data_fraction,
                 output_embedding_dtype=self.output_embedding_dtype,
+                write_batch_size=self.write_batch_size,
                 read_kwargs=self.read_kwargs,
                 write_kwargs=self.write_kwargs,
                 cache_path=self.cache_path,
