@@ -95,6 +95,28 @@ def _patch_context(
     return parent, child, process
 
 
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({}, ray_cluster.RayClient),
+        ({"SLURM_JOB_NUM_NODES": "1"}, ray_cluster.RayClient),
+        ({"SLURM_JOB_NUM_NODES": "2"}, ray_cluster.SlurmRayClient),
+        ({"SLURM_NNODES": "4"}, ray_cluster.SlurmRayClient),
+    ],
+)
+def test_ray_client_class_follows_slurm_node_count(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+    expected: type,
+) -> None:
+    monkeypatch.delenv("SLURM_JOB_NUM_NODES", raising=False)
+    monkeypatch.delenv("SLURM_NNODES", raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    assert ray_cluster._ray_client_class() is expected
+
+
 def test_get_ray_cluster_data_returns_child_result(monkeypatch: pytest.MonkeyPatch) -> None:
     parent, child, process = _patch_context(
         monkeypatch,

@@ -28,7 +28,7 @@ import ray
 from loguru import logger
 from runner.utils import get_shm_usage
 
-from nemo_curator.core.client import RayClient
+from nemo_curator.core.client import RayClient, SlurmRayClient
 from nemo_curator.core.utils import check_ray_responsive
 
 ray_client_start_timeout_s = 30
@@ -37,6 +37,12 @@ ray_cluster_data_timeout_s = 120
 
 
 _RAY_CLEANUP_WAIT_S = 10
+
+
+def _ray_client_class() -> type[RayClient]:
+    """Select the multi-node client only for a multi-node Slurm step."""
+    slurm_num_nodes = int(os.environ.get("SLURM_JOB_NUM_NODES", os.environ.get("SLURM_NNODES", "1")))
+    return SlurmRayClient if slurm_num_nodes > 1 else RayClient
 
 
 def _wait_for_ray_cleanup() -> None:
@@ -87,7 +93,7 @@ def setup_ray_cluster_and_env(  # noqa: PLR0913
             ray_stdouterr_capture_file = f"{ray_log_path!s}-{retries + 1}"
 
         # Create and start the Ray client
-        client = RayClient(
+        client = _ray_client_class()(
             ray_temp_dir=str(short_temp_path),
             include_dashboard=include_dashboard,
             num_gpus=num_gpus,
