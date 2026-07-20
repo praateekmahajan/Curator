@@ -87,6 +87,7 @@ def setup_ray_cluster_and_env(  # noqa: PLR0913
     client = None
     while not responsive and retries < max_retries:
         logger.info(f"Starting Ray cluster (attempt {retries + 1} of {max_retries})...")
+        external_ray_address = os.environ.get("RAY_ADDRESS")
 
         # Capture the ray cluster output for each attempt to start it using a unique file name
         if ray_log_path and retries > 0:
@@ -106,7 +107,12 @@ def setup_ray_cluster_and_env(  # noqa: PLR0913
 
         try:
             client.start()
-            _ensure_ray_client_process_started(client, ray_client_start_timeout_s, ray_client_start_poll_interval_s)
+            _ensure_ray_client_started(
+                client,
+                external_ray_address,
+                ray_client_start_timeout_s,
+                ray_client_start_poll_interval_s,
+            )
             responsive = True
         except Exception:
             logger.exception(f"Ray cluster start failed on attempt {retries + 1}")
@@ -126,7 +132,10 @@ def setup_ray_cluster_and_env(  # noqa: PLR0913
         msg = f"Failed to start Ray cluster after {max_retries} attempts"
         raise RuntimeError(msg)
 
-    logger.info(f"RayClient started successfully: pid={client.ray_process.pid}, port={client.ray_port}")
+    if client.ray_process is None:
+        logger.info(f"Connected to externally managed Ray cluster at {os.environ.get('RAY_ADDRESS')}")
+    else:
+        logger.info(f"RayClient started successfully: pid={client.ray_process.pid}, port={client.ray_port}")
     return client, short_temp_path
 
 
@@ -224,6 +233,21 @@ def _ensure_ray_client_process_started(client: RayClient, timeout_s: int, poll_i
     if client.ray_process is None:
         msg = f"Ray client process failed to start in {timeout_s} seconds"
         raise RuntimeError(msg)
+
+
+def _ensure_ray_client_started(
+    client: RayClient,
+    external_ray_address: str | None,
+    timeout_s: int,
+    poll_interval_s: float,
+) -> None:
+    """Validate either an externally managed cluster or a new client process."""
+    if external_ray_address:
+        if not check_ray_responsive():
+            msg = f"Existing Ray cluster at {external_ray_address} is not responsive"
+            raise RuntimeError(msg)
+        return
+    _ensure_ray_client_process_started(client, timeout_s, poll_interval_s)
 
 
 def _copy_item_safely(src_path: Path, dst_path: Path) -> None:

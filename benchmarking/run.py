@@ -18,6 +18,7 @@ import json
 import os
 import pickle
 import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -295,7 +296,12 @@ def run_entry(  # noqa: PLR0913
             shutil.rmtree(scratch_path, ignore_errors=True)
 
 
-def main() -> int:  # noqa: C901, PLR0912, PLR0915
+def main() -> int:  # noqa: C901, PLR0911, PLR0912, PLR0915
+    slurm_num_nodes = int(os.environ.get("SLURM_JOB_NUM_NODES", os.environ.get("SLURM_NNODES", "1")))
+    if slurm_num_nodes > 1 and os.environ.get("SLURM_NODEID") is not None and not os.environ.get("RAY_ADDRESS"):
+        slurm_runner = _this_script_dir / "semdedup/slurm_run.py"
+        return subprocess.run([sys.executable, str(slurm_runner), *sys.argv[1:]], check=False).returncode  # noqa: S603
+
     parser = argparse.ArgumentParser(description="Runs the benchmarking application")
     parser.add_argument(
         "--config",
