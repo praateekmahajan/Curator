@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Literal
 
 import cupy as cp
@@ -25,6 +26,8 @@ import pyarrow.parquet as pq
 from fsspec.parquet import open_parquet_file
 from loguru import logger
 
+PARQUET_FOOTER_READ_WORKERS = 8
+
 
 def get_array_from_df(df: "cudf.DataFrame", embedding_col: str) -> "cp.ndarray":
     """
@@ -35,11 +38,31 @@ def get_array_from_df(df: "cudf.DataFrame", embedding_col: str) -> "cp.ndarray":
 
 def get_parquet_num_rows_by_file(files: list[str], storage_options: dict[str, Any] | None = None) -> dict[str, int]:
     """Return exact row counts keyed by Parquet file from footer metadata."""
-    rows_by_file = {}
-    for file in files:
+    if not files:
+        return {}
+
+    if not storage_options:
+        import pylibcudf as plc
+
+        metadata = plc.io.parquet_metadata.read_parquet_metadata(plc.io.SourceInfo(files))
+        row_groups_per_file = metadata.num_rowgroups_per_file()
+        row_group_metadata = metadata.rowgroup_metadata()
+        row_counts = []
+        offset = 0
+        for num_row_groups in row_groups_per_file:
+            end = offset + num_row_groups
+            row_counts.append(sum(group["num_rows"] for group in row_group_metadata[offset:end]))
+            offset = end
+        return dict(zip(files, row_counts, strict=True))
+
+    def read_num_rows(file: str) -> int:
         with open_parquet_file(file, storage_options=storage_options) as f:
-            rows_by_file[file] = pq.read_metadata(f).num_rows
-    return rows_by_file
+            return pq.read_metadata(f).num_rows
+
+    max_workers = min(PARQUET_FOOTER_READ_WORKERS, len(files))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        row_counts = executor.map(read_num_rows, files)
+        return dict(zip(files, row_counts, strict=True))
 
 
 def get_parquet_num_rows(files: list[str], storage_options: dict[str, Any] | None = None) -> int:
