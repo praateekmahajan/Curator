@@ -34,6 +34,20 @@ from nemo_curator.stages.deduplication.semantic.kmeans import KMeansStage
 from nemo_curator.tasks.utils import TaskPerfUtils
 
 
+def _write_batch_size(value: str) -> int | str:
+    if value == "auto":
+        return value
+    try:
+        batch_size = int(value)
+    except ValueError as error:
+        msg = "write batch size must be a positive integer or 'auto'"
+        raise argparse.ArgumentTypeError(msg) from error
+    if batch_size <= 0:
+        msg = "write batch size must be positive"
+        raise argparse.ArgumentTypeError(msg)
+    return batch_size
+
+
 def _input_files(input_path: Path, input_file_limit: int | None) -> list[str]:
     files = sorted(str(path) for path in input_path.rglob("*.parquet"))
     if not files:
@@ -166,7 +180,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--oversampling-factor", type=float, default=2.0)
     parser.add_argument("--max-samples-per-batch", type=int, default=32768)
     parser.add_argument("--output-embedding-dtype", choices=["float16", "float32"], default="float16")
-    parser.add_argument("--write-batch-size", type=int, default=100_000)
+    parser.add_argument("--write-batch-size", type=_write_batch_size, default="auto")
     return parser
 
 

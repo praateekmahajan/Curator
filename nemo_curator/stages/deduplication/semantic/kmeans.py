@@ -21,6 +21,7 @@ from cudf.io.parquet import ParquetDatasetWriter
 
 from nemo_curator.backends.base import WorkerMetadata
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
+from nemo_curator.stages.deduplication.gpu_utils import get_device_memory_info
 from nemo_curator.stages.deduplication.io_utils import DeduplicationIO
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
 from nemo_curator.stages.resources import Resources
@@ -28,7 +29,7 @@ from nemo_curator.stages.text.embedders.utils import create_list_series_from_1d_
 from nemo_curator.tasks import EmptyTask, FileGroupTask
 from nemo_curator.utils.file_utils import check_disallowed_kwargs, get_default_file_extensions
 
-from .utils import break_parquet_partition_into_groups, get_array_from_df, get_parquet_num_rows
+from .utils import break_parquet_partition_into_groups, get_array_from_df, get_parquet_num_rows_by_file
 
 if TYPE_CHECKING:
     import cudf
@@ -43,6 +44,13 @@ from loguru import logger
 # Column names
 L2_DIST_TO_CENT_COL = "l2_dist_to_cent"
 COSINE_DIST_TO_CENT_COL = "cosine_dist_to_cent"
+
+# cuDF columns use a 32-bit size type. Keep list child columns below this
+# conservative element count when reading or writing embeddings.
+CUDF_LIST_COLUMN_MAX_ELEMENTS = 2_000_000_000
+AUTO_WRITE_TARGET_MEMORY_FRACTION = 0.80
+AUTO_WRITE_BYTES_PER_EMBEDDING_ELEMENT = 24
+AUTO_WRITE_FIXED_BYTES_PER_ROW = 128
 
 
 @dataclass
@@ -75,7 +83,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         max_samples_per_batch: int = 1 << 15,
         fit_data_fraction: float | None = None,
         output_embedding_dtype: Literal["float16", "float32"] = "float16",
-        write_batch_size: int = 100_000,
+        write_batch_size: int | Literal["auto"] = "auto",
         # I/O args
         cache_path: str | None = None,
         read_kwargs: dict[dict] | None = None,
@@ -100,7 +108,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             max_samples_per_batch (int): The number of data samples to use for batches of the pairwise distance computation. This computation is done throughout both fit predict. The default should suit most cases. The total number of elements in the batched pairwise distance computation is max_samples_per_batch * n_clusters. It might become necessary to lower this number when n_clusters becomes prohibitively large.
             fit_data_fraction (float | None): Fraction of the dataset (in (0, 1)) used to fit the KMeans model. Pass None to fit on the full dataset (single-pass mode). Sampling is done at the file level: each actor draws `round(fit_data_fraction x num_actor_files)` of its files (floor of 1) for the fit. When set, uses a two-pass approach: Pass 1 reads only the embedding column from the sampled files (so IO and GPU memory in Pass 1 scale with the fraction); Pass 2 then loads each (full) original group one at a time to predict labels and write results. This dramatically reduces peak GPU memory for large datasets. If None, all rows are loaded simultaneously.
             output_embedding_dtype: Storage dtype for normalized embeddings written after KMeans. FP16 is encoded as uint16 bit patterns for cuDF compatibility.
-            write_batch_size: Maximum rows to materialize and send to the partitioned Parquet writer at once.
+            write_batch_size: Maximum rows to materialize and send to the partitioned Parquet writer at once. ``"auto"`` sizes each group from the actor GPU's live memory and embedding width.
             cache_path (str | None): The path to save the centroids to. If None, the centroids will not be saved.
             read_kwargs (dict[dict]): Keyword arguments for the read stage.
             write_kwargs (dict[dict]): Keyword arguments for the write stage.
@@ -128,7 +136,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             msg = f"Unsupported output_embedding_dtype: {output_embedding_dtype}"
             raise ValueError(msg)
         self.output_embedding_dtype = output_embedding_dtype
-        if write_batch_size <= 0:
+        if write_batch_size != "auto" and (not isinstance(write_batch_size, int) or write_batch_size <= 0):
             msg = f"write_batch_size must be positive, got {write_batch_size}"
             raise ValueError(msg)
         self.write_batch_size = write_batch_size
@@ -172,10 +180,15 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
 
         # Break files into subgroups to avoid cudf row limits
         if self.filetype == "parquet":
+            self._parquet_rows_by_file = get_parquet_num_rows_by_file(
+                all_files,
+                storage_options=self.input_storage_options,
+            )
             groups = break_parquet_partition_into_groups(
                 all_files,
                 embedding_dim=self.embedding_dim,
                 storage_options=self.input_storage_options,
+                rows_by_file=self._parquet_rows_by_file,
             )
         elif self.filetype == "jsonl":
             # For JSONL files, just group all files together since we can't easily estimate size
@@ -286,10 +299,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         """Load multiple Parquet groups into one runtime-sized array."""
 
         remaining_files = [file for group in groups[1:] for file in group]
-        row_capacity = len(first_frame) + get_parquet_num_rows(
-            remaining_files,
-            storage_options=self.input_storage_options,
-        )
+        row_capacity = len(first_frame) + sum(self._parquet_rows_by_file[file] for file in remaining_files)
         embedding_width = first_embeddings.shape[1]
         embeddings = cp.empty((row_capacity, embedding_width), dtype=cp.float32)
         loaded_groups: list[_LoadedGroup] = []
@@ -433,7 +443,12 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         fit_files = rng.sample(all_files, n_files)
 
         if self.filetype == "parquet":
-            fit_groups = break_parquet_partition_into_groups(fit_files, embedding_dim=self.embedding_dim)
+            fit_groups = break_parquet_partition_into_groups(
+                fit_files,
+                embedding_dim=self.embedding_dim,
+                storage_options=self.input_storage_options,
+                rows_by_file=self._parquet_rows_by_file,
+            )
         else:  # jsonl
             fit_groups = [fit_files]
 
@@ -585,8 +600,9 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         labels: "cp.ndarray",
     ) -> None:
         """Materialize distances and encoded embeddings in bounded row batches."""
-        for start in range(0, len(source_frame), self.write_batch_size):
-            end = min(start + self.write_batch_size, len(source_frame))
+        write_batch_size = self._resolve_write_batch_size(embeddings.shape[1])
+        for start in range(0, len(source_frame), write_batch_size):
+            end = min(start + write_batch_size, len(source_frame))
             frame = source_frame.iloc[start:end].copy(deep=False)
             frame[self.embedding_field] = create_list_series_from_1d_or_2d_ar(
                 embeddings[start:end],
@@ -597,6 +613,33 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             frame = self._encode_embeddings_for_write(frame, self.embedding_field)
             writer.write_table(frame)
             del frame
+
+    def _resolve_write_batch_size(self, embedding_width: int) -> int:
+        """Bound a write batch by cuDF's size type and the actor's live memory."""
+        list_column_limit = max(1, CUDF_LIST_COLUMN_MAX_ELEMENTS // embedding_width)
+        if self.write_batch_size != "auto":
+            return min(self.write_batch_size, list_column_limit)
+
+        memory_info = get_device_memory_info()
+        if memory_info is None:
+            fallback = min(100_000, list_column_limit)
+            logger.warning(f"Could not query GPU memory; using write_batch_size={fallback}")
+            return fallback
+
+        free_memory, total_memory = memory_info
+        used_memory = total_memory - free_memory
+        target_headroom = max(0, int(total_memory * AUTO_WRITE_TARGET_MEMORY_FRACTION) - used_memory)
+        estimated_bytes_per_row = (
+            AUTO_WRITE_BYTES_PER_EMBEDDING_ELEMENT * embedding_width + AUTO_WRITE_FIXED_BYTES_PER_ROW
+        )
+        memory_limit = max(1, target_headroom // estimated_bytes_per_row)
+        batch_size = min(list_column_limit, memory_limit)
+        logger.info(
+            f"Auto write batch size: {batch_size} rows "
+            f"(embedding_width={embedding_width}, free={free_memory}, total={total_memory}, "
+            f"list_column_limit={list_column_limit})"
+        )
+        return batch_size
 
     @staticmethod
     def _assign_distances(df: "cudf.DataFrame", embedding_col: str, centroids: "cp.ndarray") -> "cudf.DataFrame":
@@ -652,7 +695,7 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
     max_samples_per_batch: int = 1 << 15
     fit_data_fraction: float | None = None
     output_embedding_dtype: Literal["float16", "float32"] = "float16"
-    write_batch_size: int = 100_000
+    write_batch_size: int | Literal["auto"] = "auto"
     cache_path: str | None = None
     """KMeans clustering stage that requires RAFT for distributed processing.
 
@@ -677,7 +720,7 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
         max_samples_per_batch (int): The number of data samples to use for batches of the pairwise distance computation. This computation is done throughout both fit predict. The default should suit most cases. The total number of elements in the batched pairwise distance computation is max_samples_per_batch * n_clusters. It might become necessary to lower this number when n_clusters becomes prohibitively large.
         fit_data_fraction (float | None): Fraction of the dataset (in (0, 1)) used to fit the KMeans model. Pass None to fit on the full dataset (single-pass mode). Sampling is done at the file level: each actor draws `round(fit_data_fraction x num_actor_files)` of its files (floor of 1) for the fit. When set, uses a two-pass approach: Pass 1 reads only the embedding column from the sampled files (so IO and GPU memory in Pass 1 scale with the fraction); Pass 2 then loads each (full) original group one at a time to predict labels and write results. This dramatically reduces peak GPU memory for large datasets. If None, all rows are loaded simultaneously.
         output_embedding_dtype: Storage dtype for normalized embeddings written after KMeans. Defaults to FP16 encoded as uint16 bits.
-        write_batch_size: Maximum rows to materialize and write at once.
+        write_batch_size: Maximum rows to materialize and write at once. ``"auto"`` sizes each group from the actor GPU's live memory and embedding width.
         cache_path (str | None): The path to save the centroids to. If None, the centroids will not be saved.
     """
 
@@ -692,7 +735,9 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
         if self.output_embedding_dtype not in {"float16", "float32"}:
             msg = f"Unsupported output_embedding_dtype: {self.output_embedding_dtype}"
             raise ValueError(msg)
-        if self.write_batch_size <= 0:
+        if self.write_batch_size != "auto" and (
+            not isinstance(self.write_batch_size, int) or self.write_batch_size <= 0
+        ):
             msg = f"write_batch_size must be positive, got {self.write_batch_size}"
             raise ValueError(msg)
 

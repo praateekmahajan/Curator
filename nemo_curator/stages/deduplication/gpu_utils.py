@@ -23,17 +23,25 @@ def align_down_to_256(memory_size: int) -> int:
     return (memory_size // 256) * 256
 
 
-def get_device_free_memory() -> int | None:
-    """
-    Return total memory of the first GPU the caller has access to.
-    Returns None if the GPU is not available or information could not be retrieved.
-    """
+def get_device_memory_info() -> tuple[int, int] | None:
+    """Return ``(free, total)`` bytes for the first GPU available to the caller."""
     try:
         index = int(ray.get_gpu_ids()[0]) if ray.is_initialized() else 0
     except IndexError:
         return None
     try:
         handle = pynvml.nvmlDeviceGetHandleByIndex(index)
-        return pynvml.nvmlDeviceGetMemoryInfo(handle).free
+        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
     except pynvml.NVMLError:
         return None
+    else:
+        return info.free, info.total
+
+
+def get_device_free_memory() -> int | None:
+    """
+    Return free memory of the first GPU the caller has access to.
+    Returns None if the GPU is not available or information could not be retrieved.
+    """
+    memory_info = get_device_memory_info()
+    return memory_info[0] if memory_info is not None else None
