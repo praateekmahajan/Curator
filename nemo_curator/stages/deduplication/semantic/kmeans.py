@@ -23,6 +23,7 @@ import numpy as np
 from cudf.io.parquet import ParquetDatasetWriter
 
 from nemo_curator.backends.base import WorkerMetadata
+from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.deduplication.gpu_utils import get_device_memory_info
 from nemo_curator.stages.deduplication.io_utils import DeduplicationIO
@@ -54,6 +55,7 @@ CUDF_LIST_COLUMN_MAX_ELEMENTS = 2_000_000_000
 AUTO_WRITE_TARGET_MEMORY_FRACTION = 0.80
 AUTO_WRITE_BYTES_PER_EMBEDDING_ELEMENT = 24
 AUTO_WRITE_FIXED_BYTES_PER_ROW = 128
+CENTROID_ARRAY_NDIM = 2
 
 
 @dataclass
@@ -254,10 +256,15 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         if not tasks:
             return []
 
-        # Collect all files from all tasks
-        all_files = [file for task in tasks for file in task.data]
+        groups = self._group_input_files(tasks)
 
-        # Break files into subgroups to avoid cudf row limits
+        if self.fit_data_fraction is not None:
+            return self._process_batch_two_pass(tasks, groups)
+        return self._process_batch_single_pass(tasks, groups)
+
+    def _group_input_files(self, tasks: list[FileGroupTask]) -> list[list[str]]:
+        """Group task files into reads that stay below cuDF column limits."""
+        all_files = [file for task in tasks for file in task.data]
         if self.filetype == "parquet":
             footer_scan_start = time.perf_counter()
             self._parquet_rows_by_file = get_parquet_num_rows_by_file(
@@ -279,10 +286,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         else:
             msg = f"Unsupported filetype: {self.filetype}. Only jsonl and parquet are supported."
             raise ValueError(msg)
-
-        if self.fit_data_fraction is not None:
-            return self._process_batch_two_pass(tasks, groups)
-        return self._process_batch_single_pass(tasks, groups)
+        return groups
 
     def _read_group(self, group: list[str], columns: list[str]) -> "cudf.DataFrame":
         """Read a group of files into a cudf DataFrame."""
@@ -620,7 +624,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
                 total_rows += len(df)
 
                 predict_start = time.perf_counter()
-                labels = self.kmeans.predict(embeddings_array, convert_dtype=False).astype(cp.int32)
+                labels = self._predict_labels(embeddings_array)
                 predict_time += time.perf_counter() - predict_start
 
                 write_start = time.perf_counter()
@@ -664,6 +668,12 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         )
 
         return results, pass2_read_time, total_rows
+
+    def _predict_labels(self, embeddings: "cp.ndarray") -> "cp.ndarray":
+        from cuml import using_output_type
+
+        with using_output_type("cupy"):
+            return self.kmeans.predict(embeddings, convert_dtype=False).astype(cp.int32)
 
     def _read_prediction_group(self, group: list[str]) -> tuple["cudf.DataFrame", float]:
         read_start = time.perf_counter()
@@ -753,7 +763,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
                 index=frame.index,
             )
             frame["centroid"] = labels[start:end]
-            frame = self._assign_distances(frame, self.embedding_field, self.kmeans.cluster_centers_)
+            frame = self._assign_distances(frame, self.embedding_field, self._cluster_centers())
             frame = self._encode_embeddings_for_write(frame, self.embedding_field)
             writer.write_table(frame)
             del frame
@@ -785,6 +795,9 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         )
         return batch_size
 
+    def _cluster_centers(self) -> "cp.ndarray":
+        return self.kmeans.cluster_centers_
+
     @staticmethod
     def _assign_distances(df: "cudf.DataFrame", embedding_col: str, centroids: "cp.ndarray") -> "cudf.DataFrame":
         """
@@ -810,6 +823,138 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         return {
             "is_raft_actor": True,
         }
+
+
+class KMeansPredictWriteStage(KMeansReadFitWriteStage):
+    """Predict centroids and write file-task batches without a RAFT collective.
+
+    Each Ray Data worker loads the saved centroids once during setup, then streams
+    its assigned file batches through the existing bounded reader and rolling
+    Parquet writer. Input embeddings remain local to the worker GPU.
+    """
+
+    def __init__(  # noqa: PLR0913
+        self,
+        id_field: str,
+        embedding_field: str,
+        output_path: str,
+        centroids_path: str,
+        filetype: Literal["parquet", "jsonl"] = "parquet",
+        metadata_fields: list[str] | None = None,
+        embedding_dim: int | None = None,
+        max_samples_per_batch: int = 1 << 15,
+        output_embedding_dtype: Literal["float16", "float32"] = "float16",
+        write_batch_size: int | Literal["auto"] = "auto",
+        max_output_file_size: int | None = None,
+        prefetch_next_group: bool = False,
+        task_batch_size: int = 1,
+        gpu_fraction: float = 1.0,
+        worker_count: int | None = None,
+        read_kwargs: dict[dict] | None = None,
+        write_kwargs: dict[dict] | None = None,
+    ) -> None:
+        if task_batch_size <= 0:
+            msg = f"task_batch_size must be positive, got {task_batch_size}"
+            raise ValueError(msg)
+        if not 0.0 < gpu_fraction <= 1.0:
+            msg = f"gpu_fraction must be in (0, 1], got {gpu_fraction}"
+            raise ValueError(msg)
+        if worker_count is not None and worker_count <= 0:
+            msg = f"worker_count must be positive, got {worker_count}"
+            raise ValueError(msg)
+
+        self.centroids_path = centroids_path
+        super().__init__(
+            id_field=id_field,
+            embedding_field=embedding_field,
+            output_path=output_path,
+            filetype=filetype,
+            n_clusters=1,  # Replaced from the centroid array during setup.
+            metadata_fields=metadata_fields,
+            embedding_dim=embedding_dim,
+            max_samples_per_batch=max_samples_per_batch,
+            fit_data_fraction=None,
+            output_embedding_dtype=output_embedding_dtype,
+            write_batch_size=write_batch_size,
+            max_output_file_size=max_output_file_size,
+            prefetch_next_group=prefetch_next_group,
+            read_kwargs=read_kwargs,
+            write_kwargs=write_kwargs,
+        )
+        self.name = "KMeansPredictWriteStage"
+        self.resources = Resources(cpus=1.0, gpus=gpu_fraction)
+        self.batch_size = task_batch_size
+        self.worker_count = worker_count
+
+    def setup(self, _: WorkerMetadata | None = None) -> None:
+        centroids = cp.load(self.centroids_path)
+        if centroids.ndim != CENTROID_ARRAY_NDIM or centroids.shape[0] == 0 or centroids.shape[1] == 0:
+            msg = f"Expected a non-empty 2D centroid array, got shape={centroids.shape}"
+            raise ValueError(msg)
+        if centroids.dtype != cp.float32:
+            centroids = centroids.astype(cp.float32)
+
+        self.n_clusters = int(centroids.shape[0])
+        self._centroid_embedding_width = int(centroids.shape[1])
+        self._centroids = cp.ascontiguousarray(centroids)
+        logger.info(
+            f"Loaded {self.n_clusters} centroids with embedding width {centroids.shape[1]} from {self.centroids_path}"
+        )
+
+    def _predict_labels(self, embeddings: "cp.ndarray") -> "cp.ndarray":
+        from cuml.metrics import pairwise_distances
+
+        if embeddings.shape[1] != self._centroid_embedding_width:
+            msg = (
+                f"Input embedding width {embeddings.shape[1]} does not match centroid width "
+                f"{self._centroid_embedding_width}"
+            )
+            raise ValueError(msg)
+        labels = cp.empty(len(embeddings), dtype=cp.int32)
+        for start in range(0, len(embeddings), self.max_samples_per_batch):
+            end = min(start + self.max_samples_per_batch, len(embeddings))
+            distances = pairwise_distances(
+                embeddings[start:end],
+                self._centroids,
+                metric="sqeuclidean",
+                convert_dtype=False,
+            )
+            labels[start:end] = cp.argmin(distances, axis=1).astype(cp.int32)
+            del distances
+        return labels
+
+    def _cluster_centers(self) -> "cp.ndarray":
+        return self._centroids
+
+    def process_batch(self, tasks: list[FileGroupTask]) -> list[EmptyTask]:
+        if len(tasks) == 0:
+            return []
+
+        groups = self._group_input_files(tasks)
+        _, read_time, total_rows = self._predict_write_pass(tasks, groups)
+        self._log_metrics(
+            {
+                "kmeans_read_time": read_time,
+                "kmeans_predict_read_time": read_time,
+                "num_rows": total_rows,
+            }
+        )
+        # The stage is a sink: output Parquet files are the materialized result.
+        # Emit one completion task per input batch so batch metrics are not
+        # duplicated when a batch is split into multiple cuDF-safe groups.
+        return [EmptyTask(dataset_name=tasks[0].dataset_name)]
+
+    def ray_stage_spec(self) -> dict[str, Any]:
+        """This prediction-only stage does not participate in a RAFT collective."""
+        # Input tasks contain only file paths, so spreading actors across nodes
+        # improves I/O concurrency without moving materialized data.
+        return {
+            RayStageSpecKeys.MAX_TASKS_IN_FLIGHT_PER_ACTOR: 1,
+            RayStageSpecKeys.RAY_REMOTE_ARGS: {"scheduling_strategy": "SPREAD"},
+        }
+
+    def num_workers(self) -> int | None:
+        return self.worker_count
 
 
 @dataclass
