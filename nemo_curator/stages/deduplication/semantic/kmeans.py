@@ -180,10 +180,14 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
 
         # Break files into subgroups to avoid cudf row limits
         if self.filetype == "parquet":
+            footer_scan_start = time.perf_counter()
             self._parquet_rows_by_file = get_parquet_num_rows_by_file(
                 all_files,
                 storage_options=self.input_storage_options,
             )
+            footer_scan_time = time.perf_counter() - footer_scan_start
+            self._log_metric("kmeans_footer_scan_time", footer_scan_time)
+            logger.info(f"Parquet footer scan time: {footer_scan_time:.2f} seconds for {len(all_files)} files")
             groups = break_parquet_partition_into_groups(
                 all_files,
                 embedding_dim=self.embedding_dim,
@@ -406,6 +410,8 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         self._log_metrics(
             {
                 "kmeans_read_time": pass1_read_time + pass2_read_time,
+                "kmeans_fit_read_time": pass1_read_time,
+                "kmeans_predict_read_time": pass2_read_time,
                 "num_rows": total_rows,
             }
         )
@@ -501,9 +507,14 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         t_start = time.perf_counter()
         results: list[EmptyTask] = []
         pass2_read_time = 0.0
+        predict_time = 0.0
+        write_time = 0.0
+        cleanup_time = 0.0
+        writer_close_time = 0.0
         total_rows = 0
 
-        with self._create_dataset_writer(tasks) as writer:
+        writer = self._create_dataset_writer(tasks)
+        try:
             for i, group in enumerate(groups):
                 t_read_start = time.perf_counter()
                 df = self._read_group(group, [self.id_field, self.embedding_field, *self.metadata_fields])
@@ -512,8 +523,13 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
                 pass2_read_time += time.perf_counter() - t_read_start
                 total_rows += len(df)
 
+                predict_start = time.perf_counter()
                 labels = self.kmeans.predict(embeddings_array, convert_dtype=False).astype(cp.int32)
+                predict_time += time.perf_counter() - predict_start
+
+                write_start = time.perf_counter()
                 self._write_partitioned_batches(writer, df, embeddings_array, labels)
+                write_time += time.perf_counter() - write_start
                 results.append(
                     EmptyTask(
                         dataset_name=f"kmeans_group_{i}",
@@ -523,14 +539,30 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
                     )
                 )
 
+                cleanup_start = time.perf_counter()
                 del df, embeddings_array, labels
                 gc.collect()
+                cleanup_time += time.perf_counter() - cleanup_start
+        finally:
+            close_start = time.perf_counter()
+            writer.close()
+            writer_close_time = time.perf_counter() - close_start
 
         t_end = time.perf_counter()
-        self._log_metric("kmeans_predict_write_time", (t_end - t_start) - pass2_read_time)
+        predict_write_time = (t_end - t_start) - pass2_read_time
+        self._log_metrics(
+            {
+                "kmeans_predict_write_time": predict_write_time,
+                "kmeans_predict_time": predict_time,
+                "kmeans_write_time": write_time,
+                "kmeans_writer_close_time": writer_close_time,
+                "kmeans_cleanup_time": cleanup_time,
+            }
+        )
         logger.info(
             f"Pass 2 total time: {(t_end - t_start):.2f} seconds "
-            f"(read: {pass2_read_time:.2f}s, predict+write: {(t_end - t_start) - pass2_read_time:.2f}s)"
+            f"(read: {pass2_read_time:.2f}s, predict: {predict_time:.2f}s, "
+            f"write: {write_time:.2f}s, close: {writer_close_time:.2f}s, cleanup: {cleanup_time:.2f}s)"
         )
 
         return results, pass2_read_time, total_rows
