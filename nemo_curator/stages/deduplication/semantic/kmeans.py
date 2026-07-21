@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -60,6 +63,73 @@ class _LoadedGroup:
     end: int
 
 
+class _RollingParquetDatasetWriter:
+    """Roll partitioned files using conservative per-partition row accounting."""
+
+    def __init__(
+        self,
+        create_writer: Callable[[int], ParquetDatasetWriter],
+        n_partitions: int,
+        max_file_size: int | None,
+    ) -> None:
+        self._create_writer = create_writer
+        self._n_partitions = n_partitions
+        self._max_file_size = max_file_size
+        self._generation = 0
+        self._writer = create_writer(self._generation)
+        self._rows_by_partition = np.zeros(n_partitions, dtype=np.int64)
+        self._target_rows: int | None = None
+
+    def __enter__(self) -> "_RollingParquetDatasetWriter":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def _partition_counts(self, frame: "cudf.DataFrame") -> np.ndarray:
+        return cp.asnumpy(cp.bincount(frame["centroid"].values, minlength=self._n_partitions))
+
+    def _ensure_target_rows(self, frame: "cudf.DataFrame") -> None:
+        if self._max_file_size is None or self._target_rows is not None:
+            return
+        bytes_per_row = max(1, math.ceil(int(frame.memory_usage().sum()) / len(frame)))
+        self._target_rows = max(1, self._max_file_size // bytes_per_row)
+        logger.info(
+            f"Rolling KMeans output after approximately {self._target_rows} rows per centroid "
+            f"(max_file_size={self._max_file_size}, estimated_uncompressed_bytes_per_row={bytes_per_row})"
+        )
+
+    def _roll(self) -> None:
+        self._writer.close()
+        self._generation += 1
+        self._writer = self._create_writer(self._generation)
+        self._rows_by_partition.fill(0)
+
+    def write_table(self, frame: "cudf.DataFrame") -> None:
+        if len(frame) == 0:
+            return
+        self._ensure_target_rows(frame)
+        if self._target_rows is None:
+            self._writer.write_table(frame)
+            return
+
+        counts = self._partition_counts(frame)
+        if counts.max() > self._target_rows:
+            num_slices = math.ceil(int(counts.max()) / self._target_rows)
+            slice_rows = math.ceil(len(frame) / num_slices)
+            for start in range(0, len(frame), slice_rows):
+                self.write_table(frame.iloc[start : start + slice_rows])
+            return
+
+        if self._rows_by_partition.any() and np.any(self._rows_by_partition + counts > self._target_rows):
+            self._roll()
+        self._writer.write_table(frame)
+        self._rows_by_partition += counts
+
+    def close(self) -> None:
+        self._writer.close()
+
+
 class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], DeduplicationIO):
     """KMeans clustering stage that requires RAFT for distributed processing."""
 
@@ -84,6 +154,8 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         fit_data_fraction: float | None = None,
         output_embedding_dtype: Literal["float16", "float32"] = "float16",
         write_batch_size: int | Literal["auto"] = "auto",
+        max_output_file_size: int | None = None,
+        prefetch_next_group: bool = False,
         # I/O args
         cache_path: str | None = None,
         read_kwargs: dict[dict] | None = None,
@@ -106,9 +178,11 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             n_init (int | Literal["auto"]): Number of times the k-means algorithm will be run with different centroid seeds. The final results will be the best output of n_init consecutive runs in terms of inertia.
             oversampling_factor (float): The amount of points to sample in scalable k-means++ initialization for potential centroids. Increasing this value can lead to better initial centroids at the cost of memory. The total number of centroids sampled in scalable k-means++ is oversampling_factor * n_clusters * 8.
             max_samples_per_batch (int): The number of data samples to use for batches of the pairwise distance computation. This computation is done throughout both fit predict. The default should suit most cases. The total number of elements in the batched pairwise distance computation is max_samples_per_batch * n_clusters. It might become necessary to lower this number when n_clusters becomes prohibitively large.
-            fit_data_fraction (float | None): Fraction of the dataset (in (0, 1)) used to fit the KMeans model. Pass None to fit on the full dataset (single-pass mode). Sampling is done at the file level: each actor draws `round(fit_data_fraction x num_actor_files)` of its files (floor of 1) for the fit. When set, uses a two-pass approach: Pass 1 reads only the embedding column from the sampled files (so IO and GPU memory in Pass 1 scale with the fraction); Pass 2 then loads each (full) original group one at a time to predict labels and write results. This dramatically reduces peak GPU memory for large datasets. If None, all rows are loaded simultaneously.
+            fit_data_fraction (float | None): Fraction of the dataset (in (0, 1)) used to fit the KMeans model. Pass None to fit on the full dataset (single-pass mode). For Parquet, each actor uses footer row counts to sample whole files until it reaches the requested row fraction. Other formats sample by file count. When set, uses a two-pass approach: Pass 1 reads only the embedding column from the sampled files; Pass 2 loads each full original group one at a time to predict labels and write results. If None, all rows are loaded simultaneously.
             output_embedding_dtype: Storage dtype for normalized embeddings written after KMeans. FP16 is encoded as uint16 bit patterns for cuDF compatibility.
             write_batch_size: Maximum rows to materialize and send to the partitioned Parquet writer at once. ``"auto"`` sizes each group from the actor GPU's live memory and embedding width.
+            max_output_file_size: Approximate maximum uncompressed bytes per centroid Parquet file.
+            prefetch_next_group: Read and normalize one group concurrently with prediction and writing.
             cache_path (str | None): The path to save the centroids to. If None, the centroids will not be saved.
             read_kwargs (dict[dict]): Keyword arguments for the read stage.
             write_kwargs (dict[dict]): Keyword arguments for the write stage.
@@ -140,6 +214,11 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             msg = f"write_batch_size must be positive, got {write_batch_size}"
             raise ValueError(msg)
         self.write_batch_size = write_batch_size
+        if max_output_file_size is not None and max_output_file_size <= 0:
+            msg = f"max_output_file_size must be positive, got {max_output_file_size}"
+            raise ValueError(msg)
+        self.max_output_file_size = max_output_file_size
+        self.prefetch_next_group = prefetch_next_group
 
         self.cache_path = cache_path
         self.read_kwargs = read_kwargs.copy() if read_kwargs is not None else {}
@@ -367,7 +446,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         logger.info(f"KMeans fit+predict time: {(t2 - t1):.2f} seconds")
 
         results = []
-        with self._create_dataset_writer(tasks) as writer:
+        with self._create_rolling_dataset_writer(tasks) as writer:
             for i, loaded_group in enumerate(loaded_groups):
                 self._write_partitioned_batches(
                     writer,
@@ -432,21 +511,28 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         # size-aware grouper; jsonl uses a single group (matching process_batch's
         # jsonl path).
         all_files = [f for g in groups for f in g]
-        target_n_files = round(len(all_files) * fraction)
-        n_files = max(1, target_n_files)
-        if target_n_files < 1:
-            # RAFT's cooperative _fit needs every actor to contribute at least one row,
-            # so we pull up to 1. Warn loudly: the user asked for less than that, and
-            # if many actors hit this floor the realized sample is much larger than
-            # fit_data_fraction would suggest.
-            logger.warning(
-                f"fit_data_fraction={fraction} on {len(all_files)} files would sample "
-                f"0 files for this actor; bumping to 1 to keep it in the cooperative "
-                f"fit. Increase fit_data_fraction (or pass None for full data) if you "
-                f"care about pass-1 cost."
-            )
         rng = random.Random(self.random_state)  # noqa: S311
-        fit_files = rng.sample(all_files, n_files)
+        if self.filetype == "parquet":
+            shuffled_files = all_files.copy()
+            rng.shuffle(shuffled_files)
+            target_rows = max(1, round(sum(self._parquet_rows_by_file.values()) * fraction))
+            sampled_rows = 0
+            fit_files = []
+            for file in shuffled_files:
+                fit_files.append(file)
+                sampled_rows += self._parquet_rows_by_file[file]
+                if sampled_rows >= target_rows:
+                    break
+        else:
+            target_n_files = round(len(all_files) * fraction)
+            n_files = max(1, target_n_files)
+            if target_n_files < 1:
+                # RAFT's cooperative _fit needs every actor to contribute at least one row.
+                logger.warning(
+                    f"fit_data_fraction={fraction} on {len(all_files)} files would sample "
+                    "0 files for this actor; bumping to 1 to keep it in the cooperative fit."
+                )
+            fit_files = rng.sample(all_files, n_files)
 
         if self.filetype == "parquet":
             fit_groups = break_parquet_partition_into_groups(
@@ -513,14 +599,24 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         writer_close_time = 0.0
         total_rows = 0
 
-        writer = self._create_dataset_writer(tasks)
+        writer = self._create_rolling_dataset_writer(tasks)
+        prefetch_pool = ThreadPoolExecutor(max_workers=1) if self.prefetch_next_group and groups else None
+        prefetched_group = prefetch_pool.submit(self._read_prediction_group, groups[0]) if prefetch_pool else None
         try:
             for i, group in enumerate(groups):
-                t_read_start = time.perf_counter()
-                df = self._read_group(group, [self.id_field, self.embedding_field, *self.metadata_fields])
-                df = self.normalize_embeddings_col_in_df(df, self.embedding_field)
+                if prefetched_group is None:
+                    df, read_time = self._read_prediction_group(group)
+                    pass2_read_time += read_time
+                else:
+                    read_wait_start = time.perf_counter()
+                    df, _ = prefetched_group.result()
+                    pass2_read_time += time.perf_counter() - read_wait_start
+                    prefetched_group = (
+                        prefetch_pool.submit(self._read_prediction_group, groups[i + 1])
+                        if prefetch_pool is not None and i + 1 < len(groups)
+                        else None
+                    )
                 embeddings_array = get_array_from_df(df, self.embedding_field)
-                pass2_read_time += time.perf_counter() - t_read_start
                 total_rows += len(df)
 
                 predict_start = time.perf_counter()
@@ -544,6 +640,8 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
                 gc.collect()
                 cleanup_time += time.perf_counter() - cleanup_start
         finally:
+            if prefetch_pool is not None:
+                prefetch_pool.shutdown()
             close_start = time.perf_counter()
             writer.close()
             writer_close_time = time.perf_counter() - close_start
@@ -566,6 +664,12 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         )
 
         return results, pass2_read_time, total_rows
+
+    def _read_prediction_group(self, group: list[str]) -> tuple["cudf.DataFrame", float]:
+        read_start = time.perf_counter()
+        frame = self._read_group(group, [self.id_field, self.embedding_field, *self.metadata_fields])
+        frame = self.normalize_embeddings_col_in_df(frame, self.embedding_field)
+        return frame, time.perf_counter() - read_start
 
     def setup(self, _: WorkerMetadata | None = None) -> None:
         from cuml.cluster.kmeans import KMeans as cumlKMeans
@@ -608,25 +712,33 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         df[embedding_col] = create_list_series_from_1d_or_2d_ar(fp16_bits, index=df.index)
         return df
 
-    def _create_dataset_writer(self, tasks: list[FileGroupTask]) -> ParquetDatasetWriter:
+    def _create_dataset_writer(self, tasks: list[FileGroupTask], generation: int) -> ParquetDatasetWriter:
         """Create one incremental partitioned writer per KMeans actor."""
         supported_kwargs = {"compression", "statistics"}
         unsupported_kwargs = set(self.write_kwargs).difference(supported_kwargs)
         if unsupported_kwargs:
             msg = f"Chunked KMeans output does not support write kwargs {sorted(unsupported_kwargs)}"
             raise ValueError(msg)
+        generation_suffix = f"_{generation}" if self.max_output_file_size is not None else ""
         return ParquetDatasetWriter(
             self.output_path,
             partition_cols=["centroid"],
             index=False,
-            file_name_prefix=f"{tasks[0].task_id}.parquet",
+            file_name_prefix=f"{tasks[0].task_id}{generation_suffix}.parquet",
             storage_options=self.output_storage_options,
             **self.write_kwargs,
         )
 
+    def _create_rolling_dataset_writer(self, tasks: list[FileGroupTask]) -> _RollingParquetDatasetWriter:
+        return _RollingParquetDatasetWriter(
+            create_writer=lambda generation: self._create_dataset_writer(tasks, generation),
+            n_partitions=self.n_clusters,
+            max_file_size=self.max_output_file_size,
+        )
+
     def _write_partitioned_batches(
         self,
-        writer: ParquetDatasetWriter,
+        writer: _RollingParquetDatasetWriter,
         source_frame: "cudf.DataFrame",
         embeddings: "cp.ndarray",
         labels: "cp.ndarray",
@@ -728,6 +840,8 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
     fit_data_fraction: float | None = None
     output_embedding_dtype: Literal["float16", "float32"] = "float16"
     write_batch_size: int | Literal["auto"] = "auto"
+    max_output_file_size: int | None = None
+    prefetch_next_group: bool = False
     cache_path: str | None = None
     """KMeans clustering stage that requires RAFT for distributed processing.
 
@@ -750,9 +864,11 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
         n_init (int | Literal["auto"]): Number of times the k-means algorithm will be run with different centroid seeds. The final results will be the best output of n_init consecutive runs in terms of inertia.
         oversampling_factor (float): The amount of points to sample in scalable k-means++ initialization for potential centroids. Increasing this value can lead to better initial centroids at the cost of memory. The total number of centroids sampled in scalable k-means++ is oversampling_factor * n_clusters * 8.
         max_samples_per_batch (int): The number of data samples to use for batches of the pairwise distance computation. This computation is done throughout both fit predict. The default should suit most cases. The total number of elements in the batched pairwise distance computation is max_samples_per_batch * n_clusters. It might become necessary to lower this number when n_clusters becomes prohibitively large.
-        fit_data_fraction (float | None): Fraction of the dataset (in (0, 1)) used to fit the KMeans model. Pass None to fit on the full dataset (single-pass mode). Sampling is done at the file level: each actor draws `round(fit_data_fraction x num_actor_files)` of its files (floor of 1) for the fit. When set, uses a two-pass approach: Pass 1 reads only the embedding column from the sampled files (so IO and GPU memory in Pass 1 scale with the fraction); Pass 2 then loads each (full) original group one at a time to predict labels and write results. This dramatically reduces peak GPU memory for large datasets. If None, all rows are loaded simultaneously.
+        fit_data_fraction (float | None): Fraction of the dataset (in (0, 1)) used to fit the KMeans model. Pass None to fit on the full dataset (single-pass mode). For Parquet, each actor uses footer row counts to sample whole files until it reaches the requested row fraction. Other formats sample by file count. When set, uses a two-pass approach: Pass 1 reads only the embedding column from the sampled files; Pass 2 loads each full original group one at a time to predict labels and write results. If None, all rows are loaded simultaneously.
         output_embedding_dtype: Storage dtype for normalized embeddings written after KMeans. Defaults to FP16 encoded as uint16 bits.
         write_batch_size: Maximum rows to materialize and write at once. ``"auto"`` sizes each group from the actor GPU's live memory and embedding width.
+        max_output_file_size: Approximate maximum uncompressed bytes per centroid Parquet file.
+        prefetch_next_group: Read and normalize one group concurrently with prediction and writing.
         cache_path (str | None): The path to save the centroids to. If None, the centroids will not be saved.
     """
 
@@ -771,6 +887,9 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
             not isinstance(self.write_batch_size, int) or self.write_batch_size <= 0
         ):
             msg = f"write_batch_size must be positive, got {self.write_batch_size}"
+            raise ValueError(msg)
+        if self.max_output_file_size is not None and self.max_output_file_size <= 0:
+            msg = f"max_output_file_size must be positive, got {self.max_output_file_size}"
             raise ValueError(msg)
 
     def decompose(self) -> list[ProcessingStage]:
@@ -803,6 +922,8 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
                 fit_data_fraction=self.fit_data_fraction,
                 output_embedding_dtype=self.output_embedding_dtype,
                 write_batch_size=self.write_batch_size,
+                max_output_file_size=self.max_output_file_size,
+                prefetch_next_group=self.prefetch_next_group,
                 read_kwargs=self.read_kwargs,
                 write_kwargs=self.write_kwargs,
                 cache_path=self.cache_path,
