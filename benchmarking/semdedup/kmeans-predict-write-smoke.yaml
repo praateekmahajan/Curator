@@ -1,0 +1,36 @@
+paths:
+  - name: results_path
+    host_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/nemotron-v4/sandia/users/praateekm/benchmarking
+  - name: crawl_n55_embeddings
+    host_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/nemotron-v4/sandia/users/praateekm/results/embedding-slurm-array-full-20260717/web/english/nvidia/crawl-n5.5-apr-2025
+  - name: crawl_n55_centroids
+    host_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/nemotron-v4/sandia/users/praateekm/benchmarking/semdedup-kmeans-write-smoke-20260720/crawl-n55-smoke-3072-none-256mb/centroids/kmeans_centroids.npy
+sinks: []
+delete_scratch: true
+object_store_size: default
+gpu_mem_use_warning_threshold: 0.01
+gpu_stats_recorder:
+  interval_s: 1
+
+ray:
+  num_cpus: 16
+  num_gpus: 4
+  enable_object_spilling: false
+
+entries:
+  - name: crawl-n55-smoke-3072-ray-data-48-files
+    script: ../semdedup/kmeans_predict.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={crawl_n55_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={crawl_n55_centroids}
+      --input-file-limit=3072
+      --embedding-dim=1024
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --compression=none
+      --max-output-file-size-mb=512
+      --task-batch-size=48
+      --gpu-fraction=0.5
+    timeout_s: 1800
