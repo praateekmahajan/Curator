@@ -48,17 +48,17 @@ def _write_batch_size(value: str) -> int | str:
     return batch_size
 
 
-def _input_files(input_path: Path, input_file_limit: int | None) -> list[str]:
-    files = sorted(str(path) for path in input_path.rglob("*.parquet"))
+def _input_files(input_paths: list[Path], input_file_limit: int | None) -> list[str]:
+    files = sorted({str(path) for input_path in input_paths for path in input_path.rglob("*.parquet")})
     if not files:
-        msg = f"No Parquet inputs found under {input_path}"
+        msg = f"No Parquet inputs found under {input_paths}"
         raise FileNotFoundError(msg)
     if input_file_limit is not None:
         if input_file_limit <= 0:
             msg = "input_file_limit must be positive"
             raise ValueError(msg)
         if len(files) < input_file_limit:
-            msg = f"Requested {input_file_limit} input files, but only found {len(files)} under {input_path}"
+            msg = f"Requested {input_file_limit} input files, but only found {len(files)} under {input_paths}"
             raise ValueError(msg)
         files = files[:input_file_limit]
     return files
@@ -91,7 +91,7 @@ def _verify_output_metadata(output_path: Path, metadata_fields: list[str]) -> No
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    input_files = _input_files(Path(args.input_path), args.input_file_limit)
+    input_files = _input_files([Path(path) for path in args.input_path], args.input_file_limit)
     metadata_fields = _metadata_fields(input_files, args.id_field, args.embedding_field)
     output_path = Path(args.output_path)
     centroids_path = Path(args.centroids_path)
@@ -109,6 +109,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         msg = "fit_data_fraction must be in (0, 1]"
         raise ValueError(msg)
     effective_fit_data_fraction = None if args.fit_data_fraction == 1 else args.fit_data_fraction
+    write_kwargs: dict[str, Any] = {}
+    if args.compression != "default":
+        write_kwargs["compression"] = None if args.compression == "none" else args.compression
 
     pipeline = Pipeline(
         name="semdedup_kmeans_benchmark",
@@ -125,11 +128,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 max_iter=args.max_iter,
                 tol=args.tol,
                 random_state=args.random_state,
+                init=args.init,
                 oversampling_factor=args.oversampling_factor,
                 max_samples_per_batch=args.max_samples_per_batch,
                 fit_data_fraction=effective_fit_data_fraction,
                 output_embedding_dtype=args.output_embedding_dtype,
                 write_batch_size=args.write_batch_size,
+                max_output_file_size=(
+                    args.max_output_file_size_mb * 1_000_000 if args.max_output_file_size_mb is not None else None
+                ),
+                prefetch_next_group=args.prefetch_next_group,
+                write_kwargs=write_kwargs,
                 cache_path=str(centroids_path),
             )
         ],
@@ -141,6 +150,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _verify_output_metadata(output_path, metadata_fields)
     task_metrics = TaskPerfUtils.aggregate_task_metrics(tasks)
     rows_processed = _num_rows(task_metrics)
+    output_files = list(output_path.rglob("*.parquet"))
+    output_bytes = sum(path.stat().st_size for path in output_files)
     return {
         "params": {
             **vars(args),
@@ -156,6 +167,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "time_taken_s": duration_s,
             "num_documents_processed": rows_processed,
             "throughput_docs_per_sec": rows_processed / duration_s if duration_s else None,
+            "output_bytes": output_bytes,
+            "output_file_count": len(output_files),
             **task_metrics,
         },
         "tasks": tasks,
@@ -165,22 +178,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--benchmark-results-path", required=True)
-    parser.add_argument("--input-path", required=True)
+    parser.add_argument("--input-path", action="append", required=True)
     parser.add_argument("--output-path", required=True)
     parser.add_argument("--centroids-path", required=True)
     parser.add_argument("--input-file-limit", type=int)
-    parser.add_argument("--embedding-dim", type=int, required=True)
-    parser.add_argument("--n-clusters", type=int, required=True)
+    parser.add_argument("--embedding-dim", type=int)
+    parser.add_argument("--n-clusters", type=int, default=128)
     parser.add_argument("--id-field", default="id")
     parser.add_argument("--embedding-field", default="embeddings")
     parser.add_argument("--fit-data-fraction", type=float)
     parser.add_argument("--max-iter", type=int, default=300)
     parser.add_argument("--tol", type=float, default=1e-4)
     parser.add_argument("--random-state", type=int, default=42)
+    parser.add_argument("--init", choices=["k-means||", "random"], default="k-means||")
     parser.add_argument("--oversampling-factor", type=float, default=2.0)
     parser.add_argument("--max-samples-per-batch", type=int, default=32768)
     parser.add_argument("--output-embedding-dtype", choices=["float16", "float32"], default="float16")
     parser.add_argument("--write-batch-size", type=_write_batch_size, default="auto")
+    parser.add_argument("--compression", choices=["default", "zstd", "snappy", "none"], default="default")
+    parser.add_argument("--max-output-file-size-mb", type=int)
+    parser.add_argument("--prefetch-next-group", action="store_true")
     return parser
 
 
