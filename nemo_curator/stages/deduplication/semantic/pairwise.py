@@ -144,7 +144,9 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
         dfs = []
         num_rows = 0
 
-        # Break input files into groups to avoid 2bn row limit
+        # Break input files into groups to avoid the 2bn list-child-element limit.
+        # TODO: Split an individually oversized Parquet file at row-group boundaries;
+        # file-level grouping cannot make that case safe.
         file_groups = break_parquet_partition_into_groups(
             task.data, embedding_dim=self.embedding_dim, storage_options=self.input_storage_options
         )
