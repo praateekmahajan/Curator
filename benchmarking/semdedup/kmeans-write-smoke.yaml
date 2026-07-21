@@ -1,0 +1,104 @@
+paths:
+  - name: results_path
+    host_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/nemotron-v4/sandia/users/praateekm/benchmarking
+  - name: crawl_n55_embeddings
+    host_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/nemotron-v4/sandia/users/praateekm/results/embedding-slurm-array-full-20260717/web/english/nvidia/crawl-n5.5-apr-2025
+sinks: []
+delete_scratch: true
+object_store_size: default
+gpu_mem_use_warning_threshold: 0.01
+gpu_stats_recorder:
+  interval_s: 1
+
+ray:
+  num_cpus: 144
+  num_gpus: 4
+  enable_object_spilling: false
+
+entries:
+  - name: crawl-n55-smoke-3072-zstd-256mb
+    enabled: false
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={crawl_n55_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --input-file-limit=3072
+      --embedding-dim=1024
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=0.05
+      --init=k-means||
+      --compression=zstd
+      --max-output-file-size-mb=256
+    timeout_s: 1800
+  - name: crawl-n55-smoke-3072-zstd-256mb-v2
+    enabled: false
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={crawl_n55_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --input-file-limit=3072
+      --embedding-dim=1024
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=0.05
+      --init=k-means||
+      --compression=zstd
+      --max-output-file-size-mb=256
+    timeout_s: 1800
+  - name: crawl-n55-smoke-3072-snappy-256mb
+    enabled: false
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={crawl_n55_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --input-file-limit=3072
+      --embedding-dim=1024
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=0.05
+      --init=k-means||
+      --compression=snappy
+      --max-output-file-size-mb=256
+    timeout_s: 1800
+  - name: crawl-n55-smoke-3072-none-256mb
+    enabled: false
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={crawl_n55_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --input-file-limit=3072
+      --embedding-dim=1024
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=0.05
+      --init=k-means||
+      --compression=none
+      --max-output-file-size-mb=256
+    timeout_s: 1800
+  - name: crawl-n55-smoke-3072-none-256mb-prefetch
+    enabled: false
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={crawl_n55_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --input-file-limit=3072
+      --embedding-dim=1024
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=0.05
+      --init=k-means||
+      --compression=none
+      --max-output-file-size-mb=256
+      --prefetch-next-group
+    timeout_s: 1800
