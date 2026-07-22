@@ -7,6 +7,8 @@ paths:
     host_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/nemotron-v4/sandia/users/praateekm/results/embedding-slurm-array-full-20260717/web/english/nvidia/crawl
   - name: mistral_other_high_embeddings
     host_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/nemotron-v4/sandia/users/praateekm/results/embedding-slurm-array-full-20260717/web/english/mistral/web1_2_en_other_high
+  - name: mistral_nvidia_centroids
+    host_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/nemotron-v4/sandia/users/praateekm/benchmarking/kmeans-mistral-nvidia-subset-20260720/web1_2_en_other_high_vs_nvidia_5pct/centroids/kmeans_centroids.npy
 sinks: []
 delete_scratch: true
 object_store_size: default
@@ -18,6 +20,201 @@ ray:
   num_gpus: 4
   enable_object_spilling: false
 entries:
+  - name: web1_2_en_other_high_vs_nvidia_5pct_integrated_auto_smoke_rapids2604_directoff_v8
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={nvidia_crawl_n55_embeddings}
+      --input-path={nvidia_crawl_embeddings}
+      --input-path={mistral_other_high_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --input-file-limit=3072
+      --embedding-dim=1024
+      --n-clusters=128
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=0.05
+      --init=k-means||
+      --write-batch-size=600000
+      --predict-write-concurrency=auto
+      --compression=none
+      --max-output-file-size-mb=512
+    timeout_s: 7200
+  - name: web1_2_en_other_high_vs_nvidia_5pct_integrated_auto_rapids2604_directoff_v9
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={nvidia_crawl_n55_embeddings}
+      --input-path={nvidia_crawl_embeddings}
+      --input-path={mistral_other_high_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --embedding-dim=1024
+      --n-clusters=128
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=0.05
+      --init=k-means||
+      --write-batch-size=600000
+      --predict-write-concurrency=auto
+      --compression=none
+      --max-output-file-size-mb=512
+    timeout_s: 7200
+  - name: web1_2_en_other_high_vs_nvidia_5pct_integrated_auto_v7
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={nvidia_crawl_n55_embeddings}
+      --input-path={nvidia_crawl_embeddings}
+      --input-path={mistral_other_high_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --embedding-dim=1024
+      --n-clusters=128
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=0.05
+      --init=k-means||
+      --write-batch-size=600000
+      --predict-write-concurrency=auto
+      --compression=none
+      --max-output-file-size-mb=512
+    timeout_s: 7200
+  - name: web1_2_en_other_high_vs_nvidia_5pct_integrated_auto_v4
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={nvidia_crawl_n55_embeddings}
+      --input-path={nvidia_crawl_embeddings}
+      --input-path={mistral_other_high_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --embedding-dim=1024
+      --n-clusters=128
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=0.05
+      --init=k-means||
+      --write-batch-size=600000
+      --predict-write-concurrency=auto
+      --compression=none
+      --max-output-file-size-mb=512
+    timeout_s: 7200
+  - name: web1_2_en_other_high_vs_nvidia_5pct_integrated_auto_smoke_v5
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={nvidia_crawl_n55_embeddings}
+      --input-path={nvidia_crawl_embeddings}
+      --input-path={mistral_other_high_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --input-file-limit=3072
+      --embedding-dim=1024
+      --n-clusters=128
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=0.05
+      --init=k-means||
+      --write-batch-size=600000
+      --predict-write-concurrency=auto
+      --compression=none
+      --max-output-file-size-mb=512
+    timeout_s: 7200
+  - name: web1_2_en_other_high_vs_nvidia_5pct_integrated_auto_smoke_v6
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={nvidia_crawl_n55_embeddings}
+      --input-path={nvidia_crawl_embeddings}
+      --input-path={mistral_other_high_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --input-file-limit=3072
+      --embedding-dim=1024
+      --n-clusters=128
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=0.05
+      --init=k-means||
+      --write-batch-size=600000
+      --predict-write-concurrency=auto
+      --compression=none
+      --max-output-file-size-mb=512
+    timeout_s: 7200
+  - name: web1_2_en_other_high_vs_nvidia_5pct_integrated_3lanes_smoke_v3
+    script: ../semdedup/kmeans.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={nvidia_crawl_n55_embeddings}
+      --input-path={nvidia_crawl_embeddings}
+      --input-path={mistral_other_high_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={session_entry_dir}/centroids
+      --input-file-limit=3072
+      --embedding-dim=1024
+      --n-clusters=128
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --fit-data-fraction=0.05
+      --init=k-means||
+      --write-batch-size=600000
+      --predict-write-concurrency=3
+      --compression=none
+      --max-output-file-size-mb=512
+    timeout_s: 7200
+  - name: web1_2_en_other_high_vs_nvidia_5pct_streaming_write_05gpu_v2
+    script: ../semdedup/kmeans_predict.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={nvidia_crawl_n55_embeddings}
+      --input-path={nvidia_crawl_embeddings}
+      --input-path={mistral_other_high_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={mistral_nvidia_centroids}
+      --embedding-dim=1024
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --compression=none
+      --max-output-file-size-mb=512
+      --task-batch-size=48
+      --gpu-fraction=0.5
+    timeout_s: 7200
+  - name: web1_2_en_other_high_vs_nvidia_5pct_streaming_write_025gpu
+    script: ../semdedup/kmeans_predict.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={nvidia_crawl_n55_embeddings}
+      --input-path={nvidia_crawl_embeddings}
+      --input-path={mistral_other_high_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={mistral_nvidia_centroids}
+      --embedding-dim=1024
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --compression=none
+      --max-output-file-size-mb=512
+      --task-batch-size=48
+      --gpu-fraction=0.25
+    timeout_s: 7200
+  - name: web1_2_en_other_high_vs_nvidia_5pct_streaming_write
+    script: ../semdedup/kmeans_predict.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={nvidia_crawl_n55_embeddings}
+      --input-path={nvidia_crawl_embeddings}
+      --input-path={mistral_other_high_embeddings}
+      --output-path={session_entry_dir}/kmeans
+      --centroids-path={mistral_nvidia_centroids}
+      --embedding-dim=1024
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --compression=none
+      --max-output-file-size-mb=512
+      --task-batch-size=48
+      --gpu-fraction=0.5
+    timeout_s: 7200
   - name: web1_2_en_other_high_vs_nvidia_5pct
     enabled: false
     script: ../semdedup/kmeans.py

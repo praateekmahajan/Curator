@@ -48,6 +48,20 @@ def _write_batch_size(value: str) -> int | str:
     return batch_size
 
 
+def _predict_write_concurrency(value: str) -> int | str:
+    if value == "auto":
+        return value
+    try:
+        concurrency = int(value)
+    except ValueError as error:
+        msg = "predict/write concurrency must be a positive integer or 'auto'"
+        raise argparse.ArgumentTypeError(msg) from error
+    if concurrency <= 0:
+        msg = "predict/write concurrency must be positive"
+        raise argparse.ArgumentTypeError(msg)
+    return concurrency
+
+
 def _input_files(input_paths: list[Path], input_file_limit: int | None) -> list[str]:
     files = sorted({str(path) for input_path in input_paths for path in input_path.rglob("*.parquet")})
     if not files:
@@ -138,6 +152,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     args.max_output_file_size_mb * 1_000_000 if args.max_output_file_size_mb is not None else None
                 ),
                 prefetch_next_group=args.prefetch_next_group,
+                predict_write_concurrency=args.predict_write_concurrency,
                 write_kwargs=write_kwargs,
                 cache_path=str(centroids_path),
             )
@@ -198,6 +213,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--compression", choices=["default", "zstd", "snappy", "none"], default="default")
     parser.add_argument("--max-output-file-size-mb", type=int)
     parser.add_argument("--prefetch-next-group", action="store_true")
+    parser.add_argument("--predict-write-concurrency", type=_predict_write_concurrency, default=1)
     return parser
 
 
