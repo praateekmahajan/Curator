@@ -102,13 +102,13 @@ inference_server = [
 
 # Installs CPU + GPU text curation modules
 deduplication_cuda12 = [
-    "cudf-cu12==25.10.*",
-    "cuml-cu12==25.10.*",
-    "scikit-learn<1.8.0",  # cuml 25.10.0 is incompatible with scikit-learn 1.8.0
-    "pylibcugraph-cu12==25.10.*",
-    "pylibraft-cu12==25.10.*",
-    "raft-dask-cu12==25.10.*",
-    "rapidsmpf-cu12==25.10.*",
+    "cudf-cu12==26.04.*",
+    "cuml-cu12==26.04.*",
+    "scikit-learn<1.8.0",
+    "pylibcugraph-cu12==26.04.*",
+    "pylibraft-cu12==26.04.*",
+    "raft-dask-cu12==26.04.*",
+    "rapidsmpf-cu12==26.04.*",
 ]
 
 audio_common = [
@@ -316,7 +316,7 @@ test = [
     "pytest-loguru",
     "pyyaml",
     "rich",
-    "scikit-learn<1.8.0",  # cuml 25.10.0 is incompatible with scikit-learn 1.8.0
+    "scikit-learn<1.8.0",
     "s3fs>=2024.12.0", # added for testing cloud fs
     "slack_sdk",
 ]
