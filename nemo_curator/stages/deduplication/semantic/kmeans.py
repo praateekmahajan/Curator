@@ -55,6 +55,10 @@ CUDF_LIST_COLUMN_MAX_ELEMENTS = 2_000_000_000
 AUTO_WRITE_TARGET_MEMORY_FRACTION = 0.80
 AUTO_WRITE_BYTES_PER_EMBEDDING_ELEMENT = 24
 AUTO_WRITE_FIXED_BYTES_PER_ROW = 128
+AUTO_PREDICT_WRITE_MEMORY_FRACTION = 0.80
+AUTO_PREDICT_WRITE_OVERHEAD_FRACTION = 2.0
+FLOAT32_BYTES = 4
+OUTPUT_FILE_SIZE_SAFETY_FRACTION = 0.90
 CENTROID_ARRAY_NDIM = 2
 
 
@@ -65,8 +69,47 @@ class _LoadedGroup:
     end: int
 
 
+@dataclass
+class _TimedFrame:
+    frame: Any
+    started_at: float
+    ended_at: float
+
+
+@dataclass
+class _PredictWriteLaneResult:
+    tasks: list[EmptyTask]
+    read_intervals: list[tuple[float, float]]
+    predict_intervals: list[tuple[float, float]]
+    write_intervals: list[tuple[float, float]]
+    close_intervals: list[tuple[float, float]]
+    cleanup_intervals: list[tuple[float, float]]
+    total_rows: int
+
+
+def _interval_work_time(intervals: list[tuple[float, float]]) -> float:
+    """Return summed work-seconds, including concurrent intervals."""
+    return sum(ended_at - started_at for started_at, ended_at in intervals)
+
+
+def _interval_wall_time(intervals: list[tuple[float, float]]) -> float:
+    """Return elapsed time covered by the union of concurrent intervals."""
+    if not intervals:
+        return 0.0
+    ordered = sorted(intervals)
+    total = 0.0
+    current_start, current_end = ordered[0]
+    for started_at, ended_at in ordered[1:]:
+        if started_at <= current_end:
+            current_end = max(current_end, ended_at)
+        else:
+            total += current_end - current_start
+            current_start, current_end = started_at, ended_at
+    return total + current_end - current_start
+
+
 class _RollingParquetDatasetWriter:
-    """Roll partitioned files using conservative per-partition row accounting."""
+    """Roll partitioned files using logical bytes from the unpartitioned frame."""
 
     def __init__(
         self,
@@ -76,11 +119,12 @@ class _RollingParquetDatasetWriter:
     ) -> None:
         self._create_writer = create_writer
         self._n_partitions = n_partitions
-        self._max_file_size = max_file_size
         self._generation = 0
         self._writer = create_writer(self._generation)
-        self._rows_by_partition = np.zeros(n_partitions, dtype=np.int64)
-        self._target_rows: int | None = None
+        self._logical_bytes_by_partition = np.zeros(n_partitions, dtype=np.int64)
+        self._logical_target = (
+            max(1, math.floor(max_file_size * OUTPUT_FILE_SIZE_SAFETY_FRACTION)) if max_file_size is not None else None
+        )
 
     def __enter__(self) -> "_RollingParquetDatasetWriter":
         return self
@@ -91,42 +135,35 @@ class _RollingParquetDatasetWriter:
     def _partition_counts(self, frame: "cudf.DataFrame") -> np.ndarray:
         return cp.asnumpy(cp.bincount(frame["centroid"].values, minlength=self._n_partitions))
 
-    def _ensure_target_rows(self, frame: "cudf.DataFrame") -> None:
-        if self._max_file_size is None or self._target_rows is not None:
-            return
-        bytes_per_row = max(1, math.ceil(int(frame.memory_usage().sum()) / len(frame)))
-        self._target_rows = max(1, self._max_file_size // bytes_per_row)
-        logger.info(
-            f"Rolling KMeans output after approximately {self._target_rows} rows per centroid "
-            f"(max_file_size={self._max_file_size}, estimated_uncompressed_bytes_per_row={bytes_per_row})"
-        )
-
     def _roll(self) -> None:
         self._writer.close()
         self._generation += 1
         self._writer = self._create_writer(self._generation)
-        self._rows_by_partition.fill(0)
+        self._logical_bytes_by_partition.fill(0)
 
     def write_table(self, frame: "cudf.DataFrame") -> None:
         if len(frame) == 0:
             return
-        self._ensure_target_rows(frame)
-        if self._target_rows is None:
+        if self._logical_target is None:
             self._writer.write_table(frame)
             return
 
+        bytes_per_row = max(1, math.ceil(int(frame.memory_usage().sum()) / len(frame)))
         counts = self._partition_counts(frame)
-        if counts.max() > self._target_rows:
-            num_slices = math.ceil(int(counts.max()) / self._target_rows)
+        incoming_bytes = counts * bytes_per_row
+        if incoming_bytes.max() > self._logical_target:
+            num_slices = math.ceil(int(incoming_bytes.max()) / self._logical_target)
             slice_rows = math.ceil(len(frame) / num_slices)
             for start in range(0, len(frame), slice_rows):
                 self.write_table(frame.iloc[start : start + slice_rows])
             return
 
-        if self._rows_by_partition.any() and np.any(self._rows_by_partition + counts > self._target_rows):
+        if self._logical_bytes_by_partition.any() and np.any(
+            self._logical_bytes_by_partition + incoming_bytes > self._logical_target
+        ):
             self._roll()
         self._writer.write_table(frame)
-        self._rows_by_partition += counts
+        self._logical_bytes_by_partition += incoming_bytes
 
     def close(self) -> None:
         self._writer.close()
@@ -135,7 +172,7 @@ class _RollingParquetDatasetWriter:
 class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], DeduplicationIO):
     """KMeans clustering stage that requires RAFT for distributed processing."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(  # noqa: PLR0913, PLR0915
         self,
         id_field: str,
         embedding_field: str,
@@ -158,6 +195,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         write_batch_size: int | Literal["auto"] = "auto",
         max_output_file_size: int | None = None,
         prefetch_next_group: bool = False,
+        predict_write_concurrency: int | Literal["auto"] = 1,
         # I/O args
         cache_path: str | None = None,
         read_kwargs: dict[dict] | None = None,
@@ -185,6 +223,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             write_batch_size: Maximum rows to materialize and send to the partitioned Parquet writer at once. ``"auto"`` sizes each group from the actor GPU's live memory and embedding width.
             max_output_file_size: Approximate maximum uncompressed bytes per centroid Parquet file.
             prefetch_next_group: Read and normalize one group concurrently with prediction and writing.
+            predict_write_concurrency: Actor-local read, predict, and write lanes used after a sampled fit. ``"auto"`` chooses a lane count from the actor GPU's live memory and largest input group.
             cache_path (str | None): The path to save the centroids to. If None, the centroids will not be saved.
             read_kwargs (dict[dict]): Keyword arguments for the read stage.
             write_kwargs (dict[dict]): Keyword arguments for the write stage.
@@ -221,6 +260,20 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             raise ValueError(msg)
         self.max_output_file_size = max_output_file_size
         self.prefetch_next_group = prefetch_next_group
+        if predict_write_concurrency != "auto" and (
+            not isinstance(predict_write_concurrency, int) or predict_write_concurrency <= 0
+        ):
+            msg = f"predict_write_concurrency must be positive, got {predict_write_concurrency}"
+            raise ValueError(msg)
+        if predict_write_concurrency != 1 and fit_data_fraction is None:
+            msg = (
+                "Concurrent predict/write lanes require fit_data_fraction so fit memory can be released before writing"
+            )
+            raise ValueError(msg)
+        if predict_write_concurrency != 1 and write_batch_size == "auto":
+            msg = "Concurrent predict/write lanes require an explicit write_batch_size to avoid concurrent overcommit"
+            raise ValueError(msg)
+        self.predict_write_concurrency = predict_write_concurrency
 
         self.cache_path = cache_path
         self.read_kwargs = read_kwargs.copy() if read_kwargs is not None else {}
@@ -436,7 +489,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         logger.debug(f"Read time: {(t1 - t0):.2f} seconds")
 
         # Fit the model cooperatively across actors, then predict on local data
-        self.kmeans._fit(embeddings, sample_weight=None, convert_dtype=False, multigpu=True)
+        self._fit_kmeans(embeddings)
 
         if self.cache_path is not None and getattr(self, "_actor_index", 0) == 0:
             os.makedirs(self.cache_path, exist_ok=True)
@@ -489,6 +542,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         instead of total_data x embedding_dim x 4 bytes.
         """
         pass1_read_time = self._fit_pass(groups)
+        self._release_fit_model_for_prediction()
         results, pass2_read_time, total_rows = self._predict_write_pass(tasks, groups)
         self._log_metrics(
             {
@@ -499,6 +553,16 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             }
         )
         return results
+
+    def _release_fit_model_for_prediction(self) -> None:
+        """Keep immutable centroids and release distributed fit allocations."""
+        self._prediction_centroids = cp.ascontiguousarray(cp.asarray(self.kmeans.cluster_centers_).copy())
+        del self.kmeans
+        gc.collect()
+        cp.get_default_memory_pool().free_all_blocks()
+        logger.info(
+            f"Released distributed KMeans fit model; retained centroids with shape {self._prediction_centroids.shape}"
+        )
 
     def _fit_pass(self, groups: list[list[str]]) -> float:
         """Pass 1: sample files at the actor level, read embeddings, fit KMeans,
@@ -568,7 +632,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             f"(fit_data_fraction={fraction:.4f}, {len(fit_files)}/{len(all_files)} files)"
         )
 
-        self.kmeans._fit(sampled_embeddings, sample_weight=None, convert_dtype=False, multigpu=True)
+        self._fit_kmeans(sampled_embeddings)
         del sampled_embeddings, fit_group_owners
         gc.collect()
         # Stop the fit-time clock before centroid I/O so the metric isn't skewed
@@ -587,7 +651,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
     def _predict_write_pass(
         self, tasks: list[FileGroupTask], groups: list[list[str]]
     ) -> tuple[list["EmptyTask"], float, int]:
-        """Pass 2: load each full group, predict labels, write results.
+        """Pass 2: process groups through actor-local read/predict/write lanes.
 
         Returns:
             (results, pass2_read_time, total_rows). The orchestrator combines
@@ -595,44 +659,136 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             reports total_rows as num_rows.
         """
         t_start = time.perf_counter()
-        results: list[EmptyTask] = []
-        pass2_read_time = 0.0
-        predict_time = 0.0
-        write_time = 0.0
-        cleanup_time = 0.0
-        writer_close_time = 0.0
-        total_rows = 0
+        lane_count = min(self._resolve_predict_write_concurrency(groups), len(groups))
+        indexed_groups = list(enumerate(groups))
+        lane_groups = [indexed_groups[lane_index::lane_count] for lane_index in range(lane_count)]
+        logger.info(
+            f"Starting {lane_count} actor-local predict/write lane(s) for {len(groups)} groups "
+            f"with write_batch_size={self.write_batch_size}"
+        )
 
-        writer = self._create_rolling_dataset_writer(tasks)
-        prefetch_pool = ThreadPoolExecutor(max_workers=1) if self.prefetch_next_group and groups else None
-        prefetched_group = prefetch_pool.submit(self._read_prediction_group, groups[0]) if prefetch_pool else None
+        if lane_count == 1:
+            lane_results = [self._predict_write_lane(tasks, lane_groups[0], 0)]
+        else:
+            with ThreadPoolExecutor(max_workers=lane_count, thread_name_prefix="kmeans-predict-write") as executor:
+                futures = [
+                    executor.submit(self._predict_write_lane, tasks, groups_for_lane, lane_index)
+                    for lane_index, groups_for_lane in enumerate(lane_groups)
+                ]
+                lane_results = [future.result() for future in futures]
+
+        results = [task for lane_result in lane_results for task in lane_result.tasks]
+        results.sort(key=lambda task: task.dataset_name)
+        read_intervals = [interval for result in lane_results for interval in result.read_intervals]
+        predict_intervals = [interval for result in lane_results for interval in result.predict_intervals]
+        write_intervals = [interval for result in lane_results for interval in result.write_intervals]
+        close_intervals = [interval for result in lane_results for interval in result.close_intervals]
+        cleanup_intervals = [interval for result in lane_results for interval in result.cleanup_intervals]
+        pass2_read_time = _interval_wall_time(read_intervals)
+        predict_time = _interval_wall_time(predict_intervals)
+        write_time = _interval_wall_time(write_intervals)
+        writer_close_time = _interval_wall_time(close_intervals)
+        cleanup_time = _interval_wall_time(cleanup_intervals)
+        total_rows = sum(result.total_rows for result in lane_results)
+
+        t_end = time.perf_counter()
+        predict_write_time = t_end - t_start
+        self._log_metrics(
+            {
+                "kmeans_predict_write_time": predict_write_time,
+                "kmeans_predict_write_wall_time": t_end - t_start,
+                "kmeans_predict_time": predict_time,
+                "kmeans_write_time": write_time,
+                "kmeans_writer_close_time": writer_close_time,
+                "kmeans_cleanup_time": cleanup_time,
+                "kmeans_predict_write_lane_count": lane_count,
+            }
+        )
+        logger.info(
+            f"Pass 2 wall time: {(t_end - t_start):.2f} seconds across {lane_count} lane(s) "
+            f"(wall-active: read={pass2_read_time:.2f}s, predict={predict_time:.2f}s, "
+            f"write={write_time:.2f}s; work-seconds: read={_interval_work_time(read_intervals):.2f}s, "
+            f"predict={_interval_work_time(predict_intervals):.2f}s, "
+            f"write={_interval_work_time(write_intervals):.2f}s)"
+        )
+
+        return results, pass2_read_time, total_rows
+
+    def _resolve_predict_write_concurrency(self, groups: list[list[str]]) -> int:
+        """Choose lanes whose resident frames and one-copy overhead fit the GPU."""
+        if self.predict_write_concurrency != "auto":
+            return self.predict_write_concurrency
+        if self.filetype != "parquet" or not self._parquet_rows_by_file:
+            logger.warning("Cannot estimate auto predict/write concurrency without Parquet row counts; using one lane")
+            return 1
+
+        memory_info = get_device_memory_info()
+        if memory_info is None:
+            logger.warning("Could not query GPU memory for auto predict/write concurrency; using one lane")
+            return 1
+
+        max_group_rows = max(sum(self._parquet_rows_by_file[file_path] for file_path in group) for group in groups)
+        embedding_width = self.embedding_dim or 1024
+        bytes_per_row = embedding_width * FLOAT32_BYTES + AUTO_WRITE_FIXED_BYTES_PER_ROW
+        bytes_per_lane = math.ceil(max_group_rows * bytes_per_row * (1.0 + AUTO_PREDICT_WRITE_OVERHEAD_FRACTION))
+        free_memory, total_memory = memory_info
+        used_memory = total_memory - free_memory
+        memory_budget = max(0, int(total_memory * AUTO_PREDICT_WRITE_MEMORY_FRACTION) - used_memory)
+        lane_count = max(1, min(len(groups), memory_budget // bytes_per_lane))
+        logger.info(
+            f"Auto predict/write concurrency: {lane_count} lane(s) "
+            f"(max_group_rows={max_group_rows}, estimated_bytes_per_lane={bytes_per_lane}, "
+            f"memory_budget={memory_budget}, free={free_memory}, total={total_memory})"
+        )
+        return lane_count
+
+    def _predict_write_lane(
+        self,
+        tasks: list[FileGroupTask],
+        indexed_groups: list[tuple[int, list[str]]],
+        lane_index: int,
+    ) -> _PredictWriteLaneResult:
+        """Own one predictor flow and one partitioned writer within an actor."""
+        results: list[EmptyTask] = []
+        read_intervals: list[tuple[float, float]] = []
+        predict_intervals: list[tuple[float, float]] = []
+        write_intervals: list[tuple[float, float]] = []
+        cleanup_intervals: list[tuple[float, float]] = []
+        close_intervals: list[tuple[float, float]] = []
+        total_rows = 0
+        writer = self._create_rolling_dataset_writer(tasks, lane_index)
+        prefetch_pool = ThreadPoolExecutor(max_workers=1) if self.prefetch_next_group and indexed_groups else None
+        prefetched_group = (
+            prefetch_pool.submit(self._read_prediction_group, indexed_groups[0][1]) if prefetch_pool else None
+        )
         try:
-            for i, group in enumerate(groups):
+            for lane_position, (group_index, group) in enumerate(indexed_groups):
                 if prefetched_group is None:
-                    df, read_time = self._read_prediction_group(group)
-                    pass2_read_time += read_time
+                    timed_frame = self._read_prediction_group(group)
                 else:
-                    read_wait_start = time.perf_counter()
-                    df, _ = prefetched_group.result()
-                    pass2_read_time += time.perf_counter() - read_wait_start
+                    timed_frame = prefetched_group.result()
                     prefetched_group = (
-                        prefetch_pool.submit(self._read_prediction_group, groups[i + 1])
-                        if prefetch_pool is not None and i + 1 < len(groups)
+                        prefetch_pool.submit(self._read_prediction_group, indexed_groups[lane_position + 1][1])
+                        if lane_position + 1 < len(indexed_groups)
                         else None
                     )
-                embeddings_array = get_array_from_df(df, self.embedding_field)
-                total_rows += len(df)
+                frame = timed_frame.frame
+                read_intervals.append((timed_frame.started_at, timed_frame.ended_at))
 
+                embeddings = get_array_from_df(frame, self.embedding_field)
+                total_rows += len(frame)
                 predict_start = time.perf_counter()
-                labels = self._predict_labels(embeddings_array)
-                predict_time += time.perf_counter() - predict_start
+                labels = self._predict_labels(embeddings)
+                predict_end = time.perf_counter()
+                predict_intervals.append((predict_start, predict_end))
 
                 write_start = time.perf_counter()
-                self._write_partitioned_batches(writer, df, embeddings_array, labels)
-                write_time += time.perf_counter() - write_start
+                self._write_partitioned_batches(writer, frame, embeddings, labels)
+                write_end = time.perf_counter()
+                write_intervals.append((write_start, write_end))
                 results.append(
                     EmptyTask(
-                        dataset_name=f"kmeans_group_{i}",
+                        dataset_name=f"kmeans_group_{group_index:08d}",
                         _metadata=None,
                         _stage_perf=[],
                         data=None,
@@ -640,55 +796,77 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
                 )
 
                 cleanup_start = time.perf_counter()
-                del df, embeddings_array, labels
-                gc.collect()
-                cleanup_time += time.perf_counter() - cleanup_start
+                del frame, embeddings, labels
+                cleanup_end = time.perf_counter()
+                cleanup_intervals.append((cleanup_start, cleanup_end))
         finally:
             if prefetch_pool is not None:
                 prefetch_pool.shutdown()
             close_start = time.perf_counter()
             writer.close()
-            writer_close_time = time.perf_counter() - close_start
+            close_end = time.perf_counter()
+            close_intervals.append((close_start, close_end))
+            gc.collect()
 
-        t_end = time.perf_counter()
-        predict_write_time = (t_end - t_start) - pass2_read_time
-        self._log_metrics(
-            {
-                "kmeans_predict_write_time": predict_write_time,
-                "kmeans_predict_time": predict_time,
-                "kmeans_write_time": write_time,
-                "kmeans_writer_close_time": writer_close_time,
-                "kmeans_cleanup_time": cleanup_time,
-            }
-        )
         logger.info(
-            f"Pass 2 total time: {(t_end - t_start):.2f} seconds "
-            f"(read: {pass2_read_time:.2f}s, predict: {predict_time:.2f}s, "
-            f"write: {write_time:.2f}s, close: {writer_close_time:.2f}s, cleanup: {cleanup_time:.2f}s)"
+            f"Predict/write lane {lane_index} completed {len(indexed_groups)} groups and {total_rows} rows "
+            f"(read={_interval_work_time(read_intervals):.2f}s, "
+            f"predict={_interval_work_time(predict_intervals):.2f}s, "
+            f"write={_interval_work_time(write_intervals):.2f}s)"
         )
-
-        return results, pass2_read_time, total_rows
+        return _PredictWriteLaneResult(
+            tasks=results,
+            read_intervals=read_intervals,
+            predict_intervals=predict_intervals,
+            write_intervals=write_intervals,
+            close_intervals=close_intervals,
+            cleanup_intervals=cleanup_intervals,
+            total_rows=total_rows,
+        )
 
     def _predict_labels(self, embeddings: "cp.ndarray") -> "cp.ndarray":
+        if hasattr(self, "_prediction_centroids"):
+            return self._predict_labels_from_centroids(embeddings, self._prediction_centroids)
+
         from cuml import using_output_type
 
         with using_output_type("cupy"):
             return self.kmeans.predict(embeddings, convert_dtype=False).astype(cp.int32)
 
-    def _read_prediction_group(self, group: list[str]) -> tuple["cudf.DataFrame", float]:
+    def _predict_labels_from_centroids(self, embeddings: "cp.ndarray", centroids: "cp.ndarray") -> "cp.ndarray":
+        """Assign labels in bounded batches using immutable saved centroids."""
+        from cuml.metrics import pairwise_distances
+
+        if embeddings.shape[1] != centroids.shape[1]:
+            msg = f"Input embedding width {embeddings.shape[1]} does not match centroid width {centroids.shape[1]}"
+            raise ValueError(msg)
+        labels = cp.empty(len(embeddings), dtype=cp.int32)
+        for start in range(0, len(embeddings), self.max_samples_per_batch):
+            end = min(start + self.max_samples_per_batch, len(embeddings))
+            distances = pairwise_distances(
+                embeddings[start:end],
+                centroids,
+                metric="sqeuclidean",
+                convert_dtype=False,
+            )
+            labels[start:end] = cp.argmin(distances, axis=1).astype(cp.int32)
+            del distances
+        return labels
+
+    def _read_prediction_group(self, group: list[str]) -> _TimedFrame:
         read_start = time.perf_counter()
         frame = self._read_group(group, [self.id_field, self.embedding_field, *self.metadata_fields])
         frame = self.normalize_embeddings_col_in_df(frame, self.embedding_field)
-        return frame, time.perf_counter() - read_start
+        return _TimedFrame(frame=frame, started_at=read_start, ended_at=time.perf_counter())
 
     def setup(self, _: WorkerMetadata | None = None) -> None:
-        from cuml.cluster.kmeans import KMeans as cumlKMeans
+        from cuml.cluster.kmeans_mg import KMeansMG
 
         if not hasattr(self, "_raft_handle"):
             msg = "RAFT handle not found. Make sure the stage is initialized with RAFT"
             raise ValueError(msg)
 
-        self.kmeans = cumlKMeans(
+        self.kmeans = KMeansMG(
             handle=self._raft_handle,
             output_type="cupy",
             init=self.init,
@@ -701,6 +879,10 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             oversampling_factor=self.oversampling_factor,
             max_samples_per_batch=self.max_samples_per_batch,
         )
+
+    def _fit_kmeans(self, embeddings: "cp.ndarray") -> None:
+        """Fit KMeans cooperatively across the RAFT actor pool."""
+        self.kmeans.fit(embeddings, sample_weight=None, convert_dtype=False)
 
     @staticmethod
     def normalize_embeddings_col_in_df(df: "cudf.DataFrame", embedding_col: str) -> "cudf.DataFrame":
@@ -722,26 +904,36 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         df[embedding_col] = create_list_series_from_1d_or_2d_ar(fp16_bits, index=df.index)
         return df
 
-    def _create_dataset_writer(self, tasks: list[FileGroupTask], generation: int) -> ParquetDatasetWriter:
+    def _create_dataset_writer(
+        self,
+        tasks: list[FileGroupTask],
+        generation: int,
+        lane_index: int = 0,
+    ) -> ParquetDatasetWriter:
         """Create one incremental partitioned writer per KMeans actor."""
         supported_kwargs = {"compression", "statistics"}
         unsupported_kwargs = set(self.write_kwargs).difference(supported_kwargs)
         if unsupported_kwargs:
             msg = f"Chunked KMeans output does not support write kwargs {sorted(unsupported_kwargs)}"
             raise ValueError(msg)
+        lane_suffix = f"_lane{lane_index}" if self.predict_write_concurrency != 1 else ""
         generation_suffix = f"_{generation}" if self.max_output_file_size is not None else ""
         return ParquetDatasetWriter(
             self.output_path,
             partition_cols=["centroid"],
             index=False,
-            file_name_prefix=f"{tasks[0].task_id}{generation_suffix}.parquet",
+            file_name_prefix=f"{tasks[0].task_id}{lane_suffix}{generation_suffix}.parquet",
             storage_options=self.output_storage_options,
             **self.write_kwargs,
         )
 
-    def _create_rolling_dataset_writer(self, tasks: list[FileGroupTask]) -> _RollingParquetDatasetWriter:
+    def _create_rolling_dataset_writer(
+        self,
+        tasks: list[FileGroupTask],
+        lane_index: int = 0,
+    ) -> _RollingParquetDatasetWriter:
         return _RollingParquetDatasetWriter(
-            create_writer=lambda generation: self._create_dataset_writer(tasks, generation),
+            create_writer=lambda generation: self._create_dataset_writer(tasks, generation, lane_index),
             n_partitions=self.n_clusters,
             max_file_size=self.max_output_file_size,
         )
@@ -796,6 +988,8 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         return batch_size
 
     def _cluster_centers(self) -> "cp.ndarray":
+        if hasattr(self, "_prediction_centroids"):
+            return self._prediction_centroids
         return self.kmeans.cluster_centers_
 
     @staticmethod
@@ -987,6 +1181,7 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
     write_batch_size: int | Literal["auto"] = "auto"
     max_output_file_size: int | None = None
     prefetch_next_group: bool = False
+    predict_write_concurrency: int | Literal["auto"] = 1
     cache_path: str | None = None
     """KMeans clustering stage that requires RAFT for distributed processing.
 
@@ -1014,6 +1209,7 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
         write_batch_size: Maximum rows to materialize and write at once. ``"auto"`` sizes each group from the actor GPU's live memory and embedding width.
         max_output_file_size: Approximate maximum uncompressed bytes per centroid Parquet file.
         prefetch_next_group: Read and normalize one group concurrently with prediction and writing.
+        predict_write_concurrency: Actor-local read, predict, and write lanes used after a sampled fit. ``"auto"`` chooses a lane count from the actor GPU's live memory and largest input group.
         cache_path (str | None): The path to save the centroids to. If None, the centroids will not be saved.
     """
 
@@ -1035,6 +1231,19 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
             raise ValueError(msg)
         if self.max_output_file_size is not None and self.max_output_file_size <= 0:
             msg = f"max_output_file_size must be positive, got {self.max_output_file_size}"
+            raise ValueError(msg)
+        if self.predict_write_concurrency != "auto" and (
+            not isinstance(self.predict_write_concurrency, int) or self.predict_write_concurrency <= 0
+        ):
+            msg = f"predict_write_concurrency must be positive, got {self.predict_write_concurrency}"
+            raise ValueError(msg)
+        if self.predict_write_concurrency != 1 and self.fit_data_fraction is None:
+            msg = (
+                "Concurrent predict/write lanes require fit_data_fraction so fit memory can be released before writing"
+            )
+            raise ValueError(msg)
+        if self.predict_write_concurrency != 1 and self.write_batch_size == "auto":
+            msg = "Concurrent predict/write lanes require an explicit write_batch_size to avoid concurrent overcommit"
             raise ValueError(msg)
 
     def decompose(self) -> list[ProcessingStage]:
@@ -1069,6 +1278,7 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
                 write_batch_size=self.write_batch_size,
                 max_output_file_size=self.max_output_file_size,
                 prefetch_next_group=self.prefetch_next_group,
+                predict_write_concurrency=self.predict_write_concurrency,
                 read_kwargs=self.read_kwargs,
                 write_kwargs=self.write_kwargs,
                 cache_path=self.cache_path,
