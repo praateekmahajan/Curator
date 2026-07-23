@@ -95,7 +95,8 @@ class TextSemanticDeduplicationWorkflow:
     kmeans_fit_data_fraction: float | None = None
     # Pairwise similarity parameters
     ranking_strategy: RankingStrategy | None = None
-    pairwise_batch_size: int = 1024
+    pairwise_batch_size: int | Literal["auto"] = 1024
+    num_additional_neighbors: int = 0
     _duplicates_num_row_groups_hint: int | None = None
     # ID generator parameters
     use_id_generator: bool = False
@@ -328,6 +329,7 @@ class TextSemanticDeduplicationWorkflow:
             which_to_keep=self.which_to_keep,
             ranking_strategy=self.ranking_strategy,
             pairwise_batch_size=self.pairwise_batch_size,
+            num_additional_neighbors=self.num_additional_neighbors,
             # Duplicate identification parameters (optional)
             eps=self.eps,
             _duplicates_num_row_groups_hint=self._duplicates_num_row_groups_hint,

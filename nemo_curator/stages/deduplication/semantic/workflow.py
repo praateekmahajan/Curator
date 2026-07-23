@@ -90,7 +90,8 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
         distance_metric: Literal["cosine", "l2"] = "cosine",
         which_to_keep: Literal["hard", "easy", "random"] = "hard",
         ranking_strategy: RankingStrategy | None = None,
-        pairwise_batch_size: int = 1024,
+        pairwise_batch_size: int | Literal["auto"] = 1024,
+        num_additional_neighbors: int = 0,
         # Duplicate identification parameters (optional)
         eps: float | None = None,
         _duplicates_num_row_groups_hint: int | None = None,
@@ -136,7 +137,9 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
             # Pairwise similarity parameters
             which_to_keep: Strategy for ranking within clusters ("hard", "easy", "random")
             ranking_strategy: Custom ranking strategy (overrides which_to_keep)
-            pairwise_batch_size: Batch size for pairwise similarity computation
+            pairwise_batch_size: Batch size for pairwise similarity computation, or ``"auto"`` to size it from
+                free GPU memory
+            num_additional_neighbors: Number of additional earlier-ranked neighbors to write for analysis
 
             # Duplicate identification parameters (optional)
             eps: Epsilon value for duplicate identification
@@ -184,6 +187,7 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
         self.which_to_keep = which_to_keep
         self.ranking_strategy = ranking_strategy
         self.pairwise_batch_size = pairwise_batch_size
+        self.num_additional_neighbors = num_additional_neighbors
 
         # Duplicate identification parameters
         self.eps = eps
@@ -310,6 +314,7 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
             embedding_dim=self.embedding_dim,
             input_embedding_dtype=self.kmeans_output_embedding_dtype,
             pairwise_batch_size=self.pairwise_batch_size,
+            num_additional_neighbors=self.num_additional_neighbors,
             verbose=self.verbose,
             which_to_keep=self.which_to_keep,
             sim_metric=self.distance_metric,

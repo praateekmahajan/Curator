@@ -99,6 +99,17 @@ class TestPairwiseCosineSimilarityBatched:
         np.testing.assert_array_equal(max_indices.tolist(), [0, 0])
         np.testing.assert_allclose(max_similarity.tolist(), [0.0, -1.0])
 
+    def test_only_compares_candidate_prefix(self) -> None:
+        embeddings = torch.randn(6, 3, device="cuda")
+
+        with patch(
+            "nemo_curator.stages.deduplication.semantic.pairwise.torch.mm",
+            wraps=torch.mm,
+        ) as mock_mm:
+            pairwise_cosine_similarity_batched(embeddings, batch_size=2)
+
+        assert [call.args[0].shape for call in mock_mm.call_args_list] == [(2, 3), (4, 3), (6, 3)]
+
     def test_decode_fp16_uint16_storage_to_fp32(self) -> None:
         values = cp.array([[0.25, -0.5], [1.0, 0.125]], dtype=cp.float16)
         df = cudf.DataFrame(index=cudf.RangeIndex(len(values)))
@@ -277,6 +288,7 @@ class TestPairwiseCosineSimilarityStage:
             embedding_field="embedding",
             output_path=str(output_dir),
             ranking_strategy=ranking_strategy,
+            num_additional_neighbors=2,
             read_kwargs={},
             write_kwargs={},
         )
@@ -304,6 +316,20 @@ class TestPairwiseCosineSimilarityStage:
         expected_id_order = [2, 3, 1]
         actual_id_order = result_df["id"].to_arrow().to_pylist()
         assert actual_id_order == expected_id_order
+
+        neighbor_file = output_dir / "cluster_1_neighbors.parquet"
+        assert neighbor_file.exists()
+        neighbor_df = cudf.read_parquet(neighbor_file)
+        assert len(neighbor_df) == 1
+        assert set(neighbor_df.columns) == {
+            "id",
+            "other_id",
+            "other_cosine_sim_score",
+            "other_neighbor_rank",
+            "other_priority",
+            "other_score",
+        }
+        assert neighbor_df["other_neighbor_rank"].iloc[0] == 2
 
     def test_pairwise_stage_ranking_fails_on_missing_columns(self, tmp_path: Path) -> None:
         """Test that ranking fails when required columns are missing."""
