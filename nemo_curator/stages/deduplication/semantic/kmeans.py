@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import cupy as cp
 import numpy as np
 from cudf.io.parquet import ParquetDatasetWriter
+from tqdm import tqdm
 
 from nemo_curator.backends.base import WorkerMetadata
 from nemo_curator.backends.utils import RayStageSpecKeys
@@ -57,6 +58,8 @@ AUTO_WRITE_BYTES_PER_EMBEDDING_ELEMENT = 24
 AUTO_WRITE_FIXED_BYTES_PER_ROW = 128
 AUTO_PREDICT_WRITE_MEMORY_FRACTION = 0.80
 AUTO_PREDICT_WRITE_OVERHEAD_FRACTION = 2.0
+AUTO_FIT_MEMORY_FRACTION = 0.70
+AUTO_FIT_MEMORY_OVERHEAD_FRACTION = 0.30
 FLOAT32_BYTES = 4
 OUTPUT_FILE_SIZE_SAFETY_FRACTION = 0.90
 CENTROID_ARRAY_NDIM = 2
@@ -190,7 +193,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         n_init: int | Literal["auto"] = 1,
         oversampling_factor: float = 2.0,
         max_samples_per_batch: int = 1 << 15,
-        fit_data_fraction: float | None = None,
+        fit_data_fraction: float | Literal["auto"] | None = None,
         output_embedding_dtype: Literal["float16", "float32"] = "float16",
         write_batch_size: int | Literal["auto"] = "auto",
         max_output_file_size: int | None = None,
@@ -243,7 +246,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         self.n_init = n_init
         self.oversampling_factor = oversampling_factor
         self.max_samples_per_batch = max_samples_per_batch
-        if fit_data_fraction is not None and not 0.0 < fit_data_fraction < 1.0:
+        if fit_data_fraction not in {None, "auto"} and not 0.0 < fit_data_fraction < 1.0:
             msg = f"fit_data_fraction must be in (0, 1), got {fit_data_fraction}; pass None to fit on the full dataset"
             raise ValueError(msg)
         self.fit_data_fraction = fit_data_fraction
@@ -269,9 +272,6 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             msg = (
                 "Concurrent predict/write lanes require fit_data_fraction so fit memory can be released before writing"
             )
-            raise ValueError(msg)
-        if predict_write_concurrency != 1 and write_batch_size == "auto":
-            msg = "Concurrent predict/write lanes require an explicit write_batch_size to avoid concurrent overcommit"
             raise ValueError(msg)
         self.predict_write_concurrency = predict_write_concurrency
 
@@ -311,6 +311,14 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
 
         groups = self._group_input_files(tasks)
 
+        if self.fit_data_fraction == "auto":
+            all_files = [file for group in groups for file in group]
+            self._effective_fit_data_fraction = self._resolve_fit_data_fraction(all_files)
+            if self._effective_fit_data_fraction >= 1.0:
+                logger.info(
+                    "Auto fit selected all rows; using the single-pass preallocated path to avoid rereading input"
+                )
+                return self._process_batch_single_pass(tasks, groups)
         if self.fit_data_fraction is not None:
             return self._process_batch_two_pass(tasks, groups)
         return self._process_batch_single_pass(tasks, groups)
@@ -325,8 +333,8 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
                 storage_options=self.input_storage_options,
             )
             footer_scan_time = time.perf_counter() - footer_scan_start
-            self._log_metric("kmeans_footer_scan_time", footer_scan_time)
             logger.info(f"Parquet footer scan time: {footer_scan_time:.2f} seconds for {len(all_files)} files")
+            self._log_metric("kmeans_footer_scan_time", footer_scan_time)
             groups = break_parquet_partition_into_groups(
                 all_files,
                 embedding_dim=self.embedding_dim,
@@ -485,7 +493,14 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         )
 
         t1 = time.perf_counter()
-        self._log_metrics({"kmeans_read_time": t1 - t0, "num_rows": len(embeddings)})
+        self._log_metrics(
+            {
+                "kmeans_read_time": t1 - t0,
+                "num_rows": len(embeddings),
+                "kmeans_fit_rows": len(embeddings),
+                "kmeans_fit_data_fraction": 1.0,
+            }
+        )
         logger.debug(f"Read time: {(t1 - t0):.2f} seconds")
 
         # Fit the model cooperatively across actors, then predict on local data
@@ -496,29 +511,55 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             cp.save(f"{self.cache_path}/kmeans_centroids.npy", self.kmeans.cluster_centers_)
             logger.info(f"Saved {self.n_clusters} KMeans centroids to {self.cache_path}/kmeans_centroids.npy")
 
-        labels = cp.asarray(self.kmeans.labels_).astype(cp.int32, copy=False)
+        labels = cp.asarray(self.kmeans.labels_).astype(cp.int32, copy=True)
 
         t2 = time.perf_counter()
+        self._log_metric("kmeans_fit_time", t2 - t1)
         self._log_metric("kmeans_fit_predict_time", t2 - t1)
         logger.info(f"KMeans fit+predict time: {(t2 - t1):.2f} seconds")
 
+        self._release_fit_model_for_prediction()
+        write_batch_size = self._resolve_write_batch_size(embeddings.shape[1])
+        actor_index = getattr(self, "_actor_index", 0)
+        self._log_metrics(
+            {
+                "kmeans_predict_write_planned_lane_count": 1,
+                "kmeans_write_batch_size": write_batch_size,
+                "kmeans_predict_write_group_count": len(loaded_groups),
+            }
+        )
+        logger.info(
+            f"Actor {actor_index} starting single-pass writes for {len(loaded_groups)} groups "
+            f"with write_batch_size={write_batch_size}"
+        )
+
         results = []
-        with self._create_rolling_dataset_writer(tasks) as writer:
-            for i, loaded_group in enumerate(loaded_groups):
+        with (
+            self._create_rolling_dataset_writer(tasks) as writer,
+            tqdm(
+                total=len(loaded_groups),
+                desc=f"KMeans actor {actor_index} single-pass write",
+                mininterval=30,
+                leave=True,
+            ) as progress,
+        ):
+            for group_index, loaded_group in enumerate(loaded_groups):
                 self._write_partitioned_batches(
                     writer,
                     loaded_group.frame,
                     embeddings[loaded_group.start : loaded_group.end],
                     labels[loaded_group.start : loaded_group.end],
+                    write_batch_size,
                 )
                 results.append(
                     EmptyTask(
-                        dataset_name=f"kmeans_group_{i}",
+                        dataset_name=f"kmeans_group_{group_index}",
                         _metadata=None,
                         _stage_perf=[],
                         data=None,
                     )
                 )
+                progress.update(1)
 
         t3 = time.perf_counter()
         self._log_metric("kmeans_write_time", t3 - t2)
@@ -572,13 +613,13 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             Wall-clock seconds spent reading sampled files (for the combined
             kmeans_read_time metric reported by the orchestrator).
         """
-        fraction = self.fit_data_fraction
+        all_files = [file for group in groups for file in group]
+        fraction = getattr(self, "_effective_fit_data_fraction", None) or self._resolve_fit_data_fraction(all_files)
 
         # Sample files at the actor level (across all groups), then re-chunk into
         # memory-bounded groups. Works for both filetypes: parquet uses the
         # size-aware grouper; jsonl uses a single group (matching process_batch's
         # jsonl path).
-        all_files = [f for g in groups for f in g]
         rng = random.Random(self.random_state)  # noqa: S311
         if self.filetype == "parquet":
             shuffled_files = all_files.copy()
@@ -618,6 +659,11 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             [self.embedding_field],
             retain_frames=False,
         )
+        if self.filetype == "parquet" and len(sampled_embeddings) > target_rows:
+            # Whole-file sampling avoids reading every input just to sample rows.
+            # Trim only the final file's overshoot so the requested fraction is
+            # exact at actor level without another allocation.
+            sampled_embeddings = sampled_embeddings[:target_rows]
         sampled_rows = len(sampled_embeddings)
 
         t1 = time.perf_counter()
@@ -630,6 +676,14 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         logger.info(
             f"Fitting KMeans on {len(sampled_embeddings)} sampled rows "
             f"(fit_data_fraction={fraction:.4f}, {len(fit_files)}/{len(all_files)} files)"
+        )
+        self._log_metrics(
+            {
+                "kmeans_fit_rows": sampled_rows,
+                "kmeans_fit_data_fraction": sampled_rows / sum(self._parquet_rows_by_file.values())
+                if self.filetype == "parquet"
+                else fraction,
+            }
         )
 
         self._fit_kmeans(sampled_embeddings)
@@ -648,6 +702,33 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
 
         return pass1_read_time
 
+    def _resolve_fit_data_fraction(self, all_files: list[str]) -> float:
+        """Resolve an explicit or memory-sized Parquet fit fraction."""
+        if self.fit_data_fraction != "auto":
+            return self.fit_data_fraction
+        if self.filetype != "parquet":
+            msg = "fit_data_fraction='auto' requires Parquet footer row counts"
+            raise ValueError(msg)
+        memory_info = get_device_memory_info()
+        if memory_info is None:
+            msg = "Could not query GPU memory for fit_data_fraction='auto'"
+            raise RuntimeError(msg)
+
+        total_rows = sum(self._parquet_rows_by_file[file] for file in all_files)
+        embedding_width = self.embedding_dim or 1024
+        free_memory, total_memory = memory_info
+        used_memory = total_memory - free_memory
+        memory_budget = max(0, int(total_memory * AUTO_FIT_MEMORY_FRACTION) - used_memory)
+        bytes_per_fit_row = math.ceil(embedding_width * FLOAT32_BYTES * (1.0 + AUTO_FIT_MEMORY_OVERHEAD_FRACTION))
+        target_rows = max(1, memory_budget // bytes_per_fit_row)
+        fraction = min(1.0, target_rows / total_rows)
+        logger.info(
+            f"Auto fit data fraction: {fraction:.6f} ({min(target_rows, total_rows)}/{total_rows} rows, "
+            f"estimated_bytes_per_row={bytes_per_fit_row}, memory_budget={memory_budget}, "
+            f"free={free_memory}, total={total_memory})"
+        )
+        return fraction
+
     def _predict_write_pass(
         self, tasks: list[FileGroupTask], groups: list[list[str]]
     ) -> tuple[list["EmptyTask"], float, int]:
@@ -659,23 +740,47 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             reports total_rows as num_rows.
         """
         t_start = time.perf_counter()
-        lane_count = min(self._resolve_predict_write_concurrency(groups), len(groups))
+        lane_count, write_batch_size = self._resolve_predict_write_plan(groups)
         indexed_groups = list(enumerate(groups))
         lane_groups = [indexed_groups[lane_index::lane_count] for lane_index in range(lane_count)]
+        actor_index = getattr(self, "_actor_index", 0)
         logger.info(
-            f"Starting {lane_count} actor-local predict/write lane(s) for {len(groups)} groups "
-            f"with write_batch_size={self.write_batch_size}"
+            f"Actor {actor_index} starting {lane_count} predict/write lane(s) for {len(groups)} groups "
+            f"with write_batch_size={write_batch_size}"
+        )
+        self._log_metrics(
+            {
+                "kmeans_predict_write_planned_lane_count": lane_count,
+                "kmeans_write_batch_size": write_batch_size,
+                "kmeans_predict_write_group_count": len(groups),
+            }
         )
 
-        if lane_count == 1:
-            lane_results = [self._predict_write_lane(tasks, lane_groups[0], 0)]
-        else:
-            with ThreadPoolExecutor(max_workers=lane_count, thread_name_prefix="kmeans-predict-write") as executor:
-                futures = [
-                    executor.submit(self._predict_write_lane, tasks, groups_for_lane, lane_index)
-                    for lane_index, groups_for_lane in enumerate(lane_groups)
-                ]
-                lane_results = [future.result() for future in futures]
+        progress = tqdm(
+            total=len(groups),
+            desc=f"KMeans actor {actor_index} predict/write",
+            mininterval=30,
+            leave=True,
+        )
+        try:
+            if lane_count == 1:
+                lane_results = [self._predict_write_lane(tasks, lane_groups[0], 0, write_batch_size, progress)]
+            else:
+                with ThreadPoolExecutor(max_workers=lane_count, thread_name_prefix="kmeans-predict-write") as executor:
+                    futures = [
+                        executor.submit(
+                            self._predict_write_lane,
+                            tasks,
+                            groups_for_lane,
+                            lane_index,
+                            write_batch_size,
+                            progress,
+                        )
+                        for lane_index, groups_for_lane in enumerate(lane_groups)
+                    ]
+                    lane_results = [future.result() for future in futures]
+        finally:
+            progress.close()
 
         results = [task for lane_result in lane_results for task in lane_result.tasks]
         results.sort(key=lambda task: task.dataset_name)
@@ -714,39 +819,60 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
 
         return results, pass2_read_time, total_rows
 
-    def _resolve_predict_write_concurrency(self, groups: list[list[str]]) -> int:
-        """Choose lanes whose resident frames and one-copy overhead fit the GPU."""
-        if self.predict_write_concurrency != "auto":
-            return self.predict_write_concurrency
+    def _resolve_predict_write_plan(self, groups: list[list[str]]) -> tuple[int, int]:
+        """Jointly size resident lanes and each lane's transient write batch."""
         if self.filetype != "parquet" or not self._parquet_rows_by_file:
-            logger.warning("Cannot estimate auto predict/write concurrency without Parquet row counts; using one lane")
-            return 1
+            fallback = self.write_batch_size if self.write_batch_size != "auto" else 100_000
+            lane_count = self.predict_write_concurrency if self.predict_write_concurrency != "auto" else 1
+            logger.warning(
+                f"Cannot estimate predict/write plan without Parquet row counts; using {lane_count}x{fallback}"
+            )
+            return min(lane_count, len(groups)), fallback
 
         memory_info = get_device_memory_info()
         if memory_info is None:
-            logger.warning("Could not query GPU memory for auto predict/write concurrency; using one lane")
-            return 1
+            fallback = self.write_batch_size if self.write_batch_size != "auto" else 100_000
+            lane_count = self.predict_write_concurrency if self.predict_write_concurrency != "auto" else 1
+            logger.warning(f"Could not query GPU memory; using predict/write plan {lane_count}x{fallback}")
+            return min(lane_count, len(groups)), fallback
 
         max_group_rows = max(sum(self._parquet_rows_by_file[file_path] for file_path in group) for group in groups)
         embedding_width = self.embedding_dim or 1024
-        bytes_per_row = embedding_width * FLOAT32_BYTES + AUTO_WRITE_FIXED_BYTES_PER_ROW
-        bytes_per_lane = math.ceil(max_group_rows * bytes_per_row * (1.0 + AUTO_PREDICT_WRITE_OVERHEAD_FRACTION))
+        resident_bytes_per_row = embedding_width * FLOAT32_BYTES + AUTO_WRITE_FIXED_BYTES_PER_ROW
+        resident_bytes_per_lane = max_group_rows * resident_bytes_per_row
         free_memory, total_memory = memory_info
         used_memory = total_memory - free_memory
         memory_budget = max(0, int(total_memory * AUTO_PREDICT_WRITE_MEMORY_FRACTION) - used_memory)
-        lane_count = max(1, min(len(groups), memory_budget // bytes_per_lane))
+        if self.predict_write_concurrency == "auto":
+            planned_bytes_per_lane = math.ceil(resident_bytes_per_lane * (1.0 + AUTO_PREDICT_WRITE_OVERHEAD_FRACTION))
+            lane_count = max(1, min(len(groups), memory_budget // planned_bytes_per_lane))
+        else:
+            lane_count = min(self.predict_write_concurrency, len(groups))
+
+        list_column_limit = max(1, CUDF_LIST_COLUMN_MAX_ELEMENTS // embedding_width)
+        if self.write_batch_size == "auto":
+            transient_budget = max(0, memory_budget - lane_count * resident_bytes_per_lane)
+            transient_bytes_per_row = (
+                AUTO_WRITE_BYTES_PER_EMBEDDING_ELEMENT * embedding_width + AUTO_WRITE_FIXED_BYTES_PER_ROW
+            )
+            batch_size = max(1, transient_budget // lane_count // transient_bytes_per_row)
+            batch_size = min(batch_size, max_group_rows, list_column_limit)
+        else:
+            batch_size = min(self.write_batch_size, list_column_limit)
         logger.info(
-            f"Auto predict/write concurrency: {lane_count} lane(s) "
-            f"(max_group_rows={max_group_rows}, estimated_bytes_per_lane={bytes_per_lane}, "
-            f"memory_budget={memory_budget}, free={free_memory}, total={total_memory})"
+            f"Predict/write plan: lanes={lane_count}, write_batch_rows={batch_size}, "
+            f"max_group_rows={max_group_rows}, resident_bytes_per_lane={resident_bytes_per_lane}, "
+            f"memory_budget={memory_budget}, free={free_memory}, total={total_memory}"
         )
-        return lane_count
+        return lane_count, batch_size
 
     def _predict_write_lane(
         self,
         tasks: list[FileGroupTask],
         indexed_groups: list[tuple[int, list[str]]],
         lane_index: int,
+        write_batch_size: int,
+        progress: "tqdm",
     ) -> _PredictWriteLaneResult:
         """Own one predictor flow and one partitioned writer within an actor."""
         results: list[EmptyTask] = []
@@ -783,7 +909,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
                 predict_intervals.append((predict_start, predict_end))
 
                 write_start = time.perf_counter()
-                self._write_partitioned_batches(writer, frame, embeddings, labels)
+                self._write_partitioned_batches(writer, frame, embeddings, labels, write_batch_size)
                 write_end = time.perf_counter()
                 write_intervals.append((write_start, write_end))
                 results.append(
@@ -794,6 +920,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
                         data=None,
                     )
                 )
+                progress.update(1)
 
                 cleanup_start = time.perf_counter()
                 del frame, embeddings, labels
@@ -944,9 +1071,10 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         source_frame: "cudf.DataFrame",
         embeddings: "cp.ndarray",
         labels: "cp.ndarray",
+        write_batch_size: int | None = None,
     ) -> None:
         """Materialize distances and encoded embeddings in bounded row batches."""
-        write_batch_size = self._resolve_write_batch_size(embeddings.shape[1])
+        write_batch_size = write_batch_size or self._resolve_write_batch_size(embeddings.shape[1])
         for start in range(0, len(source_frame), write_batch_size):
             end = min(start + write_batch_size, len(source_frame))
             frame = source_frame.iloc[start:end].copy(deep=False)
@@ -1176,7 +1304,7 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
     n_init: int | Literal["auto"] = 1
     oversampling_factor: float = 2.0
     max_samples_per_batch: int = 1 << 15
-    fit_data_fraction: float | None = None
+    fit_data_fraction: float | Literal["auto"] | None = None
     output_embedding_dtype: Literal["float16", "float32"] = "float16"
     write_batch_size: int | Literal["auto"] = "auto"
     max_output_file_size: int | None = None
@@ -1218,7 +1346,7 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
         super().__init__()
         # Validate eagerly so bad values surface at construction, not later in
         # decompose() / on a worker.
-        if self.fit_data_fraction is not None and not 0.0 < self.fit_data_fraction < 1.0:
+        if self.fit_data_fraction not in {None, "auto"} and not 0.0 < self.fit_data_fraction < 1.0:
             msg = f"fit_data_fraction must be in (0, 1), got {self.fit_data_fraction}; pass None to fit on the full dataset"
             raise ValueError(msg)
         if self.output_embedding_dtype not in {"float16", "float32"}:
@@ -1241,9 +1369,6 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
             msg = (
                 "Concurrent predict/write lanes require fit_data_fraction so fit memory can be released before writing"
             )
-            raise ValueError(msg)
-        if self.predict_write_concurrency != 1 and self.write_batch_size == "auto":
-            msg = "Concurrent predict/write lanes require an explicit write_batch_size to avoid concurrent overcommit"
             raise ValueError(msg)
 
     def decompose(self) -> list[ProcessingStage]:
