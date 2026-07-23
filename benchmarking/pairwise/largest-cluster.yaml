@@ -1,0 +1,101 @@
+paths:
+  - name: results_path
+    host_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/nemotron-v4/sandia/users/praateekm/benchmarking
+  - name: kmeans_input
+    host_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/nemotron-v4/sandia/users/praateekm/benchmarking/kmeans-mistral-nvidia-category-20260722/nvidia-vs-mistral-en-humanities-fit-auto-6-nodes-v03/kmeans
+
+sinks: []
+delete_scratch: true
+object_store_size: default
+gpu_mem_use_warning_threshold: 0.01
+gpu_stats_recorder:
+  interval_s: 1
+
+ray:
+  num_cpus: 16
+  num_gpus: 1
+  enable_object_spilling: false
+
+entries:
+  - name: v01-current-ranked-centroid-204-b1024
+    script: ../pairwise/pairwise.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={kmeans_input}
+      --output-path={session_entry_dir}/pairwise
+      --centroid-id=204
+      --embedding-dim=1024
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --input-embedding-dtype=auto
+      --pairwise-batch-size=1024
+    timeout_s: 7200
+  - name: v02-short-ray-tmp-centroid-204-b1024
+    script: ../pairwise/pairwise.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={kmeans_input}
+      --output-path={session_entry_dir}/pairwise
+      --centroid-id=204
+      --embedding-dim=1024
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --input-embedding-dtype=auto
+      --pairwise-batch-size=1024
+    timeout_s: 7200
+  - name: v03-auto-batch-centroid-204
+    script: ../pairwise/pairwise.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={kmeans_input}
+      --output-path={session_entry_dir}/pairwise
+      --centroid-id=204
+      --embedding-dim=1024
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --input-embedding-dtype=auto
+      --pairwise-batch-size=auto
+    timeout_s: 7200
+  - name: v04-triangular-prefix-centroid-204-b1024
+    script: ../pairwise/pairwise.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={kmeans_input}
+      --output-path={session_entry_dir}/pairwise
+      --centroid-id=204
+      --embedding-dim=1024
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --input-embedding-dtype=auto
+      --pairwise-batch-size=1024
+    timeout_s: 7200
+  - name: v05-triangular-prefix-bounded-top5-centroid-204-b1024
+    script: ../pairwise/pairwise.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={kmeans_input}
+      --output-path={session_entry_dir}/pairwise
+      --centroid-id=204
+      --embedding-dim=1024
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --input-embedding-dtype=auto
+      --pairwise-batch-size=1024
+      --num-additional-neighbors=5
+      --reference-output-path={results_path}/pairwise-largest-cluster-20260723/v02-short-ray-tmp-centroid-204-b1024/pairwise/cluster_204.parquet
+    timeout_s: 7200
+  - name: v06-triangular-prefix-reused-mask-top5-centroid-204-b1024
+    script: ../pairwise/pairwise.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={kmeans_input}
+      --output-path={session_entry_dir}/pairwise
+      --centroid-id=204
+      --embedding-dim=1024
+      --id-field=_curator_dedup_id
+      --embedding-field=embeddings
+      --input-embedding-dtype=auto
+      --pairwise-batch-size=1024
+      --num-additional-neighbors=5
+      --reference-output-path={results_path}/pairwise-largest-cluster-20260723/v02-short-ray-tmp-centroid-204-b1024/pairwise/cluster_204.parquet
+    timeout_s: 7200
