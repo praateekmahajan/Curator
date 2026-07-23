@@ -62,6 +62,20 @@ def _predict_write_concurrency(value: str) -> int | str:
     return concurrency
 
 
+def _fit_data_fraction(value: str) -> float | str:
+    if value == "auto":
+        return value
+    try:
+        fraction = float(value)
+    except ValueError as error:
+        msg = "fit data fraction must be in (0, 1] or 'auto'"
+        raise argparse.ArgumentTypeError(msg) from error
+    if not 0 < fraction <= 1:
+        msg = "fit data fraction must be in (0, 1]"
+        raise argparse.ArgumentTypeError(msg)
+    return fraction
+
+
 def _input_files(input_paths: list[Path], input_file_limit: int | None) -> list[str]:
     files = sorted({str(path) for input_path in input_paths for path in input_path.rglob("*.parquet")})
     if not files:
@@ -80,6 +94,26 @@ def _input_files(input_paths: list[Path], input_file_limit: int | None) -> list[
 
 def _num_rows(task_metrics: dict[str, Any]) -> int:
     return int(sum(value for key, value in task_metrics.items() if key.endswith("custom.num_rows_sum")))
+
+
+def _human_readable_kmeans_metrics(task_metrics: dict[str, Any]) -> dict[str, Any]:
+    metric_suffixes = {
+        "fit_time_per_gpu_s": "custom.kmeans_fit_time_mean",
+        "fit_rows_per_gpu": "custom.kmeans_fit_rows_mean",
+        "fit_data_fraction_per_gpu": "custom.kmeans_fit_data_fraction_mean",
+        "read_time_per_gpu_s": "custom.kmeans_read_time_mean",
+        "predict_time_per_gpu_s": "custom.kmeans_predict_time_mean",
+        "write_time_per_gpu_s": "custom.kmeans_write_time_mean",
+        "predict_write_time_per_gpu_s": "custom.kmeans_predict_write_time_mean",
+        "predict_write_concurrency_per_gpu": "custom.kmeans_predict_write_planned_lane_count_mean",
+        "write_batch_rows_per_gpu": "custom.kmeans_write_batch_size_mean",
+    }
+    return {
+        output_name: value
+        for output_name, suffix in metric_suffixes.items()
+        for key, value in task_metrics.items()
+        if key.endswith(suffix)
+    }
 
 
 def _metadata_fields(input_files: list[str], id_field: str, embedding_field: str) -> list[str]:
@@ -119,9 +153,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         msg = f"KMeans requires at least one Ray GPU resource; found {cluster_resources}"
         raise RuntimeError(msg)
 
-    if args.fit_data_fraction is not None and not 0 < args.fit_data_fraction <= 1:
-        msg = "fit_data_fraction must be in (0, 1]"
-        raise ValueError(msg)
     effective_fit_data_fraction = None if args.fit_data_fraction == 1 else args.fit_data_fraction
     write_kwargs: dict[str, Any] = {}
     if args.compression != "default":
@@ -165,6 +196,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _verify_output_metadata(output_path, metadata_fields)
     task_metrics = TaskPerfUtils.aggregate_task_metrics(tasks)
     rows_processed = _num_rows(task_metrics)
+    kmeans_metrics = _human_readable_kmeans_metrics(task_metrics)
     output_files = list(output_path.rglob("*.parquet"))
     output_bytes = sum(path.stat().st_size for path in output_files)
     return {
@@ -184,7 +216,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "throughput_docs_per_sec": rows_processed / duration_s if duration_s else None,
             "output_bytes": output_bytes,
             "output_file_count": len(output_files),
-            **task_metrics,
+            **kmeans_metrics,
         },
         "tasks": tasks,
     }
@@ -201,7 +233,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-clusters", type=int, default=128)
     parser.add_argument("--id-field", default="id")
     parser.add_argument("--embedding-field", default="embeddings")
-    parser.add_argument("--fit-data-fraction", type=float)
+    parser.add_argument("--fit-data-fraction", type=_fit_data_fraction)
     parser.add_argument("--max-iter", type=int, default=300)
     parser.add_argument("--tol", type=float, default=1e-4)
     parser.add_argument("--random-state", type=int, default=42)
