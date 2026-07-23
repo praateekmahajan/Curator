@@ -270,7 +270,9 @@ class RayActorPoolExecutor(BaseExecutor):
             err_msg = "Either batch_size or num_output_tasks must be provided but not both"
             raise ValueError(err_msg)
         elif num_output_tasks is not None:
-            return [batch.tolist() for batch in np.array_split(tasks, num_output_tasks) if len(batch) > 0]
+            rng = np.random.default_rng(seed=0)
+            shuffled_tasks = [tasks[index] for index in rng.permutation(len(tasks))]
+            return [batch.tolist() for batch in np.array_split(shuffled_tasks, num_output_tasks) if len(batch) > 0]
         else:
             return [tasks[i : i + batch_size] for i in range(0, len(tasks), batch_size)]
 
