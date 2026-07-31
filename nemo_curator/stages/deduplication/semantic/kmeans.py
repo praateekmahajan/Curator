@@ -58,7 +58,7 @@ AUTO_WRITE_BYTES_PER_EMBEDDING_ELEMENT = 24
 AUTO_WRITE_FIXED_BYTES_PER_ROW = 128
 AUTO_PREDICT_WRITE_MEMORY_FRACTION = 0.80
 AUTO_PREDICT_WRITE_OVERHEAD_FRACTION = 2.0
-AUTO_FIT_MEMORY_FRACTION = 0.70
+AUTO_FIT_MEMORY_FRACTION = 0.80
 AUTO_FIT_MEMORY_OVERHEAD_FRACTION = 0.30
 FLOAT32_BYTES = 4
 OUTPUT_FILE_SIZE_SAFETY_FRACTION = 0.90
@@ -112,7 +112,7 @@ def _interval_wall_time(intervals: list[tuple[float, float]]) -> float:
 
 
 class _RollingParquetDatasetWriter:
-    """Roll partitioned files using logical bytes from the unpartitioned frame."""
+    """Share partitioned writers and roll each centroid by logical bytes."""
 
     def __init__(
         self,
@@ -122,12 +122,13 @@ class _RollingParquetDatasetWriter:
     ) -> None:
         self._create_writer = create_writer
         self._n_partitions = n_partitions
-        self._generation = 0
-        self._writer = create_writer(self._generation)
+        self._writers: dict[int, ParquetDatasetWriter] = {}
+        self._generation_by_partition = np.zeros(n_partitions, dtype=np.int64)
         self._logical_bytes_by_partition = np.zeros(n_partitions, dtype=np.int64)
         self._logical_target = (
             max(1, math.floor(max_file_size * OUTPUT_FILE_SIZE_SAFETY_FRACTION)) if max_file_size is not None else None
         )
+        self._closed = False
 
     def __enter__(self) -> "_RollingParquetDatasetWriter":
         return self
@@ -138,38 +139,66 @@ class _RollingParquetDatasetWriter:
     def _partition_counts(self, frame: "cudf.DataFrame") -> np.ndarray:
         return cp.asnumpy(cp.bincount(frame["centroid"].values, minlength=self._n_partitions))
 
-    def _roll(self) -> None:
-        self._writer.close()
-        self._generation += 1
-        self._writer = self._create_writer(self._generation)
-        self._logical_bytes_by_partition.fill(0)
+    def _writer_for_generation(self, generation: int) -> ParquetDatasetWriter:
+        if generation not in self._writers:
+            self._writers[generation] = self._create_writer(generation)
+        return self._writers[generation]
 
     def write_table(self, frame: "cudf.DataFrame") -> None:
         if len(frame) == 0:
             return
+        if self._closed:
+            msg = "Cannot write to a closed KMeans dataset writer"
+            raise RuntimeError(msg)
+        self._write_table(frame)
+
+    def _write_table(self, frame: "cudf.DataFrame", bytes_per_row: int | None = None) -> None:
         if self._logical_target is None:
-            self._writer.write_table(frame)
+            self._writer_for_generation(0).write_table(frame)
             return
 
-        bytes_per_row = max(1, math.ceil(int(frame.memory_usage().sum()) / len(frame)))
+        if bytes_per_row is None:
+            bytes_per_row = max(1, math.ceil(int(frame.memory_usage().sum()) / len(frame)))
         counts = self._partition_counts(frame)
         incoming_bytes = counts * bytes_per_row
         if incoming_bytes.max() > self._logical_target:
             num_slices = math.ceil(int(incoming_bytes.max()) / self._logical_target)
             slice_rows = math.ceil(len(frame) / num_slices)
             for start in range(0, len(frame), slice_rows):
-                self.write_table(frame.iloc[start : start + slice_rows])
+                self._write_table(frame.iloc[start : start + slice_rows], bytes_per_row)
             return
 
-        if self._logical_bytes_by_partition.any() and np.any(
-            self._logical_bytes_by_partition + incoming_bytes > self._logical_target
-        ):
-            self._roll()
-        self._writer.write_table(frame)
+        present = counts > 0
+        roll = (
+            present
+            & (self._logical_bytes_by_partition > 0)
+            & (self._logical_bytes_by_partition + incoming_bytes > self._logical_target)
+        )
+        self._generation_by_partition[roll] += 1
+        self._logical_bytes_by_partition[roll] = 0
+
+        present_generations = np.unique(self._generation_by_partition[present])
+        if len(present_generations) == 1:
+            self._writer_for_generation(int(present_generations[0])).write_table(frame)
+        else:
+            device_generations = cp.asarray(self._generation_by_partition)
+            row_generations = device_generations[frame["centroid"].values]
+            for generation in present_generations:
+                generation_frame = frame[row_generations == generation]
+                self._writer_for_generation(int(generation)).write_table(generation_frame)
+                del generation_frame
         self._logical_bytes_by_partition += incoming_bytes
 
     def close(self) -> None:
-        self._writer.close()
+        if self._closed:
+            return
+        self._closed = True
+        for writer in self._writers.values():
+            writer.close()
+        logger.info(
+            f"Closed KMeans dataset writer with {len(self._writers)} generation(s); "
+            f"maximum centroid generation={int(self._generation_by_partition.max(initial=0))}"
+        )
 
 
 class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], DeduplicationIO):
@@ -874,7 +903,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         write_batch_size: int,
         progress: "tqdm",
     ) -> _PredictWriteLaneResult:
-        """Own one predictor flow and one partitioned writer within an actor."""
+        """Own one predictor flow and one per-centroid rolling writer."""
         results: list[EmptyTask] = []
         read_intervals: list[tuple[float, float]] = []
         predict_intervals: list[tuple[float, float]] = []
