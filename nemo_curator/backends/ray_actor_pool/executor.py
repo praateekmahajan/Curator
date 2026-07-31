@@ -107,7 +107,8 @@ class RayActorPoolExecutor(BaseExecutor):
             current_tasks = initial_tasks or [EmptyTask()]
             # Process through each stage with ActorPool
             for i, stage in enumerate(stages):
-                logger.info(f"\nProcessing stage {i + 1}/{len(stages)}: {stage}")
+                stage_name = getattr(stage, "name", stage.__class__.__name__)
+                logger.info(f"\nProcessing stage {i + 1}/{len(stages)}: {stage_name}")
                 logger.info(f"  Input tasks: {len(current_tasks)}")
 
                 if not current_tasks:
@@ -126,7 +127,8 @@ class RayActorPoolExecutor(BaseExecutor):
                         ignore_head_node=self.ignore_head_node,
                     )
                     logger.info(
-                        f" {stage} - Creating {num_actors} actors (CPUs: {stage.resources.cpus}, GPUs: {stage.resources.gpus})"
+                        f" {stage_name} - Creating {num_actors} actors "
+                        f"(CPUs: {stage.resources.cpus}, GPUs: {stage.resources.gpus})"
                     )
                     # TODO: Clean up branching logic and handling here
                     # Check if this is a RAFT stage and create appropriate actor pool

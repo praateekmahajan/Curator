@@ -89,7 +89,8 @@ class RayDataExecutor(BaseExecutor):
             # Process through each stage
             for i, stage in enumerate(stages):
                 # TODO: add pipeline level config for verbosity
-                logger.info(f"Processing stage {i + 1}/{len(stages)}: {stage}")
+                stage_name = getattr(stage, "name", stage.__class__.__name__)
+                logger.info(f"Processing stage {i + 1}/{len(stages)}: {stage_name}")
                 logger.info(f"  CPU cores: {stage.resources.cpus}, GPU ratio: {stage.resources.gpus}")
 
                 # Create adapter for this stage
