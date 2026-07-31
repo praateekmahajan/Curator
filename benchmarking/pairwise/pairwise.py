@@ -19,7 +19,6 @@ from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.deduplication.semantic.pairwise import PairwiseCosineSimilarityStage
 from nemo_curator.stages.deduplication.semantic.ranking import RankingStrategy
 from nemo_curator.tasks import FileGroupTask
-from nemo_curator.tasks.utils import TaskPerfUtils
 
 RANKING_COLUMNS = ["source_family_id", "quality_rank", "recency_rank"]
 RANKING_ASCENDING = [False, False, False, True]
@@ -51,15 +50,6 @@ def _validate_schema(input_file: str, id_field: str, embedding_field: str) -> No
     if missing:
         msg = f"Input is missing required columns {sorted(missing)}: {input_file}"
         raise ValueError(msg)
-
-
-def _phase_metrics(task_metrics: dict[str, Any]) -> dict[str, Any]:
-    marker = "custom.pairwise_"
-    return {
-        key.split(marker, 1)[1].removesuffix("_mean"): value
-        for key, value in task_metrics.items()
-        if marker in key and key.endswith("_mean")
-    }
 
 
 def _compare_reference(output_file: Path, reference_file: Path) -> dict[str, Any]:
@@ -111,7 +101,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         input_embedding_dtype=args.input_embedding_dtype,
         num_additional_neighbors=args.num_additional_neighbors,
         profile=True,
-        write_kwargs={"compression": None},
+        write_kwargs={"compression": None if args.compression == "none" else args.compression},
     )
     task = FileGroupTask(
         dataset_name=f"centroid-{args.centroid_id}",
@@ -157,7 +147,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "additional_neighbor_output_bytes": neighbor_file.stat().st_size,
         }
 
-    task_metrics = TaskPerfUtils.aggregate_task_metrics(tasks)
     return {
         "params": {
             **vars(args),
@@ -175,7 +164,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "output_bytes": output_file.stat().st_size,
             **reference_metrics,
             **neighbor_metrics,
-            **_phase_metrics(task_metrics),
         },
         "tasks": tasks,
     }
@@ -193,6 +181,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-embedding-dtype", choices=["auto", "float16", "float32"], default="auto")
     parser.add_argument("--pairwise-batch-size", type=_pairwise_batch_size, default=1024)
     parser.add_argument("--num-additional-neighbors", type=int, choices=range(6), default=0)
+    parser.add_argument("--compression", choices=["none", "snappy"], default="snappy")
     parser.add_argument("--reference-output-path")
     return parser
 
