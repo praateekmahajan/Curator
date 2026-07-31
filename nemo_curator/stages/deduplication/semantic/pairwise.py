@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import os
 import time
 from dataclasses import dataclass
@@ -38,6 +39,13 @@ _AUTO_BATCH_MEMORY_FRACTION = 0.8
 _AUTO_BATCH_OVERHEAD_FACTOR = 1.25
 _AUTO_BATCH_ALIGNMENT = 256
 _MAX_ADDITIONAL_NEIGHBORS = 5
+
+
+def _release_cached_gpu_memory() -> None:
+    """Return unused allocator blocks so reused actors do not retain a previous cluster's peak."""
+    gc.collect()
+    torch.cuda.empty_cache()
+    cp.get_default_memory_pool().free_all_blocks()
 
 
 def _resolve_pairwise_batch_size(cluster_reps: "torch.Tensor", batch_size: PairwiseBatchSize) -> int:
@@ -292,7 +300,14 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
         self.name = "PairwiseCosineSimilarityStage"
         self.resources = Resources(cpus=1.0, gpus=1.0)
 
-    def process(self, task: FileGroupTask) -> FileGroupTask:  # noqa: C901, PLR0915
+    def process(self, task: FileGroupTask) -> FileGroupTask:
+        """Process one cluster and release cached allocations before this actor accepts another."""
+        try:
+            return self._process(task)
+        finally:
+            _release_cached_gpu_memory()
+
+    def _process(self, task: FileGroupTask) -> FileGroupTask:  # noqa: C901, PLR0915
         """Process a PairwiseFileGroupTask to compute pairwise similarities."""
         if task._metadata.get("filetype") != "parquet":
             msg = f"PairwiseCosineSimilarityStage only supports parquet files, got {task._metadata.get('filetype')}"
@@ -423,6 +438,10 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
             self.num_additional_neighbors,
         )
         profiler.end("similarity", phase_started)
+        # The dense O(N*B) Torch workspace is dead after the helper returns, but
+        # Torch's caching allocator otherwise keeps it reserved while cuDF/RMM
+        # materializes neighbor metadata and encodes Parquet.
+        torch.cuda.empty_cache()
         max_similarity = similarity_result.max_similarity
         max_indices = similarity_result.max_indices
 

@@ -125,6 +125,29 @@ class TestPairwiseCosineSimilarityBatched:
 class TestPairwiseCosineSimilarityStage:
     """Test cases for PairwiseCosineSimilarityStage."""
 
+    def test_releases_cached_memory_after_failure(self) -> None:
+        ranking_strategy = RankingStrategy.random()
+        stage = PairwiseCosineSimilarityStage(
+            id_field="id",
+            embedding_field="embedding",
+            output_path="/unused",
+            ranking_strategy=ranking_strategy,
+        )
+        task = FileGroupTask(
+            dataset_name="test",
+            data=[],
+            _metadata={"centroid_id": 0, "filetype": "parquet"},
+        )
+
+        with (
+            patch.object(stage, "_process", side_effect=RuntimeError("failed")),
+            patch("nemo_curator.stages.deduplication.semantic.pairwise._release_cached_gpu_memory") as release,
+            pytest.raises(RuntimeError, match="failed"),
+        ):
+            stage.process(task)
+
+        release.assert_called_once_with()
+
     def test_single_item_cluster(self, tmp_path: Path) -> None:
         """Test processing a cluster with a single item."""
         # Create test data with single embedding
