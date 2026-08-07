@@ -419,9 +419,12 @@ def test_dynamo_runtime_env_matches_base_environment() -> None:
     try:
         installed_version = dynamo_vllm.importlib.metadata.version("ai-dynamo")
     except dynamo_vllm.importlib.metadata.PackageNotFoundError:
-        expected_packages = ["ai-dynamo[vllm]"]
+        expected_packages = ["ai-dynamo[vllm]", "ai-dynamo-runtime"]
     else:
-        expected_packages = [f"ai-dynamo[vllm]=={installed_version}"]
+        expected_packages = [
+            f"ai-dynamo[vllm]=={installed_version}",
+            f"ai-dynamo-runtime=={installed_version}",
+        ]
 
     assert dynamo_vllm.DYNAMO_VLLM_RUNTIME_ENV["uv"]["packages"] == expected_packages
     assert "https://pypi.nvidia.com" not in dynamo_vllm._ACTOR_VENV_UV_OPTIONS

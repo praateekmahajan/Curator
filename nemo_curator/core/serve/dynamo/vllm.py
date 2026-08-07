@@ -64,8 +64,8 @@ def _dynamo_runtime_packages() -> list[str]:
     try:
         installed_version = importlib.metadata.version("ai-dynamo")
     except importlib.metadata.PackageNotFoundError:
-        return ["ai-dynamo[vllm]"]
-    return [f"ai-dynamo[vllm]=={installed_version}"]
+        return ["ai-dynamo[vllm]", "ai-dynamo-runtime"]
+    return [f"ai-dynamo[vllm]=={installed_version}", f"ai-dynamo-runtime=={installed_version}"]
 
 
 def _vllm_cu129_index_url() -> str | None:
