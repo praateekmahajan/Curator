@@ -19,13 +19,15 @@ benchmark = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = benchmark
 _SPEC.loader.exec_module(benchmark)
 
+import server_utils  # noqa: E402
+
 
 def test_parse_json_arg_requires_an_object() -> None:
-    assert benchmark._parse_json_arg('{"tensor_parallel_size": 1}', arg_name="--engine-kwargs") == {
+    assert server_utils.parse_json_arg('{"tensor_parallel_size": 1}', arg_name="--engine-kwargs") == {
         "tensor_parallel_size": 1
     }
     with pytest.raises(TypeError, match="must decode to a JSON object"):
-        benchmark._parse_json_arg("[]", arg_name="--engine-kwargs")
+        server_utils.parse_json_arg("[]", arg_name="--engine-kwargs")
 
 
 @pytest.mark.parametrize(
@@ -42,16 +44,21 @@ def test_parse_proc_size_rejects_wrong_dimensions() -> None:
 
 
 def test_dynamo_replicas_must_be_static() -> None:
-    assert benchmark._dynamo_num_replicas({"min_replicas": 4, "max_replicas": 4}) == 4
+    assert server_utils.static_num_replicas({"min_replicas": 4, "max_replicas": 4}) == 4
     with pytest.raises(ValueError, match="does not support autoscaling"):
-        benchmark._dynamo_num_replicas({"min_replicas": 2, "max_replicas": 4})
+        server_utils.static_num_replicas({"min_replicas": 2, "max_replicas": 4})
 
 
 def test_dynamo_gpu_count_includes_parallelism() -> None:
     assert (
-        benchmark._dynamo_gpu_count(
+        server_utils.server_gpu_count(
             {"tensor_parallel_size": 2, "pipeline_parallel_size": 2},
             {"min_replicas": 3, "max_replicas": 3},
         )
         == 12
     )
+
+
+def test_measured_dynamo_http_mode_maps_to_dynamo_backend() -> None:
+    assert benchmark._server_backend_for_mode("dynamo_http") == "dynamo"
+    assert benchmark._server_backend_for_mode("in_process_vllm") is None

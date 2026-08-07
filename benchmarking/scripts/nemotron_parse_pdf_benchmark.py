@@ -12,92 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# ruff: noqa: PLR0913
+# ruff: noqa: ANN401, PLR0913
 
-"""Nemotron-Parse PDF benchmark with explicit stages and server inference modes.
-
-Inference modes
----------------
-in_process_vllm
-    Runs vLLM inside each Curator GPU actor — the same path as the existing
-    ``nemotron_parse_pdf_benchmark.py``.  Suitable for single-node benchmarks.
-
-inference_server_base64
-    Encodes each page image as a base64 data-URL and calls a running Dynamo
-    InferenceServer via the OpenAI chat-completions API.  No shared filesystem
-    required.
-
-inference_server_file_url
-    Writes PNG page images to a shared directory, then passes an HTTP file-URL
-    to the server.  Requires ``--inference-server-file-url-prefix`` so Dynamo
-    workers can fetch the images over the network (Dynamo vLLM rejects
-    ``file://`` URLs).
-
-Serving Nemotron-Parse with InferenceServer (Dynamo backend)
-------------------------------------------------------------
-Nemotron-Parse requires two non-default Dynamo frontend flags:
-
-* ``dyn_chat_processor=vllm`` — Dynamo's native-Rust processor serializes
-  OpenAI multimodal ``content`` arrays rather than flattening them, corrupting
-  the model's pass-through chat template.  The vLLM processor renders
-  multimodal content correctly.
-
-* ``chat_template_content_format=string`` — Forces vLLM's processor to emit
-  a plain string instead of a structured content object, matching what the
-  model was trained on.
-
-Set these explicitly via ``--dynamo-frontend-kwargs`` or let this script apply
-its defaults.  Example::
-
-    python nemotron_parse_pdf_benchmark_new.py \\
-        --manifest manifest.jsonl \\
-        --pdf-dir /path/to/pdfs \\
-        --output-dir ./output \\
-        --benchmark-results-path results.json \\
-        --inference-mode inference_server_base64 \\
-        --model-path /path/to/NVIDIA-Nemotron-Parse-v1.2 \\
-        --engine-kwargs '{"trust_remote_code": true, "dtype": "bfloat16", "limit_mm_per_prompt": {"image": 1}, "enable_prefix_caching": false}' \\
-        --dynamo-frontend-kwargs '{"dyn_chat_processor": "vllm", "trust_remote_code": true, "chat_template_content_format": "string"}'
-
-InferenceServer setup (Python API)::
-
-    from nemo_curator.core.serve import (
-        DynamoRouterConfig,
-        DynamoServerConfig,
-        DynamoVLLMModelConfig,
-        InferenceServer,
-    )
-
-    server = InferenceServer(
-        models=[
-            DynamoVLLMModelConfig(
-                model_identifier="/path/to/NVIDIA-Nemotron-Parse-v1.2",
-                engine_kwargs={
-                    "trust_remote_code": True,
-                    "dtype": "bfloat16",
-                    "limit_mm_per_prompt": {"image": 1},
-                    # Nemotron-Parse (encoder-decoder) crashes with prefix caching on vLLM 0.19.
-                    "enable_prefix_caching": False,
-                },
-                dynamo_kwargs={"enable_multimodal": True},
-            )
-        ],
-        backend=DynamoServerConfig(
-            request_plane="tcp",
-            router=DynamoRouterConfig(
-                router_kwargs={
-                    # Required: native-Rust processor corrupts multimodal content arrays.
-                    "dyn_chat_processor": "vllm",
-                    "trust_remote_code": True,
-                    "chat_template_content_format": "string",
-                }
-            ),
-            subprocess_env={"DYN_TCP_REQUEST_TIMEOUT": "180"},
-        ),
-    )
-    server.start()
-    # server.endpoint -> "http://<host>:<port>/v1"
-"""
+"""Nemotron-Parse PDF benchmark with explicit in-process and server modes."""
 
 from __future__ import annotations
 
@@ -120,6 +37,16 @@ from urllib.parse import quote
 import pyarrow as pa
 from loguru import logger
 from openai import AsyncOpenAI
+from server_utils import (
+    ServerBackend,
+    build_multimodal_chat_messages,
+    default_dynamo_frontend_kwargs,
+    default_nemotron_parse_engine_kwargs,
+    parse_json_arg,
+    server_gpu_count,
+    start_inference_server,
+    static_autoscaling_config,
+)
 from utils import setup_executor, write_benchmark_results
 
 from nemo_curator.pipeline import Pipeline
@@ -140,15 +67,14 @@ from nemo_curator.tasks.utils import TaskPerfUtils
 if TYPE_CHECKING:
     import pandas as pd
 
-    from nemo_curator.core.serve import InferenceServer
-
 REPO_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tutorials" / "interleaved" / "nemotron_parse_pdf"))
 
 from main import create_nemotron_parse_pdf_argparser  # noqa: E402
 
-InferenceMode = Literal["in_process_vllm", "inference_server_file_url", "inference_server_base64"]
-ServerRequestMode = Literal["file_url", "base64"]
+InferenceMode = Literal["in_process_vllm", "dynamo_http", "ray_serve_http", "ray_serve_grpc"]
+ServerImageRequestMode = Literal["base64", "file_url"]
+ServerTransport = Literal["http", "ray_serve_handle"]
 PROC_SIZE_DIMS = 2
 
 
@@ -171,20 +97,6 @@ def _safe_path_component(value: object, *, max_len: int = 96) -> str:
     return (cleaned or "item")[:max_len]
 
 
-def _parse_json_arg(value: str | None, *, arg_name: str) -> dict[str, Any] | None:
-    if not value:
-        return None
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError as e:
-        msg = f"{arg_name} must be valid JSON: {e}"
-        raise ValueError(msg) from e
-    if not isinstance(parsed, dict):
-        msg = f"{arg_name} must decode to a JSON object"
-        raise TypeError(msg)
-    return parsed
-
-
 def _parse_proc_size(value: str) -> tuple[int, int]:
     parts = [int(part.strip()) for part in value.split(",") if part.strip()]
     if len(parts) != PROC_SIZE_DIMS:
@@ -193,80 +105,43 @@ def _parse_proc_size(value: str) -> tuple[int, int]:
     return parts[0], parts[1]
 
 
-def _dynamo_num_replicas(autoscaling_config: dict[str, Any] | None) -> int:
-    if not autoscaling_config:
-        return 1
-    min_replicas = int(autoscaling_config.get("min_replicas", 1))
-    max_replicas = int(autoscaling_config.get("max_replicas", min_replicas))
-    if min_replicas != max_replicas:
-        msg = (
-            "Dynamo backend does not support autoscaling for this benchmark; "
-            f"min_replicas ({min_replicas}) must equal max_replicas ({max_replicas})."
-        )
-        raise ValueError(msg)
-    return min_replicas
+def _server_backend_for_mode(inference_mode: str) -> ServerBackend | None:
+    if inference_mode == "in_process_vllm":
+        return None
+    if inference_mode == "dynamo_http":
+        return "dynamo"
+    if inference_mode in {"ray_serve_http", "ray_serve_grpc"}:
+        return "ray_serve"
+    msg = f"Unknown inference mode: {inference_mode}"
+    raise ValueError(msg)
 
 
-def _dynamo_gpu_count(engine_kwargs: dict[str, Any] | None, autoscaling_config: dict[str, Any] | None) -> int:
-    engine_kwargs = engine_kwargs or {}
-    tensor_parallel_size = int(engine_kwargs.get("tensor_parallel_size", 1))
-    pipeline_parallel_size = int(engine_kwargs.get("pipeline_parallel_size", 1))
-    return _dynamo_num_replicas(autoscaling_config) * tensor_parallel_size * pipeline_parallel_size
+def _server_transport_for_mode(inference_mode: str) -> ServerTransport:
+    if inference_mode == "ray_serve_grpc":
+        return "ray_serve_handle"
+    return "http"
 
 
-def _start_dynamo_inference_server(
-    *,
-    model_id: str,
-    engine_kwargs: dict[str, Any] | None = None,
-    frontend_kwargs: dict[str, Any] | None = None,
-    autoscaling_config: dict[str, Any] | None = None,
-    model_path: str | None = None,
-    request_timeout_s: int = 180,
-) -> InferenceServer:
-    """Start a local Dynamo-backed InferenceServer and return it.
-
-    ``frontend_kwargs`` must include ``dyn_chat_processor="vllm"`` for
-    Nemotron-Parse — see module docstring for details.
-    """
-    from nemo_curator.core.serve import DynamoRouterConfig, DynamoServerConfig, DynamoVLLMModelConfig, InferenceServer
-
-    model_config = DynamoVLLMModelConfig(
-        model_identifier=model_path or model_id,
-        model_name=model_id if model_path else None,
-        engine_kwargs=engine_kwargs or {},
-        dynamo_kwargs={"enable_multimodal": True},
-        num_replicas=_dynamo_num_replicas(autoscaling_config),
-    )
-    server = InferenceServer(
-        models=[model_config],
-        backend=DynamoServerConfig(
-            request_plane="tcp",
-            router=DynamoRouterConfig(router_kwargs=frontend_kwargs or {}),
-            subprocess_env={"DYN_TCP_REQUEST_TIMEOUT": str(request_timeout_s)},
-        ),
-    )
-    server.start()
-    return server
+def _extract_usage(payload: dict[str, Any]) -> tuple[int, int]:
+    usage = payload.get("usage") or {}
+    return int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
 
 
 @dataclass
 class NemotronParseInferenceServerStage(ProcessingStage[InterleavedBatch, InterleavedBatch]):
-    """Call a Dynamo/OpenAI-compatible Nemotron-Parse server asynchronously.
-
-    The stage intentionally uses the same stage name and additive custom metric
-    names as NemotronParseInferenceStage, so benchmark aggregation can compare
-    in-process vLLM and server-backed inference with the same keys.
-    """
+    """CPU client stage that calls Dynamo or Ray Serve for page-image inference."""
 
     endpoint: str
     model_name: str
-    request_mode: ServerRequestMode
+    server_transport: ServerTransport
+    image_request_mode: ServerImageRequestMode
     image_dir: str
     file_url_prefix: str | None = None
+    ray_serve_app_name: str = "default"
     text_in_pic: bool = False
     task_prompt: str | None = None
     proc_size: tuple[int, int] = (2048, 1664)
-    concurrency: int = 2
+    request_batch_size: int = 4
     request_timeout_s: float = 180.0
     max_retries: int = 3
     retry_base_delay_s: float = 1.0
@@ -274,7 +149,7 @@ class NemotronParseInferenceServerStage(ProcessingStage[InterleavedBatch, Interl
     stream_response: bool = True
     extra_body: dict[str, Any] = field(default_factory=dict)
     accounting_num_gpus: int = 1
-    stage_workers: int | None = None
+    client_num_workers: int | None = 16
     name: str = "nemotron_parse_inference"
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
 
@@ -282,9 +157,12 @@ class NemotronParseInferenceServerStage(ProcessingStage[InterleavedBatch, Interl
         if self.task_prompt is None:
             self.task_prompt = build_task_prompt(text_in_pic=self.text_in_pic)
         self.accounting_num_gpus = max(1, int(self.accounting_num_gpus))
-        self.concurrency = max(1, int(self.concurrency))
-        if self.stage_workers is not None:
-            self.stage_workers = max(1, int(self.stage_workers))
+        self.request_batch_size = int(self.request_batch_size)
+        if self.request_batch_size == 0:
+            msg = "request_batch_size must be positive, or -1 to send all pages in a task concurrently"
+            raise ValueError(msg)
+        if self.client_num_workers is not None:
+            self.client_num_workers = max(1, int(self.client_num_workers))
         self._image_dir = Path(self.image_dir).absolute()
 
     def inputs(self) -> tuple[list[str], list[str]]:
@@ -294,20 +172,15 @@ class NemotronParseInferenceServerStage(ProcessingStage[InterleavedBatch, Interl
         return ["data"], []
 
     def num_workers(self) -> int | None:
-        return self.stage_workers
+        return self.client_num_workers
 
     def ray_stage_spec(self) -> dict[str, Any]:
         return {"is_actor_stage": False}
 
-    def xenna_stage_spec(self) -> dict[str, Any]:
-        if self.stage_workers is None:
-            return {}
-        return {"num_workers_per_node": self.stage_workers}
-
     def _image_ref_for_row(
         self, *, task_id: str, row_idx: int, row: pd.Series, image_bytes: bytes
     ) -> tuple[str, Path | None]:
-        if self.request_mode == "base64":
+        if self.image_request_mode == "base64":
             content_type = str(row.get("content_type") or "image/png")
             encoded = base64.b64encode(image_bytes).decode("ascii")
             return f"data:{content_type};base64,{encoded}", None
@@ -394,21 +267,86 @@ class NemotronParseInferenceServerStage(ProcessingStage[InterleavedBatch, Interl
             finish_reason=getattr(choice, "finish_reason", None) if choice is not None else None,
         )
 
-    async def _query_one(self, client: AsyncOpenAI, image_ref: str) -> _ServerPageResult:
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": self.task_prompt},
-                    {"type": "image_url", "image_url": {"url": image_ref}},
-                ],
-            }
-        ]
+    async def _query_one_ray_serve_handle(self, handle: Any, messages: list[dict[str, Any]]) -> _ServerPageResult:
+        from starlette.responses import JSONResponse, StreamingResponse
+        from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+
+        request_payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": 0,
+            "top_p": 1.0,
+            "max_tokens": self.max_tokens,
+            "stream": self.stream_response,
+            **(self.extra_body or {}),
+        }
+        if self.stream_response:
+            request_payload["stream_options"] = {"include_usage": True}
+        body = ChatCompletionRequest.model_validate(request_payload)
+        response = await handle.chat.remote(body, None)
+
+        if isinstance(response, JSONResponse) or hasattr(response, "body"):
+            payload = json.loads(bytes(response.body).decode("utf-8"))
+            choice = payload.get("choices", [{}])[0]
+            message = choice.get("message") or {}
+            prompt_tokens, output_tokens = _extract_usage(payload)
+            return _ServerPageResult(
+                text=message.get("content") or "",
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+                finish_reason=choice.get("finish_reason"),
+            )
+
+        if isinstance(response, StreamingResponse) or hasattr(response, "body_iterator"):
+            text_parts: list[str] = []
+            prompt_tokens = 0
+            output_tokens = 0
+            finish_reason: str | None = None
+            async for raw_chunk in response.body_iterator:
+                chunk_text = raw_chunk.decode("utf-8") if isinstance(raw_chunk, bytes) else str(raw_chunk)
+                for line in chunk_text.splitlines():
+                    if not line.startswith("data: "):
+                        continue
+                    data = line.removeprefix("data: ").strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    payload = json.loads(data)
+                    usage_prompt, usage_output = _extract_usage(payload)
+                    prompt_tokens = usage_prompt or prompt_tokens
+                    output_tokens = usage_output or output_tokens
+                    choices = payload.get("choices") or []
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    finish_reason = choice.get("finish_reason") or finish_reason
+                    content = (choice.get("delta") or {}).get("content")
+                    if content:
+                        text_parts.append(content)
+            return _ServerPageResult(
+                text="".join(text_parts),
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+                finish_reason=finish_reason,
+            )
+
+        msg = f"Unexpected Ray Serve handle response type: {type(response)!r}"
+        raise TypeError(msg)
+
+    async def _query_one(
+        self,
+        *,
+        client: AsyncOpenAI | None,
+        ray_serve_handle: Any | None,
+        image_ref: str,
+    ) -> _ServerPageResult:
+        messages = build_multimodal_chat_messages(self.task_prompt or "", image_ref)
 
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                if self.stream_response:
+                if self.server_transport == "ray_serve_handle":
+                    result = await self._query_one_ray_serve_handle(ray_serve_handle, messages)
+                elif self.stream_response:
                     result = await self._query_one_streaming(client, messages)
                 else:
                     result = await self._query_one_nonstreaming(client, messages)
@@ -424,24 +362,45 @@ class NemotronParseInferenceServerStage(ProcessingStage[InterleavedBatch, Interl
 
         return _ServerPageResult(retries=self.max_retries, error=str(last_error) if last_error else "unknown")
 
+    def _effective_request_batch_size(self, num_image_refs: int) -> int:
+        if self.request_batch_size < 0:
+            return max(1, int(num_image_refs))
+        return self.request_batch_size
+
     async def _infer_async(self, image_refs: list[str]) -> list[_ServerPageResult]:
-        client = AsyncOpenAI(
-            api_key="unused",  # pragma: allowlist secret
-            base_url=self.endpoint.rstrip("/"),
-            timeout=self.request_timeout_s,
-        )
-        semaphore = asyncio.Semaphore(self.concurrency)
+        client: AsyncOpenAI | None = None
+        ray_serve_handle: Any | None = None
+        if self.server_transport == "ray_serve_handle":
+            from ray import serve
 
-        async def _bounded_query(idx: int, image_ref: str) -> tuple[int, _ServerPageResult]:
-            async with semaphore:
-                return idx, await self._query_one(client, image_ref)
+            ray_serve_handle = serve.get_app_handle(self.ray_serve_app_name)
+        else:
+            client = AsyncOpenAI(
+                api_key="unused",  # pragma: allowlist secret
+                base_url=self.endpoint.rstrip("/"),
+                timeout=self.request_timeout_s,
+            )
 
+        results: list[_ServerPageResult] = []
         try:
-            pairs = await asyncio.gather(*[_bounded_query(idx, ref) for idx, ref in enumerate(image_refs)])
-        finally:
-            await client.close()
+            request_batch_size = self._effective_request_batch_size(len(image_refs))
+            for start in range(0, len(image_refs), request_batch_size):
+                batch_refs = image_refs[start : start + request_batch_size]
 
-        return [result for _, result in sorted(pairs, key=lambda pair: pair[0])]
+                async def _query(idx: int, image_ref: str) -> tuple[int, _ServerPageResult]:
+                    return idx, await self._query_one(
+                        client=client,
+                        ray_serve_handle=ray_serve_handle,
+                        image_ref=image_ref,
+                    )
+
+                pairs = await asyncio.gather(*[_query(idx, ref) for idx, ref in enumerate(batch_refs, start=start)])
+                results.extend(result for _, result in sorted(pairs, key=lambda pair: pair[0]))
+        finally:
+            if client is not None:
+                await client.close()
+
+        return results
 
     def _infer(self, image_refs: list[str]) -> list[_ServerPageResult]:
         try:
@@ -536,11 +495,10 @@ class NemotronParseInferenceServerStage(ProcessingStage[InterleavedBatch, Interl
         metadata = dict(task._metadata)
         metadata["proc_size"] = list(self.proc_size)
         metadata["model_path"] = self.model_name
-        metadata["inference_mode"] = f"inference_server_{self.request_mode}"
+        metadata["inference_mode"] = self.server_transport
         metadata["inference_server_endpoint"] = self.endpoint
 
         return InterleavedBatch(
-            task_id=f"{task.task_id}_inferred",
             dataset_name=task.dataset_name,
             data=pa.Table.from_pandas(task_df, preserve_index=False),
             _metadata=metadata,
@@ -553,7 +511,6 @@ def create_explicit_nemotron_parse_pdf_pipeline(
     *,
     inference_stage: ProcessingStage[InterleavedBatch, InterleavedBatch],
 ) -> Pipeline:
-    """Build PDF processing pipeline with individually visible execution stages."""
     pipeline = Pipeline(
         name="nemotron_parse_pdf_explicit",
         description="PDF -> render pages -> infer -> postprocess -> interleaved parquet",
@@ -582,12 +539,7 @@ def create_explicit_nemotron_parse_pdf_pipeline(
     pipeline.add_stage(
         NemotronParsePostprocessStage(min_crop_px=args.min_crop_size).with_(resources=Resources(cpus=1.0))
     )
-    pipeline.add_stage(
-        InterleavedParquetWriterStage(
-            path=args.output_dir,
-            materialize_on_write=False,
-        ).with_(resources=Resources(cpus=1.0))
-    )
+    pipeline.add_stage(InterleavedParquetWriterStage(path=args.output_dir, materialize_on_write=False))
     return pipeline
 
 
@@ -596,11 +548,12 @@ def _compute_pdf_parse_metrics(
     run_time_taken: float,
     *,
     accounting_num_gpus: int,
+    stage_normalization_workers: int,
 ) -> dict[str, float]:
-    """Compute benchmark-level throughput metrics from additive task stats."""
     task_metrics = TaskPerfUtils.aggregate_task_metrics(output_tasks, prefix="task")
     metric_prefix = "task_nemotron_parse_inference_custom"
     accounting_num_gpus = max(1, int(accounting_num_gpus))
+    stage_normalization_workers = max(1, int(stage_normalization_workers))
 
     total_num_pages = task_metrics.get(f"{metric_prefix}.num_valid_pages_sum", 0.0)
     total_input_pages = task_metrics.get(f"{metric_prefix}.num_input_pages_sum", 0.0)
@@ -609,9 +562,15 @@ def _compute_pdf_parse_metrics(
     total_output_chars = task_metrics.get(f"{metric_prefix}.total_output_chars_sum", 0.0)
     vllm_inference_time_sum = task_metrics.get(f"{metric_prefix}.vllm_inference_time_sum", 0.0)
     server_request_time_sum = task_metrics.get(f"{metric_prefix}.inference_server_request_time_sum", 0.0)
+    num_request_errors = task_metrics.get(f"{metric_prefix}.num_request_errors_sum", 0.0)
+    num_empty_outputs = task_metrics.get(f"{metric_prefix}.num_empty_outputs_sum", 0.0)
+    num_output_length_truncated = task_metrics.get(f"{metric_prefix}.num_output_length_truncated_sum", 0.0)
     inference_wall_time_s = _safe_div(vllm_inference_time_sum, accounting_num_gpus)
     inference_pages_sec = _safe_div(total_num_pages, inference_wall_time_s)
     pipeline_pages_sec = _safe_div(total_num_pages, run_time_taken)
+    stage_process_time_sum = task_metrics.get("task_nemotron_parse_inference_process_time_sum", 0.0)
+    normalized_stage_time_s = _safe_div(stage_process_time_sum, stage_normalization_workers)
+    normalized_stage_pages_sec = _safe_div(total_num_pages, normalized_stage_time_s)
 
     return {
         "total_num_pages": total_num_pages,
@@ -621,7 +580,15 @@ def _compute_pdf_parse_metrics(
         "total_output_chars": total_output_chars,
         "vllm_inference_time_sum": vllm_inference_time_sum,
         "inference_server_request_time_sum": server_request_time_sum,
+        "num_request_errors": num_request_errors,
+        "num_empty_outputs": num_empty_outputs,
+        "num_output_length_truncated": num_output_length_truncated,
         "accounting_num_gpus": float(accounting_num_gpus),
+        "stage_normalization_workers": float(stage_normalization_workers),
+        "normalized_inference_stage_time_s": normalized_stage_time_s,
+        "normalized_inference_stage_pages_per_sec": normalized_stage_pages_sec,
+        "steady_state_inference_stage_time_s": normalized_stage_time_s,
+        "steady_state_inference_stage_pages_per_sec": normalized_stage_pages_sec,
         "inference_wall_time_s": inference_wall_time_s,
         "inference_pages_sec": inference_pages_sec,
         "pipeline_pages_sec": pipeline_pages_sec,
@@ -641,22 +608,13 @@ def _count_processed_pdfs(output_tasks: list[FileGroupTask]) -> int:
     return len(source_entries)
 
 
-def _server_request_mode(inference_mode: InferenceMode) -> ServerRequestMode:
-    if inference_mode == "inference_server_file_url":
-        return "file_url"
-    if inference_mode == "inference_server_base64":
-        return "base64"
-    msg = f"{inference_mode} is not an inference-server mode"
-    raise ValueError(msg)
-
-
 def _create_inference_stage(
     args: argparse.Namespace,
     *,
     endpoint: str | None,
     served_model_name: str,
     output_dir: Path,
-    server_gpu_count: int,
+    accounting_num_gpus: int,
     extra_body: dict[str, Any],
     engine_kwargs: dict[str, Any] | None = None,
 ) -> ProcessingStage[InterleavedBatch, InterleavedBatch]:
@@ -672,69 +630,90 @@ def _create_inference_stage(
             max_num_seqs=args.max_num_seqs,
             enforce_eager=args.enforce_eager,
             engine_kwargs=engine_kwargs,
-        ).with_(resources=Resources(cpus=1.0, gpus=1.0))
+        ).with_(resources=Resources(cpus=1.0, gpus=1.0), num_workers=args.gpu_num_workers)
 
     if endpoint is None:
         msg = "endpoint is required for inference-server modes"
         raise ValueError(msg)
 
     image_dir = args.inference_server_image_dir or str(output_dir / "_inference_server_page_images")
-    return NemotronParseInferenceServerStage(
+    server_stage = NemotronParseInferenceServerStage(
         endpoint=endpoint,
         model_name=served_model_name,
-        request_mode=_server_request_mode(args.inference_mode),
+        server_transport=_server_transport_for_mode(args.inference_mode),
+        image_request_mode=getattr(args, "server_image_request_mode", "base64"),
         image_dir=image_dir,
         file_url_prefix=args.inference_server_file_url_prefix,
         text_in_pic=args.text_in_pic,
         proc_size=args.inference_server_proc_size,
-        concurrency=args.inference_server_concurrency,
+        request_batch_size=args.request_batch_size,
         request_timeout_s=args.inference_server_request_timeout_s,
         max_retries=args.inference_server_max_retries,
         max_tokens=args.inference_server_max_tokens,
         stream_response=args.inference_server_stream,
         extra_body=extra_body,
-        accounting_num_gpus=server_gpu_count,
-        stage_workers=args.inference_server_stage_workers,
+        accounting_num_gpus=accounting_num_gpus,
+        client_num_workers=args.client_num_workers,
     )
+    return server_stage.with_(resources=Resources(cpus=1.0), num_workers=args.client_num_workers)
 
 
-def run_nemotron_parse_pdf_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa: PLR0915
-    """Run the Nemotron-Parse PDF benchmark and collect metrics."""
-    executor = setup_executor(args.executor)
+def run_nemotron_parse_pdf_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901, PLR0912, PLR0915
+    executor_config = {"execution_mode": args.execution_mode} if args.executor == "xenna" else None
+    executor = setup_executor(args.executor, config=executor_config)
 
     output_dir = Path(args.output_dir).absolute()
     output_dir.mkdir(parents=True, exist_ok=True)
-    if args.inference_mode == "inference_server_file_url":
-        if args.inference_server_file_url_prefix is None:
-            msg = (
-                "Dynamo vLLM rejects local file:// image URLs. "
-                "Use --inference-mode=inference_server_base64, or provide an HTTP(S) "
-                "--inference-server-file-url-prefix that Dynamo workers can fetch."
-            )
-            raise ValueError(msg)
+
+    if args.server_image_request_mode == "file_url":
         image_dir = Path(args.inference_server_image_dir or output_dir / "_inference_server_page_images").absolute()
         image_dir.mkdir(parents=True, exist_ok=True)
         args.inference_server_image_dir = str(image_dir)
 
-    engine_kwargs = _parse_json_arg(args.engine_kwargs, arg_name="--engine-kwargs")
-    frontend_kwargs = _parse_json_arg(args.dynamo_frontend_kwargs, arg_name="--dynamo-frontend-kwargs")
-    autoscaling_config = _parse_json_arg(args.autoscaling_config, arg_name="--autoscaling-config")
-    extra_body = _parse_json_arg(args.inference_server_extra_body, arg_name="--inference-server-extra-body") or {}
-    if args.inference_mode != "in_process_vllm":
-        engine_kwargs = dict(engine_kwargs or {})
-        engine_kwargs.setdefault("trust_remote_code", True)
-        engine_kwargs.setdefault("dtype", "bfloat16")
-        engine_kwargs.setdefault("limit_mm_per_prompt", {"image": 1})
-        # Nemotron-Parse is encoder-decoder multimodal; vLLM 0.19 crashes in
-        # CrossAttentionManager when prefix caching is enabled.
-        engine_kwargs.setdefault("enable_prefix_caching", False)
-        frontend_kwargs = dict(frontend_kwargs or {})
-        # Dynamo's native-Rust processor serializes multimodal content arrays
-        # instead of flattening them, corrupting Nemotron-Parse's pass-through
-        # chat template. Set these explicitly — no auto-injection in the backend.
-        frontend_kwargs.setdefault("dyn_chat_processor", "vllm")
-        frontend_kwargs.setdefault("trust_remote_code", True)
-        frontend_kwargs.setdefault("chat_template_content_format", "string")
+    parsed_engine_kwargs = parse_json_arg(args.engine_kwargs, arg_name="--engine-kwargs")
+    autoscaling_config = parse_json_arg(args.autoscaling_config, arg_name="--autoscaling-config")
+    autoscaling_config = autoscaling_config or static_autoscaling_config(args.server_num_replicas)
+    dynamo_disagg_config = parse_json_arg(args.dynamo_disagg_config, arg_name="--dynamo-disagg-config")
+    dynamo_encoder_disagg_config = parse_json_arg(
+        args.dynamo_encoder_disagg_config, arg_name="--dynamo-encoder-disagg-config"
+    )
+    dynamo_model_runtime_env = parse_json_arg(args.dynamo_model_runtime_env, arg_name="--dynamo-model-runtime-env")
+    extra_body = parse_json_arg(args.inference_server_extra_body, arg_name="--inference-server-extra-body") or {}
+
+    server_backend = _server_backend_for_mode(args.inference_mode)
+    if dynamo_disagg_config and server_backend != "dynamo":
+        msg = "--dynamo-disagg-config is only valid with --inference-mode=dynamo_http"
+        raise ValueError(msg)
+    if dynamo_encoder_disagg_config and server_backend != "dynamo":
+        msg = "--dynamo-encoder-disagg-config is only valid with --inference-mode=dynamo_http"
+        raise ValueError(msg)
+    if dynamo_disagg_config and dynamo_encoder_disagg_config:
+        msg = "--dynamo-disagg-config and --dynamo-encoder-disagg-config are mutually exclusive"
+        raise ValueError(msg)
+
+    engine_kwargs = parsed_engine_kwargs
+    frontend_kwargs: dict[str, Any] | None = None
+    started_server = None
+    serve_startup_s = 0.0
+    server_gpu_total = 0
+    served_model_name = args.model_id or DEFAULT_MODEL_PATH
+
+    if server_backend is not None:
+        engine_kwargs = default_nemotron_parse_engine_kwargs(parsed_engine_kwargs)
+        server_gpu_total = server_gpu_count(
+            engine_kwargs, autoscaling_config, dynamo_disagg_config, dynamo_encoder_disagg_config
+        )
+        accounting_num_gpus = max(1, int(args.accounting_num_gpus or server_gpu_total))
+        if server_backend == "dynamo":
+            frontend_kwargs = default_dynamo_frontend_kwargs(
+                use_vllm_chat_processor=args.dynamo_use_vllm_chat_processor,
+                overrides=parse_json_arg(args.dynamo_frontend_kwargs, arg_name="--dynamo-frontend-kwargs"),
+            )
+        else:
+            frontend_kwargs = {}
+    else:
+        accounting_num_gpus = max(1, int(args.accounting_num_gpus or args.gpu_num_workers))
+        autoscaling_config = None
 
     logger.info(f"Manifest: {args.manifest}")
     logger.info(f"PDF source: zip_base_dir={args.zip_base_dir}, pdf_dir={args.pdf_dir}")
@@ -742,42 +721,39 @@ def run_nemotron_parse_pdf_benchmark(args: argparse.Namespace) -> dict[str, Any]
     logger.info(f"Inference mode: {args.inference_mode}")
     logger.info(f"Model path: {args.model_path}")
     logger.info(f"PDFs per task: {args.pdfs_per_task}, max PDFs: {args.max_pdfs}")
-
-    inference_server: InferenceServer | None = None
-    serve_startup_s = 0.0
-    server_gpu_count = 1
-    accounting_num_gpus = max(1, int(args.accounting_num_gpus or 1))
-    served_model_name = args.model_id or args.model_path or DEFAULT_MODEL_PATH
+    logger.info(f"Accounting GPUs: {accounting_num_gpus}")
 
     try:
-        if args.inference_mode != "in_process_vllm":
-            server_gpu_count = _dynamo_gpu_count(engine_kwargs, autoscaling_config)
-            accounting_num_gpus = max(1, int(args.accounting_num_gpus or server_gpu_count))
+        if server_backend is not None:
             logger.info(
-                "Starting Dynamo InferenceServer "
-                f"served_model_name={served_model_name}, engine_kwargs={engine_kwargs}, "
-                f"frontend_kwargs={frontend_kwargs}, "
-                f"autoscaling_config={autoscaling_config}, server_gpus={server_gpu_count}, "
-                f"accounting_gpus={accounting_num_gpus}"
+                f"Starting {server_backend} server with replicas={args.server_num_replicas}, "
+                f"engine_kwargs={engine_kwargs}, frontend_kwargs={frontend_kwargs}, "
+                f"autoscaling_config={autoscaling_config}, dynamo_disagg_config={dynamo_disagg_config}, "
+                f"dynamo_encoder_disagg_config={dynamo_encoder_disagg_config}, "
+                f"server_gpus={server_gpu_total}"
             )
-            serve_t0 = time.perf_counter()
-            inference_server = _start_dynamo_inference_server(
+            started_server = start_inference_server(
+                backend=server_backend,
                 model_id=served_model_name,
                 model_path=args.model_path,
                 engine_kwargs=engine_kwargs,
-                frontend_kwargs=frontend_kwargs,
                 autoscaling_config=autoscaling_config,
+                frontend_kwargs=frontend_kwargs,
                 request_timeout_s=max(1, int(args.inference_server_request_timeout_s)),
+                dynamo_disagg_config=dynamo_disagg_config,
+                dynamo_encoder_disagg_config=dynamo_encoder_disagg_config,
+                dynamo_model_runtime_env=dynamo_model_runtime_env,
             )
-            serve_startup_s = time.perf_counter() - serve_t0
-            logger.info(f"InferenceServer ready at {inference_server.endpoint} (startup: {serve_startup_s:.1f}s)")
+            serve_startup_s = started_server.startup_s
+            logger.info(f"InferenceServer ready at {started_server.server.endpoint} (startup: {serve_startup_s:.1f}s)")
 
+        endpoint = started_server.server.endpoint if started_server is not None else None
         inference_stage = _create_inference_stage(
             args,
-            endpoint=inference_server.endpoint if inference_server else None,
+            endpoint=endpoint,
             served_model_name=served_model_name,
             output_dir=output_dir,
-            server_gpu_count=accounting_num_gpus,
+            accounting_num_gpus=accounting_num_gpus,
             extra_body=extra_body,
             engine_kwargs=engine_kwargs,
         )
@@ -799,13 +775,25 @@ def run_nemotron_parse_pdf_benchmark(args: argparse.Namespace) -> dict[str, Any]
                 output_tasks,
                 run_time_taken,
                 accounting_num_gpus=accounting_num_gpus,
+                stage_normalization_workers=args.gpu_num_workers
+                if args.inference_mode == "in_process_vllm"
+                else args.client_num_workers,
             )
+            num_request_errors = pdf_parse_metrics.get("num_request_errors", 0.0)
 
-            logger.success(f"Benchmark completed in {run_time_taken:.2f}s")
-            logger.success(f"Processed {num_pdfs_processed} PDFs")
-            logger.success(f"Inference throughput: {pdf_parse_metrics['inference_pages_sec']:.2f} pages/s")
-            logger.success(f"Pipeline throughput: {pdf_parse_metrics['pipeline_pages_sec']:.2f} pages/s")
-            success = True
+            logger.info(f"Benchmark completed in {run_time_taken:.2f}s")
+            logger.info(f"Processed {num_pdfs_processed} PDFs")
+            logger.info(
+                "Normalized inference stage throughput: "
+                f"{pdf_parse_metrics['normalized_inference_stage_pages_per_sec']:.2f} pages/s"
+            )
+            logger.info(f"Inference throughput: {pdf_parse_metrics['inference_pages_sec']:.2f} pages/s")
+            logger.info(f"Pipeline throughput: {pdf_parse_metrics['pipeline_pages_sec']:.2f} pages/s")
+            if num_request_errors > 0:
+                logger.error(f"Benchmark produced {num_request_errors:.0f} inference server request error(s)")
+            else:
+                logger.success("Benchmark completed without inference server request errors")
+                success = True
 
         except Exception as e:
             error_traceback = traceback.format_exc()
@@ -816,9 +804,9 @@ def run_nemotron_parse_pdf_benchmark(args: argparse.Namespace) -> dict[str, Any]
             pdf_parse_metrics = {}
 
     finally:
-        if inference_server is not None:
+        if started_server is not None:
             with contextlib.suppress(Exception):
-                inference_server.stop()
+                started_server.server.stop()
 
     return {
         "params": {
@@ -830,6 +818,9 @@ def run_nemotron_parse_pdf_benchmark(args: argparse.Namespace) -> dict[str, Any]
             "output_dir": str(output_dir),
             "benchmark_results_path": str(args.benchmark_results_path),
             "inference_mode": args.inference_mode,
+            "server_backend": server_backend,
+            "server_transport": _server_transport_for_mode(args.inference_mode),
+            "server_image_request_mode": args.server_image_request_mode,
             "model_path": args.model_path,
             "model_id": args.model_id,
             "served_model_name": served_model_name,
@@ -840,8 +831,11 @@ def run_nemotron_parse_pdf_benchmark(args: argparse.Namespace) -> dict[str, Any]
             "max_pages": args.max_pages,
             "inference_batch_size": args.inference_batch_size,
             "max_num_seqs": args.max_num_seqs,
-            "inference_server_concurrency": args.inference_server_concurrency,
-            "inference_server_stage_workers": args.inference_server_stage_workers,
+            "gpu_num_workers": args.gpu_num_workers,
+            "client_num_workers": args.client_num_workers,
+            "request_batch_size": args.request_batch_size,
+            "server_num_replicas": args.server_num_replicas,
+            "dynamo_use_vllm_chat_processor": args.dynamo_use_vllm_chat_processor,
             "inference_server_request_timeout_s": args.inference_server_request_timeout_s,
             "inference_server_max_retries": args.inference_server_max_retries,
             "inference_server_max_tokens": args.inference_server_max_tokens,
@@ -850,8 +844,11 @@ def run_nemotron_parse_pdf_benchmark(args: argparse.Namespace) -> dict[str, Any]
             "inference_server_file_url_prefix": args.inference_server_file_url_prefix,
             "engine_kwargs": engine_kwargs,
             "dynamo_frontend_kwargs": frontend_kwargs,
+            "dynamo_disagg_config": dynamo_disagg_config,
+            "dynamo_encoder_disagg_config": dynamo_encoder_disagg_config,
+            "dynamo_model_runtime_env": dynamo_model_runtime_env,
             "autoscaling_config": autoscaling_config,
-            "server_accounting_gpus": server_gpu_count,
+            "server_gpu_count": server_gpu_total,
             "accounting_num_gpus": accounting_num_gpus,
         },
         "metrics": {
@@ -861,7 +858,7 @@ def run_nemotron_parse_pdf_benchmark(args: argparse.Namespace) -> dict[str, Any]
             "num_output_tasks": len(output_tasks),
             "throughput_pdfs_per_sec": _safe_div(num_pdfs_processed, run_time_taken),
             "serve_startup_s": serve_startup_s,
-            "server_gpu_count": server_gpu_count,
+            "server_gpu_count": server_gpu_total,
             **pdf_parse_metrics,
         },
         "tasks": output_tasks,
@@ -886,85 +883,132 @@ def main() -> int:
     parser.add_argument(
         "--inference-mode",
         default="in_process_vllm",
-        choices=["in_process_vllm", "inference_server_file_url", "inference_server_base64"],
-        help="Inference path to benchmark",
+        choices=["in_process_vllm", "dynamo_http", "ray_serve_http", "ray_serve_grpc"],
+        help="Inference path to benchmark. ray_serve_grpc uses Ray Serve's Python deployment handle.",
     )
     parser.add_argument(
         "--model-id",
-        default=None,
-        help="Served model name for Dynamo modes. Defaults to --model-path.",
+        default=DEFAULT_MODEL_PATH,
+        help="Served model name for server modes.",
     )
     parser.add_argument(
         "--engine-kwargs",
         type=str,
         default=None,
-        help="JSON string of vLLM/Dynamo engine kwargs, for example '{\"tensor_parallel_size\": 1}'",
+        help="JSON string of vLLM engine kwargs, for example '{\"tensor_parallel_size\": 1}'",
     )
     parser.add_argument(
         "--dynamo-frontend-kwargs",
         type=str,
         default=None,
+        help="JSON string of Dynamo frontend kwargs.",
+    )
+    parser.add_argument(
+        "--dynamo-disagg-config",
+        type=str,
+        default=None,
         help=(
-            "JSON string of Dynamo frontend kwargs. Server modes default to "
-            '\'{"dyn_chat_processor": "vllm", "trust_remote_code": true, '
-            '"chat_template_content_format": "string"}\' to match vLLM serve preprocessing.'
+            "Optional JSON role config for Dynamo disaggregated serving. "
+            'Example: \'{"prefill":{"num_replicas":3},"decode":{"num_replicas":1}}\'.'
+        ),
+    )
+    parser.add_argument(
+        "--dynamo-encoder-disagg-config",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON role config for Dynamo multimodal encoder-disaggregated E/PD serving. "
+            'Example: \'{"encode":{"num_replicas":1}}\'. Backend replicas still come from '
+            "--server-num-replicas."
+        ),
+    )
+    parser.add_argument(
+        "--dynamo-model-runtime-env",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON Ray runtime_env merged into Dynamo model actors. "
+            "Useful for smoke-testing patched actor-side packages via env_vars or py_modules."
         ),
     )
     parser.add_argument(
         "--autoscaling-config",
         type=str,
         default=None,
-        help='JSON string with static Dynamo replicas, for example \'{"min_replicas": 4, "max_replicas": 4}\'',
+        help=(
+            "Optional static JSON replica config. If omitted, --server-num-replicas is used. "
+            "For this benchmark min_replicas must equal max_replicas."
+        ),
     )
+    parser.add_argument("--gpu-num-workers", type=int, default=4, help="Fixed GPU workers for in-process Ray Data.")
     parser.add_argument(
-        "--inference-server-concurrency",
-        type=int,
-        default=2,
-        help="Async page requests per server-inference stage worker",
-    )
-    parser.add_argument(
+        "--client-num-workers",
         "--inference-server-stage-workers",
+        dest="client_num_workers",
         type=int,
-        default=None,
-        help="Optional fixed client-side inference stage worker count for server modes",
+        default=16,
+        help="Fixed CPU client workers for inference-server modes.",
+    )
+    parser.add_argument(
+        "--request-batch-size",
+        "--inference-server-concurrency",
+        dest="request_batch_size",
+        type=int,
+        default=4,
+        help="Number of page requests each client worker keeps in flight at once. Use -1 for all pages in a task.",
+    )
+    parser.add_argument(
+        "--server-num-replicas",
+        type=int,
+        default=1,
+        help="Static server replica count when --autoscaling-config is omitted.",
+    )
+    parser.add_argument(
+        "--dynamo-use-vllm-chat-processor",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include dyn_chat_processor='vllm' in Dynamo frontend kwargs.",
+    )
+    parser.add_argument(
+        "--server-image-request-mode",
+        choices=["base64", "file_url"],
+        default="base64",
+        help="How page images are sent to inference servers.",
     )
     parser.add_argument(
         "--inference-server-request-timeout-s",
         type=float,
         default=180.0,
-        help="Per-request timeout for server inference",
+        help="Per-request timeout for server inference.",
     )
     parser.add_argument(
         "--inference-server-max-retries",
         type=int,
         default=3,
-        help="Retries per page request for server inference",
+        help="Retries per page request for server inference.",
     )
     parser.add_argument(
         "--inference-server-max-tokens",
         type=int,
         default=9000,
-        help="Max generated tokens per page for server inference",
+        help="Max generated tokens per page for server inference.",
     )
     parser.add_argument(
         "--inference-server-stream",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help=(
-            "Use streaming chat completions and aggregate chunks client-side. "
-            "This avoids Dynamo's non-streaming chat aggregator for vLLM-processed multimodal requests."
-        ),
+        help="Use streaming chat completions and aggregate chunks client-side.",
     )
     parser.add_argument(
         "--inference-server-extra-body",
         type=str,
         default='{"top_k": 1, "repetition_penalty": 1.1, "skip_special_tokens": false}',
-        help="JSON object passed as OpenAI extra_body for server inference",
+        help="JSON object passed as OpenAI extra_body for HTTP server inference.",
     )
     parser.add_argument(
         "--inference-server-image-dir",
         default=None,
-        help="Directory used to write PNG page images for inference_server_file_url mode",
+        help="Directory used to write PNG page images for file_url mode.",
     )
     parser.add_argument(
         "--inference-server-file-url-prefix",
@@ -975,21 +1019,18 @@ def main() -> int:
         "--inference-server-proc-size",
         type=_parse_proc_size,
         default=(2048, 1664),
-        help="Processor size HEIGHT,WIDTH used by postprocess in server modes",
+        help="Processor size HEIGHT,WIDTH used by postprocess in server modes.",
     )
     parser.add_argument(
         "--accounting-num-gpus",
         type=int,
         default=None,
-        help=(
-            "GPU count used to normalize inference_pages_sec. Defaults to Dynamo replica GPU count "
-            "for server modes and 1 for in-process mode."
-        ),
+        help="GPU count used to normalize inference metrics.",
     )
 
     args = parser.parse_args()
 
-    logger.info("=== Nemotron-Parse PDF Explicit Pipeline Benchmark Starting ===")
+    logger.info("=== Nemotron-Parse PDF Benchmark Starting ===")
     logger.info(f"Arguments: {vars(args)}")
 
     results: dict[str, Any] = {
