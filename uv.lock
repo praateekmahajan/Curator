@@ -93,8 +93,8 @@ wheels = [
 
 [[package]]
 name = "ai-dynamo"
-version = "1.3.0.post1"
-source = { registry = "https://pypi.org/simple" }
+version = "1.4.0.dev20260807"
+source = { registry = "https://pypi.nvidia.com/" }
 dependencies = [
     { name = "ai-dynamo-runtime" },
     { name = "aiohttp" },
@@ -107,20 +107,20 @@ dependencies = [
     { name = "zstandard" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/18/ef/8c0d3bef0f555f375a18a968d607be4af40dcf51144866db5cb5f70c51fd/ai_dynamo-1.3.0.post1-py3-none-any.whl", hash = "sha256:cd855d8e567752ebac92a8a6746963efcdc90bce02d944580ef8d0f6f9739847", size = 2681107, upload-time = "2026-07-22T04:11:48.476Z" },
+    { url = "https://pypi.nvidia.com/ai-dynamo/ai_dynamo-1.4.0.dev20260807-py3-none-any.whl", hash = "sha256:43d2ff07ea8c60efea41c2f9085ebc846479639e63dfdb276ec1dbc93b144abf" },
 ]
 
 [[package]]
 name = "ai-dynamo-runtime"
-version = "1.3.0.post1"
-source = { registry = "https://pypi.org/simple" }
+version = "1.4.0.dev20260807"
+source = { registry = "https://pypi.nvidia.com/" }
 dependencies = [
     { name = "pydantic" },
     { name = "uvloop" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d8/f1/6b468ac39afdb0292d69c9c3b99ca165c9ed97493b9f0fd66b325e1255d4/ai_dynamo_runtime-1.3.0.post1-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:45ca602fe4afca166c66150f2eccf2161dc39c1d0055914bef2a66c9bc0844dc", size = 46554625, upload-time = "2026-07-22T04:36:11.066Z" },
-    { url = "https://files.pythonhosted.org/packages/7d/2a/a3f4247b4b36ba0414ca8a06bcecddc5913d267bfb9c2a79464bf195fcfe/ai_dynamo_runtime-1.3.0.post1-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:c6da59d250da41f2bde33641649edbca800186e2cec0aede8763c6c6de35b877", size = 47106907, upload-time = "2026-07-22T04:35:26.366Z" },
+    { url = "https://pypi.nvidia.com/ai-dynamo-runtime/ai_dynamo_runtime-1.4.0.dev20260807-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:32a9e53433ab75c595a8205960a695dd593cc1059f9204976ed19ec76338673b" },
+    { url = "https://pypi.nvidia.com/ai-dynamo-runtime/ai_dynamo_runtime-1.4.0.dev20260807-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:2ed405778a3ce2b725287e6049e4a7b8811d0d54581313e29d34ff85acd6a214" },
 ]
 
 [[package]]
@@ -5209,6 +5209,7 @@ dependencies = [
 all = [
     { name = "accelerate" },
     { name = "ai-dynamo", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+    { name = "ai-dynamo-runtime", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "aiohttp" },
     { name = "av" },
     { name = "beautifulsoup4" },
@@ -5377,6 +5378,7 @@ image-cuda12 = [
 ]
 inference-server = [
     { name = "ai-dynamo", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+    { name = "ai-dynamo-runtime", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "gpustat" },
     { name = "nixl-cu12", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "nvidia-ml-py" },
@@ -5459,6 +5461,7 @@ sdg-cpu = [
 ]
 sdg-cuda12 = [
     { name = "ai-dynamo", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+    { name = "ai-dynamo-runtime", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "data-designer" },
     { name = "gpustat" },
     { name = "nixl-cu12", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
@@ -5615,7 +5618,8 @@ test = [
 requires-dist = [
     { name = "absl-py", specifier = ">=2.0.0,<3.0.0" },
     { name = "accelerate", marker = "extra == 'audio-common'", specifier = ">=1.12.0" },
-    { name = "ai-dynamo", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'inference-server') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'inference-server')", specifier = ">=1.3.0" },
+    { name = "ai-dynamo", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'inference-server') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'inference-server')", specifier = "==1.4.0.dev20260807", index = "https://pypi.nvidia.com/" },
+    { name = "ai-dynamo-runtime", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'inference-server') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'inference-server')", specifier = "==1.4.0.dev20260807", index = "https://pypi.nvidia.com/" },
     { name = "aiohttp", marker = "extra == 'translation-nmt'", specifier = ">=3.13.3" },
     { name = "av", marker = "extra == 'video-cpu'", specifier = "==17.1.0" },
     { name = "beautifulsoup4", marker = "extra == 'text-cpu'" },
