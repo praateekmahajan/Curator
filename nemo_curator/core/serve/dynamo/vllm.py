@@ -57,15 +57,25 @@ if TYPE_CHECKING:
 _ACTOR_VENV_OVERRIDES_PATH = Path(tempfile.gettempdir()) / "nemo_curator_dynamo_actor_overrides.txt"
 _ACTOR_VENV_NIXL_CU13_EXCLUSION = "nixl-cu13 ; sys_platform == 'never'"
 _ACTOR_VENV_CUDA_TAG = "cu129"
+_ACTOR_VENV_FLASHINFER_VERSION = "0.6.14"
+_ACTOR_VENV_QUACK_VERSION = "0.6.1"
+_ACTOR_VENV_FLASHINFER_INDEX_URL = "https://flashinfer.ai/whl/"
 
 
 def _dynamo_runtime_packages() -> list[str]:
-    """Install Dynamo's vLLM extra without upgrading the base Dynamo release."""
+    """Install Dynamo's vLLM stack with its matching external kernel packages."""
     try:
         installed_version = importlib.metadata.version("ai-dynamo")
     except importlib.metadata.PackageNotFoundError:
-        return ["ai-dynamo[vllm]", "ai-dynamo-runtime"]
-    return [f"ai-dynamo[vllm]=={installed_version}", f"ai-dynamo-runtime=={installed_version}"]
+        dynamo_packages = ["ai-dynamo[vllm]", "ai-dynamo-runtime"]
+    else:
+        dynamo_packages = [f"ai-dynamo[vllm]=={installed_version}", f"ai-dynamo-runtime=={installed_version}"]
+    return [
+        *dynamo_packages,
+        f"flashinfer-python=={_ACTOR_VENV_FLASHINFER_VERSION}",
+        f"flashinfer-cubin=={_ACTOR_VENV_FLASHINFER_VERSION}",
+        f"quack-kernels=={_ACTOR_VENV_QUACK_VERSION}",
+    ]
 
 
 def _vllm_cu129_index_url() -> str | None:
@@ -96,6 +106,8 @@ _ACTOR_VENV_UV_OPTIONS = [
     _ACTOR_VENV_CUDA_TAG,
     "--index-strategy",
     "unsafe-best-match",
+    "--extra-index-url",
+    _ACTOR_VENV_FLASHINFER_INDEX_URL,
 ]
 if _vllm_index_url := _vllm_cu129_index_url():
     _ACTOR_VENV_UV_OPTIONS.extend(["--extra-index-url", _vllm_index_url])

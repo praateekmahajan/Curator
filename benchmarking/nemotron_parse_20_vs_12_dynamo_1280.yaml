@@ -85,6 +85,7 @@ entries:
       --inference-server-request-timeout-s=300
       --accounting-num-gpus=4
       --engine-kwargs='{"tensor_parallel_size": 1, "disable_hybrid_kv_cache_manager": false, "enable_prefix_caching": false}'
+      --dynamo-model-runtime-env='{"env_vars":{"PYTHONPATH":"/model_weights/models--nvidia--NVIDIA-Nemotron-Parse-2.0/snapshots/635b84d9b09bb9526b9a684d0b2c953d3cc3df05/vllm_tied_patch"}}'
 
   - name: pdf_1280_parse12_in_process_p10_gpu4
     enabled: true
