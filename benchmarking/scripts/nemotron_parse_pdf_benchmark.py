@@ -106,7 +106,7 @@ def _parse_proc_size(value: str) -> tuple[int, int]:
 
 
 def _server_backend_for_mode(inference_mode: str) -> ServerBackend | None:
-    if inference_mode == "in_process_vllm":
+    if inference_mode in {"in_process_vllm", "external_http"}:
         return None
     if inference_mode == "dynamo_http":
         return "dynamo"
@@ -114,6 +114,20 @@ def _server_backend_for_mode(inference_mode: str) -> ServerBackend | None:
         return "ray_serve"
     msg = f"Unknown inference mode: {inference_mode}"
     raise ValueError(msg)
+
+
+def _resolve_inference_endpoint(
+    inference_mode: str,
+    *,
+    configured_endpoint: str | None,
+    managed_endpoint: str | None,
+) -> str | None:
+    if inference_mode == "external_http":
+        if not configured_endpoint:
+            msg = "--inference-server-endpoint is required with --inference-mode=external_http"
+            raise ValueError(msg)
+        return configured_endpoint
+    return managed_endpoint
 
 
 def _server_transport_for_mode(inference_mode: str) -> ServerTransport:
@@ -617,6 +631,7 @@ def _create_inference_stage(
     accounting_num_gpus: int,
     extra_body: dict[str, Any],
     engine_kwargs: dict[str, Any] | None = None,
+    in_process_runtime_env: dict[str, Any] | None = None,
 ) -> ProcessingStage[InterleavedBatch, InterleavedBatch]:
     if args.inference_mode == "in_process_vllm":
         if args.backend != "vllm":
@@ -630,7 +645,11 @@ def _create_inference_stage(
             max_num_seqs=args.max_num_seqs,
             enforce_eager=args.enforce_eager,
             engine_kwargs=engine_kwargs,
-        ).with_(resources=Resources(cpus=1.0, gpus=1.0), num_workers=args.gpu_num_workers)
+        ).with_(
+            resources=Resources(cpus=1.0, gpus=1.0),
+            num_workers=args.gpu_num_workers,
+            runtime_env=in_process_runtime_env,
+        )
 
     if endpoint is None:
         msg = "endpoint is required for inference-server modes"
@@ -678,6 +697,7 @@ def run_nemotron_parse_pdf_benchmark(args: argparse.Namespace) -> dict[str, Any]
         args.dynamo_encoder_disagg_config, arg_name="--dynamo-encoder-disagg-config"
     )
     dynamo_model_runtime_env = parse_json_arg(args.dynamo_model_runtime_env, arg_name="--dynamo-model-runtime-env")
+    in_process_runtime_env = parse_json_arg(args.in_process_runtime_env, arg_name="--in-process-runtime-env")
     extra_body = parse_json_arg(args.inference_server_extra_body, arg_name="--inference-server-extra-body") or {}
 
     server_backend = _server_backend_for_mode(args.inference_mode)
@@ -711,6 +731,10 @@ def run_nemotron_parse_pdf_benchmark(args: argparse.Namespace) -> dict[str, Any]
             )
         else:
             frontend_kwargs = {}
+    elif args.inference_mode == "external_http":
+        accounting_num_gpus = max(1, int(args.accounting_num_gpus or args.gpu_num_workers))
+        server_gpu_total = accounting_num_gpus
+        autoscaling_config = None
     else:
         accounting_num_gpus = max(1, int(args.accounting_num_gpus or args.gpu_num_workers))
         autoscaling_config = None
@@ -747,7 +771,11 @@ def run_nemotron_parse_pdf_benchmark(args: argparse.Namespace) -> dict[str, Any]
             serve_startup_s = started_server.startup_s
             logger.info(f"InferenceServer ready at {started_server.server.endpoint} (startup: {serve_startup_s:.1f}s)")
 
-        endpoint = started_server.server.endpoint if started_server is not None else None
+        endpoint = _resolve_inference_endpoint(
+            args.inference_mode,
+            configured_endpoint=args.inference_server_endpoint,
+            managed_endpoint=started_server.server.endpoint if started_server is not None else None,
+        )
         inference_stage = _create_inference_stage(
             args,
             endpoint=endpoint,
@@ -756,6 +784,7 @@ def run_nemotron_parse_pdf_benchmark(args: argparse.Namespace) -> dict[str, Any]
             accounting_num_gpus=accounting_num_gpus,
             extra_body=extra_body,
             engine_kwargs=engine_kwargs,
+            in_process_runtime_env=in_process_runtime_env,
         )
         pipeline = create_explicit_nemotron_parse_pdf_pipeline(args, inference_stage=inference_stage)
 
@@ -837,6 +866,7 @@ def run_nemotron_parse_pdf_benchmark(args: argparse.Namespace) -> dict[str, Any]
             "server_num_replicas": args.server_num_replicas,
             "dynamo_use_vllm_chat_processor": args.dynamo_use_vllm_chat_processor,
             "inference_server_request_timeout_s": args.inference_server_request_timeout_s,
+            "inference_server_endpoint": endpoint,
             "inference_server_max_retries": args.inference_server_max_retries,
             "inference_server_max_tokens": args.inference_server_max_tokens,
             "inference_server_stream": args.inference_server_stream,
@@ -847,6 +877,7 @@ def run_nemotron_parse_pdf_benchmark(args: argparse.Namespace) -> dict[str, Any]
             "dynamo_disagg_config": dynamo_disagg_config,
             "dynamo_encoder_disagg_config": dynamo_encoder_disagg_config,
             "dynamo_model_runtime_env": dynamo_model_runtime_env,
+            "in_process_runtime_env": in_process_runtime_env,
             "autoscaling_config": autoscaling_config,
             "server_gpu_count": server_gpu_total,
             "accounting_num_gpus": accounting_num_gpus,
@@ -883,7 +914,7 @@ def main() -> int:
     parser.add_argument(
         "--inference-mode",
         default="in_process_vllm",
-        choices=["in_process_vllm", "dynamo_http", "ray_serve_http", "ray_serve_grpc"],
+        choices=["in_process_vllm", "dynamo_http", "external_http", "ray_serve_http", "ray_serve_grpc"],
         help="Inference path to benchmark. ray_serve_grpc uses Ray Serve's Python deployment handle.",
     )
     parser.add_argument(
@@ -920,6 +951,15 @@ def main() -> int:
             "Optional JSON role config for Dynamo multimodal encoder-disaggregated E/PD serving. "
             'Example: \'{"encode":{"num_replicas":1}}\'. Backend replicas still come from '
             "--server-num-replicas."
+        ),
+    )
+    parser.add_argument(
+        "--in-process-runtime-env",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON Ray runtime_env applied to in-process GPU workers. "
+            "Useful for model-specific env_vars or packages."
         ),
     )
     parser.add_argument(
@@ -974,6 +1014,11 @@ def main() -> int:
         choices=["base64", "file_url"],
         default="base64",
         help="How page images are sent to inference servers.",
+    )
+    parser.add_argument(
+        "--inference-server-endpoint",
+        default=None,
+        help="Existing OpenAI-compatible HTTP endpoint used with external_http.",
     )
     parser.add_argument(
         "--inference-server-request-timeout-s",

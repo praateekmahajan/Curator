@@ -230,6 +230,7 @@ def execute_setup_on_node(stages: list[ProcessingStage], ignore_head_node: bool 
                 ignore_head_node=ignore_head_node,
                 num_cpus=stage.resources.cpus if stage.resources is not None else 1,
                 num_gpus=stage.resources.gpus if stage.resources is not None else 0,
+                runtime_env=stage.runtime_env,
             )
         )
     ray.get(refs)

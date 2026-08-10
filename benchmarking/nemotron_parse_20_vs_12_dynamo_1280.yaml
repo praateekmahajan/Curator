@@ -60,6 +60,7 @@ entries:
       --max-pdfs=1280
       --gpu-num-workers=4
       --accounting-num-gpus=4
+      --in-process-runtime-env='{"env_vars":{"PYTHONPATH":"/model_weights/models--nvidia--NVIDIA-Nemotron-Parse-2.0/snapshots/635b84d9b09bb9526b9a684d0b2c953d3cc3df05/vllm_tied_patch"}}'
 
   - name: pdf_1280_parse20_dynamo_http_nonstream_c32_p10_b32_nomaxseq_gpu4
     enabled: true
@@ -86,6 +87,29 @@ entries:
       --accounting-num-gpus=4
       --engine-kwargs='{"tensor_parallel_size": 1, "disable_hybrid_kv_cache_manager": false, "enable_prefix_caching": false}'
       --dynamo-model-runtime-env='{"env_vars":{"PYTHONPATH":"/model_weights/models--nvidia--NVIDIA-Nemotron-Parse-2.0/snapshots/635b84d9b09bb9526b9a684d0b2c953d3cc3df05/vllm_tied_patch"}}'
+
+  - name: pdf_1280_parse20_nim_http_nonstream_c32_p10_b32_gpu4
+    enabled: true
+    script: nemotron_parse_pdf_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=ray_data
+      --inference-mode=external_http
+      --inference-server-endpoint=http://127.0.0.1:18000/v1
+      --manifest={dataset:pdf,manifest}/manifest_0000-0999_chunk00.jsonl
+      --zip-base-dir={dataset:pdf,zipfiles}
+      --output-dir={session_entry_dir}/scratch/output
+      --model-id=nvidia/nemotron-parse-v2.0
+      --model-path={model_weights_path}/models--nvidia--NVIDIA-Nemotron-Parse-2.0/snapshots/635b84d9b09bb9526b9a684d0b2c953d3cc3df05
+      --backend=vllm
+      --pdfs-per-task=10
+      --max-pdfs=1280
+      --client-num-workers=32
+      --request-batch-size=32
+      --no-inference-server-stream
+      --inference-server-max-tokens=8192
+      --inference-server-request-timeout-s=300
+      --accounting-num-gpus=4
 
   - name: pdf_1280_parse12_in_process_p10_gpu4
     enabled: true
@@ -129,3 +153,4 @@ entries:
       --inference-server-request-timeout-s=300
       --accounting-num-gpus=4
       --engine-kwargs='{"tensor_parallel_size": 1, "disable_hybrid_kv_cache_manager": false, "enable_prefix_caching": false}'
+      --dynamo-model-runtime-env='{"uv":{"packages":["albumentations==2.0.8"]}}'

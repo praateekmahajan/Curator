@@ -62,3 +62,48 @@ def test_dynamo_gpu_count_includes_parallelism() -> None:
 def test_measured_dynamo_http_mode_maps_to_dynamo_backend() -> None:
     assert benchmark._server_backend_for_mode("dynamo_http") == "dynamo"
     assert benchmark._server_backend_for_mode("in_process_vllm") is None
+
+
+def test_external_http_mode_uses_configured_endpoint_without_managed_backend() -> None:
+    assert benchmark._server_backend_for_mode("external_http") is None
+    assert (
+        benchmark._resolve_inference_endpoint(
+            "external_http",
+            configured_endpoint="http://127.0.0.1:8000",
+            managed_endpoint=None,
+        )
+        == "http://127.0.0.1:8000"
+    )
+
+
+def test_external_http_mode_requires_configured_endpoint() -> None:
+    with pytest.raises(ValueError, match="--inference-server-endpoint"):
+        benchmark._resolve_inference_endpoint(
+            "external_http",
+            configured_endpoint=None,
+            managed_endpoint=None,
+        )
+
+
+def test_in_process_stage_receives_user_runtime_env() -> None:
+    runtime_env = {"env_vars": {"PYTHONPATH": "/model/patch"}}
+    args = argparse.Namespace(
+        inference_mode="in_process_vllm",
+        backend="vllm",
+        model_path="/model",
+        text_in_pic=False,
+        inference_batch_size=1,
+        max_num_seqs=64,
+        enforce_eager=False,
+        gpu_num_workers=4,
+    )
+    stage = benchmark._create_inference_stage(
+        args,
+        endpoint=None,
+        served_model_name="model",
+        output_dir=Path("/output"),
+        accounting_num_gpus=4,
+        extra_body={},
+        in_process_runtime_env=runtime_env,
+    )
+    assert stage.runtime_env == runtime_env

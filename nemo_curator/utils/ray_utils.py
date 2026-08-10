@@ -58,6 +58,7 @@ def submit_on_each_node(
     ignore_head_node: bool = False,
     num_cpus: float = 0,
     num_gpus: float = 0,
+    runtime_env: dict[str, Any] | None = None,
 ) -> list[Any]:
     """Submit ``remote_fn(*args)`` once per alive Ray node and return the ObjectRefs.
 
@@ -80,6 +81,7 @@ def submit_on_each_node(
             remote_fn.options(
                 num_cpus=num_cpus,
                 num_gpus=num_gpus,
+                runtime_env=runtime_env,
                 scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False),
             ).remote(*args)
         )

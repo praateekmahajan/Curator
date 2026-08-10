@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -159,6 +160,31 @@ class TestExecuteSetupOnNode:
         assert len(matching_logs) == len(ray.nodes()), (
             f"Expected {len(ray.nodes())} logs for setup on node for 2 stages, got {len(matching_logs)}: {matching_logs}"
         )
+
+    def test_execute_setup_on_node_applies_stage_runtime_env(
+        self,
+        shared_ray_client: None,
+        tmp_path: Path,
+    ) -> None:
+        env_var = "CURATOR_SETUP_RUNTIME_ENV_TEST"
+
+        class RuntimeEnvStage(ProcessingStage):
+            name = "runtime_env_stage"
+            resources = Resources(cpus=1.0, gpus=0.0)
+
+            def process(self, task: "Task") -> "Task":
+                return task
+
+            def setup_on_node(
+                self, node_info: NodeInfo | None = None, worker_metadata: WorkerMetadata | None = None
+            ) -> None:
+                (tmp_path / f"{node_info.node_id}.txt").write_text(os.environ.get(env_var, "missing"))
+
+        stage = RuntimeEnvStage().with_(runtime_env={"env_vars": {env_var: "present"}})
+
+        execute_setup_on_node([stage])
+
+        assert {path.read_text() for path in tmp_path.glob("*.txt")} == {"present"}
 
     def test_execute_setup_on_node_ignore_head_node(
         self,
