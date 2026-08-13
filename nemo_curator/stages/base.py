@@ -235,10 +235,7 @@ class ProcessingStage(ABC, Generic[X, Y], metaclass=StageMeta):
         if isinstance(input_specs, tuple):
             return self._validate_input_spec(input_specs, "inputs()")
         if not isinstance(input_specs, dict):
-            msg = (
-                f"Stage {self.name} inputs() must return an input spec tuple "
-                "or dict of task type to input spec"
-            )
+            msg = f"Stage {self.name} inputs() must return an input spec tuple or dict of task type to input spec"
             raise TypeError(msg)
 
         # Search the task's MRO from most to least specific. For example, given
@@ -246,9 +243,7 @@ class ProcessingStage(ABC, Generic[X, Y], metaclass=StageMeta):
         # for CustomDocumentBatch first, then DocumentBatch, and finally Task.
         for candidate_type in type(task).mro():
             if candidate_type in input_specs:
-                return self._validate_input_spec(
-                    input_specs[candidate_type], f"inputs()[{candidate_type.__name__}]"
-                )
+                return self._validate_input_spec(input_specs[candidate_type], f"inputs()[{candidate_type.__name__}]")
 
         supported_task_types = ", ".join(supported_type.__name__ for supported_type in input_specs) or "<none>"
         msg = (
@@ -459,28 +454,35 @@ class ProcessingStage(ABC, Generic[X, Y], metaclass=StageMeta):
 
     def is_fanout_stage(self) -> bool:
         """Infer whether `process()` can fan out one input task into many outputs."""
+        return self._process_return_annotation_contains(list)
+
+    def is_filter_stage(self) -> bool:
+        """Infer whether `process()` can filter an input task by returning ``None``."""
+        return self._process_return_annotation_contains(type(None))
+
+    def _process_return_annotation_contains(self, target: object) -> bool:
         try:
             process_hints = get_type_hints(type(self).process)
         except (AttributeError, NameError, TypeError) as exc:
             logger.debug(
-                "Could not resolve type hints for {}.process; defaulting is_fanout_stage to False: {}",
+                "Could not resolve type hints for {}.process; defaulting cardinality detection to False: {}",
                 type(self).__name__,
                 exc,
             )
             return False
 
-        return self._annotation_contains_list(process_hints.get("return"))
+        return self._annotation_contains(process_hints.get("return"), target)
 
     @classmethod
-    def _annotation_contains_list(cls, annotation: object) -> bool:
+    def _annotation_contains(cls, annotation: object, target: object) -> bool:
         if annotation is None:
             return False
 
-        if get_origin(annotation) is list:
+        if annotation is target or get_origin(annotation) is target:
             return True
 
         if get_origin(annotation) in (UnionType, Union):
-            return any(cls._annotation_contains_list(arg) for arg in get_args(annotation))
+            return any(cls._annotation_contains(arg, target) for arg in get_args(annotation))
 
         return False
 

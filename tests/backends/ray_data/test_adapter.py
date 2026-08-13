@@ -70,6 +70,13 @@ class ConfigurableTaskStage(ConfigurableActorStage):
         return self._ray_stage_spec
 
 
+class ConfigurableFilteringStage(ConfigurableTaskStage):
+    name = "configurable_filter"
+
+    def process(self, task: EmptyTask) -> EmptyTask | None:
+        return task
+
+
 class TestRayDataStageAdapter:
     def test_process_dataset_uses_compute_for_actor_stages_and_ray_default_for_task_stages(self):
         fixed_actor_kwargs = _map_batches_kwargs(ConfigurableActorStage(num_workers=3))
@@ -119,6 +126,23 @@ class TestRayDataStageAdapter:
 
         assert task_kwargs["compute"] == TaskPoolStrategy(size=1)
         mock_warning.assert_not_called()
+
+    def test_process_dataset_declares_one_to_one_stages_row_count_preserving(self):
+        task_kwargs = _map_batches_kwargs(ConfigurableTaskStage())
+
+        assert task_kwargs["udf_modifying_row_count"] is False
+
+    def test_process_dataset_keeps_fanout_stages_row_count_modifying(self):
+        task_kwargs = _map_batches_kwargs(
+            ConfigurableTaskStage(ray_stage_spec={RayStageSpecKeys.IS_FANOUT_STAGE: True})
+        )
+
+        assert task_kwargs["udf_modifying_row_count"] is True
+
+    def test_process_dataset_keeps_filtering_stages_row_count_modifying(self):
+        task_kwargs = _map_batches_kwargs(ConfigurableFilteringStage())
+
+        assert task_kwargs["udf_modifying_row_count"] is True
 
     def test_process_dataset_rejects_managed_ray_remote_args(self):
         stage = ConfigurableActorStage(

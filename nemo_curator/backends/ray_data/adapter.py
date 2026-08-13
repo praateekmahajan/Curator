@@ -101,6 +101,7 @@ class RayDataStageAdapter(BaseStageAdapter):
         """
         ray_stage_spec = self.stage.ray_stage_spec()
         stage_is_actor = ray_stage_spec.get(RayStageSpecKeys.IS_ACTOR_STAGE, is_actor_stage(self.stage))
+        stage_is_fanout = ray_stage_spec.get(RayStageSpecKeys.IS_FANOUT_STAGE, False)
 
         if stage_is_actor:
             map_batches_fn = create_actor_from_stage(self.stage)
@@ -125,6 +126,7 @@ class RayDataStageAdapter(BaseStageAdapter):
                 map_batches_kwargs["max_calls"] = max_calls
 
         map_batches_kwargs.update(self._build_resource_kwargs(ray_stage_spec))
+        map_batches_kwargs["udf_modifying_row_count"] = stage_is_fanout or self.stage.is_filter_stage()
 
         # Per-stage ray_remote_args (e.g. runtime_env with different pip versions per stage).
         ray_remote_args = copy.deepcopy(ray_stage_spec.get(RayStageSpecKeys.RAY_REMOTE_ARGS) or {})
@@ -148,7 +150,7 @@ class RayDataStageAdapter(BaseStageAdapter):
 
         processed_dataset = dataset.map_batches(map_batches_fn, batch_size=self.batch_size, **map_batches_kwargs)  # type: ignore[reportArgumentType]
 
-        if ray_stage_spec.get(RayStageSpecKeys.IS_FANOUT_STAGE, False):
+        if stage_is_fanout:
             processed_dataset = processed_dataset.repartition(target_num_rows_per_block=1)
 
         return processed_dataset
