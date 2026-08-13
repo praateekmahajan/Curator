@@ -387,6 +387,11 @@ url = "https://wheels.vllm.ai/0.22.0/cu129"
 explicit = true
 
 [tool.uv.sources]
+# Ray PR prototype base wheel. docker/Dockerfile overlays the Ray Data Python
+# package from the exact fork commit after dependency installation.
+ray = [
+    { url = "https://s3-us-west-2.amazonaws.com/ray-wheels/master/9c6ffee9a5126a21dc529eceb02e2fa3e8b9183e/ray-3.0.0.dev0-cp313-cp313-manylinux2014_x86_64.whl", marker = "python_version == '3.13' and sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
 torch = [
     { index = "pytorch", marker = "sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')" },
     { index = "pypi", marker = "sys_platform == 'darwin' or (platform_machine != 'x86_64' and platform_machine != 'aarch64')" },

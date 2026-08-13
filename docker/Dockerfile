@@ -88,6 +88,20 @@ RUN if [ -n "${CURATOR_EXTRA}" ]; then \
     # Strip opencv-python-headless (ffmpeg CVE carrier); tolerate arm64 where vllm doesn't pull it.
     (uv pip uninstall opencv-python-headless || true)
 
+# Install the Python-only Ray Data prototype on top of the wheel built from its
+# exact upstream base commit. Building Ray from a Git source dependency would
+# unnecessarily rebuild Ray Core with Bazel for this Python-only experiment.
+ARG RAY_PATCH_REPO=https://github.com/praateekmahajan/ray.git
+ARG RAY_PATCH_COMMIT=dc39881018bb49ba16c18aa013877f98db82a94f
+RUN git init /tmp/ray-patch && \
+    git -C /tmp/ray-patch remote add origin "${RAY_PATCH_REPO}" && \
+    git -C /tmp/ray-patch fetch --depth 1 origin "${RAY_PATCH_COMMIT}" && \
+    git -C /tmp/ray-patch checkout --detach FETCH_HEAD && \
+    ray_package_dir="$(python -c 'import pathlib, ray; print(pathlib.Path(ray.__file__).parent)')" && \
+    cp -a /tmp/ray-patch/python/ray/data/. "${ray_package_dir}/data/" && \
+    python -c 'from ray.data._internal.execution.interfaces.physical_operator import SingleOutputDataOpTask' && \
+    rm -rf /tmp/ray-patch
+
 # Install nemotron-ocr (C++/CUDA extension — requires no-build-isolation)
 # GIT_LFS_SKIP_SMUDGE=1: clone source only, model weights are mounted at runtime
 # TORCH_CUDA_ARCH_LIST: compile for SM 8.0/8.6/8.9/9.0 to cover A100, A10, RTX Ada, H100
