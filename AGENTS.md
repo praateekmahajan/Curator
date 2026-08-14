@@ -1,14 +1,13 @@
 # AGENTS.md — NeMo Curator
 
 NeMo Curator is a scalable library for preparing multimodal datasets. Pipelines
-are composed of `ProcessingStage` objects executed by a backend (Ray Data, Xenna,
-or Slurm) over streams of `Task` objects.
+are composed of `ProcessingStage` objects executed by a backend (Ray Data, Xenna, Ray Actor Pool) over streams of `Task` objects.
 
 ## Core abstractions
 
 | Abstraction | Location | Role |
 |---|---|---|
-| `ProcessingStage` | `nemo_curator/stages/base.py` | Unit of work: defines `process_batch()`, `resources`, and optional `setup()` for stateful stages |
+| `ProcessingStage` | `nemo_curator/stages/base.py` | Unit of work: defines `process()` or `process_batch()`, `resources`, and optional `setup()` for stateful stages |
 | `Resources` | `nemo_curator/stages/resources.py` | Per-stage CPU/GPU requirements (`cpus`, `gpus`, `gpu_memory_gb`) |
 | `Task` | `nemo_curator/tasks/` | Data item flowing through the pipeline |
 | `Pipeline` | `nemo_curator/pipeline/pipeline.py` | Ordered sequence of stages executed by a backend |
