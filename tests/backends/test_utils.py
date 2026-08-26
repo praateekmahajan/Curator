@@ -97,6 +97,27 @@ def reset_head_node_cache() -> Iterator[None]:
 class TestExecuteSetupOnNode:
     """Test class for execute_setup_on_node function."""
 
+    def test_execute_setup_on_node_skips_teardown_without_node_setup(
+        self,
+        shared_ray_client: None,
+        tmp_path: Path,
+    ):
+        """Stages using the base no-op node setup are not torn down."""
+
+        class WorkerOnlyStage(ProcessingStage):
+            name = "worker_only_stage"
+            resources = Resources(cpus=1.0, gpus=0.0)
+
+            def process(self, task: "Task") -> "Task":
+                return task
+
+            def teardown(self) -> None:
+                (tmp_path / "teardown").touch()
+
+        execute_setup_on_node([WorkerOnlyStage()])
+
+        assert not (tmp_path / "teardown").exists()
+
     def test_execute_setup_on_node_tears_down_setup_copy(
         self,
         shared_ray_client: None,

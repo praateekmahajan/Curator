@@ -201,10 +201,12 @@ def _setup_stage_on_node(stage: ProcessingStage) -> None:
     """
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     node_id = ray.get_runtime_context().get_node_id()
+    has_node_setup = type(stage).setup_on_node is not ProcessingStage.setup_on_node
     try:
         stage.setup_on_node(NodeInfo(node_id=node_id), WorkerMetadata(worker_id="", allocation=None))
     finally:
-        stage.teardown()
+        if has_node_setup:
+            stage.teardown()
 
 
 def execute_setup_on_node(stages: list[ProcessingStage], ignore_head_node: bool = False) -> None:
