@@ -17,6 +17,7 @@ from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.text.embedders.vllm import VLLMEmbeddingModelStage
 from nemo_curator.stages.text.io.reader import ParquetReader
 from nemo_curator.stages.text.io.writer import ParquetWriter
+from nemo_curator.stages.resources import Resources
 
 EMBEDDING_FIELDS = {
     "question": "question_embedding",
@@ -62,7 +63,10 @@ def run_embedding_benchmark(
         metadata_fields=["int_id"],
         model_inference_batch_size=model_inference_batch_size,
         cache_dir=cache_dir,
-    ).with_(num_workers=num_workers)
+    ).with_(
+        num_workers=num_workers,
+        resources=Resources(cpus=1, gpus=1 / num_vllm_replicas_per_gpu),
+    )
     reader = ParquetReader(
         file_paths=input_files,
         files_per_partition=1,
