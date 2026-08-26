@@ -11,8 +11,8 @@ datasets:
       - type: parquet
         path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/datasets/sft/clean/qa_parse_status=true
 
-default_timeout_s: 13200
-max_timeout_s: 13200
+default_timeout_s: 12000
+max_timeout_s: 12000
 sinks: []
 delete_scratch: false
 object_store_size: 536870912000
@@ -36,7 +36,7 @@ entries:
       --text-field=question
       --bands-per-iteration=20
       --input-blocksize=1.5GiB
-    timeout_s: 13200
+    timeout_s: 12000
 
   - name: dedup_fuzzy_combined_question_answer_default
     script: fuzzy_dedup_identification_benchmark.py
@@ -50,4 +50,4 @@ entries:
       --text-field=combined_question_answer
       --bands-per-iteration=20
       --input-blocksize=1.5GiB
-    timeout_s: 13200
+    timeout_s: 12000
