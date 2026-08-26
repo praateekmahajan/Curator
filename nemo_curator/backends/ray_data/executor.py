@@ -80,11 +80,7 @@ class RayDataExecutor(BaseExecutor):
         # lazily on first task dispatch by cloning the current virtualenv. The NeMo Curator
         # container's /opt/venv is created with `uv venv --seed` so pip is available in clones.
         try:
-            # Initialize ray and explicitly set NOSET to empty
-            # This ensures if Xenna was used before which was setting NOSET, we end up overriding it.
-            ray.init(
-                ignore_reinit_error=True, runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": ""}}
-            )
+            ray.init(ignore_reinit_error=True)
 
             # Convert tasks to dataset
             current_dataset = self._tasks_to_dataset(tasks)
