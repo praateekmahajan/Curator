@@ -1,6 +1,8 @@
 paths:
   - name: results_path
     host_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/users/praateekm/benchmarking/results
+  - name: model_weights_path
+    host_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/users/praateekm/tools_cache/hf_cache
   - name: output_path
     host_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/users/praateekm/benchmarking/output
   - name: text_models_hf_cache
@@ -15,6 +17,10 @@ datasets:
     formats:
       - type: files
         path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/datasets/text_models_hf_cache
+  - name: harrier_model
+    formats:
+      - type: files
+        path: "{model_weights_path}/hub/models--microsoft--harrier-oss-v1-270m/snapshots/31de22b673913c7d658c0f03f792d77c2dcf8ebd"
 
 gpu_stats_recorder:
   interval_s: 1.0
@@ -32,7 +38,7 @@ entries:
       --input-path={dataset:sft_qa_parse_success,parquet}
       --output-path={output_path}
       --executor=ray_data
-      --model-identifier=${EMBEDDING_MODEL}
+      --model-identifier={dataset:harrier_model,files}
       --num-vllm-replicas-per-gpu=4
       --dataset-ratio=0.1
       --cache-dir={dataset:text_models_hf_cache,files}

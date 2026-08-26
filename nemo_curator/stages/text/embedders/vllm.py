@@ -17,6 +17,7 @@ from __future__ import annotations
 import gc
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
@@ -102,6 +103,7 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         # after setup
         self.model: None | LLM = None
         self.tokenizer: None | AutoTokenizer = None
+        self._resolved_model_path: str | None = None
         # stage setup
         self.resources = Resources(
             cpus=1,
@@ -132,12 +134,16 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         """
         if not VLLM_AVAILABLE:
             raise ImportError(_VLLM_INSTALL_HINT)
-        model_path = snapshot_download(
-            self.model_identifier,
-            cache_dir=self.cache_dir,
-            token=self.hf_token,
-            local_files_only=local_files_only,
-        )
+        if Path(self.model_identifier).is_dir():
+            model_path = self.model_identifier
+        else:
+            model_path = snapshot_download(
+                self.model_identifier,
+                cache_dir=self.cache_dir,
+                token=self.hf_token,
+                local_files_only=local_files_only,
+            )
+        self._resolved_model_path = model_path
 
         vllm_init_kwargs = self.vllm_init_kwargs.copy()
         if "enforce_eager" not in vllm_init_kwargs:
@@ -182,7 +188,7 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             from transformers import AutoTokenizer
 
             self.tokenizer = AutoTokenizer.from_pretrained(
-                self.model_identifier,
+                self._resolved_model_path or self.model_identifier,
                 cache_dir=self.cache_dir,
                 token=self.hf_token,
                 local_files_only=True,
