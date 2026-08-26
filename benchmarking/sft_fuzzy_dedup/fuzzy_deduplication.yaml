@@ -1,6 +1,6 @@
 paths:
   - name: results_path
-    host_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/users/praateekm/benchmarking/sft_fuzzy_dedup/outputs
+    host_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/users/praateekm/benchmarking
 
 gpu_stats_recorder:
   interval_s: 1.0
@@ -30,7 +30,7 @@ entries:
       --benchmark-results-path={session_entry_dir}
       --input-path={dataset:sft_qa_parse_success,parquet}
       --cache-path={session_entry_dir}/scratch/cache
-      --output-path={session_entry_dir}/scratch/output
+      --output-path={session_entry_dir}/output
       --input-filetype=parquet
       --id-field=int_id
       --text-field=question
@@ -44,7 +44,7 @@ entries:
       --benchmark-results-path={session_entry_dir}
       --input-path={dataset:sft_qa_parse_success,parquet}
       --cache-path={session_entry_dir}/scratch/cache
-      --output-path={session_entry_dir}/scratch/output
+      --output-path={session_entry_dir}/output
       --input-filetype=parquet
       --id-field=int_id
       --text-field=combined_question_answer
