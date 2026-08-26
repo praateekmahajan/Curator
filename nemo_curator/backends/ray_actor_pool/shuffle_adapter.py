@@ -63,7 +63,7 @@ class ShuffleStageAdapter(BaseStageAdapter):
 
         self._batch_size = self.stage.batch_size
         if self._batch_size is None:
-            logger.warning(f"batch size not set for stage {self.stage}. Setting it to 1.")
+            logger.warning(f"batch size not set for stage {self.stage.name}. Setting it to 1.")
             self._batch_size = 1
 
         # Auto set total_nparts if not set

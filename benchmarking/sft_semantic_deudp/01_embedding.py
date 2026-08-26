@@ -49,7 +49,8 @@ def run_embedding_benchmark(
         raise ValueError("num_vllm_replicas_per_gpu must be positive")
 
     input_files = load_dataset_files(Path(input_path), dataset_ratio=dataset_ratio, keep_extensions="parquet")
-    _, num_gpus = get_available_cpu_gpu_resources(init_and_shutdown=True)
+    _, available_gpus = get_available_cpu_gpu_resources(init_and_shutdown=True)
+    num_gpus = int(available_gpus)
     if num_gpus <= 0:
         raise RuntimeError("Ray reported no GPUs")
     num_workers = num_vllm_replicas_per_gpu * num_gpus

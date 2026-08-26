@@ -44,13 +44,15 @@ class RayDataStageAdapter(BaseStageAdapter):
 
         self._batch_size = self.stage.batch_size
         if self._batch_size is None and self.stage.resources.gpus > 0:
-            logger.warning(f"When using Ray Data, batch size is not set for GPU stage {self.stage}. Setting it to 1.")
+            logger.warning(
+                f"When using Ray Data, batch size is not set for GPU stage {self.stage.name}. Setting it to 1."
+            )
             self._batch_size = 1
 
         # Go through all the keys in the ray_stage_spec and raise error if they are not in RayStageSpecKeys
         for key in self.stage.ray_stage_spec():
             if key not in {e.value for e in RayStageSpecKeys}:
-                msg = f"Invalid key {key} in ray_stage_spec for stage {self.stage}"
+                msg = f"Invalid key {key} in ray_stage_spec for stage {self.stage.name}"
                 raise ValueError(msg)
 
     @property
