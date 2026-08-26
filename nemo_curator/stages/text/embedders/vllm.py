@@ -175,6 +175,8 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         self._initialize_vllm(local_files_only=False)
 
     def teardown(self) -> None:
+        if self.model is not None:
+            self.model.llm_engine.engine_core.shutdown()
         del self.model
         self.model = None
         gc.collect()

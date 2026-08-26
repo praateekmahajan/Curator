@@ -106,6 +106,29 @@ class TestVLLMEmbeddingModelStage:
         assert stage.resources.gpus == 1
         assert stage.resources.cpus == 1
 
+    def test_teardown_shuts_down_vllm_engine(self) -> None:
+        """Release resources owned by vLLM before dropping the model reference."""
+
+        class _EngineCore:
+            shutdown_called = False
+
+            def shutdown(self) -> None:
+                self.shutdown_called = True
+
+        class _LLMEngine:
+            engine_core = _EngineCore()
+
+        class _Model:
+            llm_engine = _LLMEngine()
+
+        stage = VLLMEmbeddingModelStage(model_identifier=TEST_MODEL)
+        stage.model = _Model()  # type: ignore[assignment]
+
+        stage.teardown()
+
+        assert _Model.llm_engine.engine_core.shutdown_called
+        assert stage.model is None
+
     def test_llm_uses_cache_dir_for_download(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Ensure vLLM receives download_dir so weights reuse snapshot cache."""
         cache_dir = tmp_path / "cache"
