@@ -43,6 +43,7 @@ def run_duplicate_identification_benchmark(  # noqa: PLR0913
     lsh_spill_memory_limit: int | Literal["auto"] | None = "auto",
     use_async_memory: bool = True,
     id_field: str | None = None,
+    normalize_text: bool = False,
     **kwargs,  # noqa: ARG001
 ) -> dict[str, Any]:
     """Run the duplicate identification benchmark and collect comprehensive metrics."""
@@ -62,6 +63,7 @@ def run_duplicate_identification_benchmark(  # noqa: PLR0913
         input_filetype=input_filetype,
         bands_per_iteration=bands_per_iteration,
         text_field=text_field,
+        normalize_text=normalize_text,
         input_blocksize=input_blocksize,
         lsh_num_output_partitions=lsh_num_output_partitions,
         lsh_rmm_pool_size=lsh_rmm_pool_size,
@@ -123,7 +125,15 @@ def main() -> int:
         "--bands-per-iteration", type=int, default=20, help="Bands per iteration (for LSH deduplication)"
     )
     parser.add_argument("--text-field", default="text", help="Text field to use for duplicate identification")
-    parser.add_argument("--id-field", default=None, help="Existing integer ID field to preserve instead of generating IDs")
+    parser.add_argument(
+        "--normalize-text",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Lowercase and normalize spaces before computing minhashes",
+    )
+    parser.add_argument(
+        "--id-field", default=None, help="Existing integer ID field to preserve instead of generating IDs"
+    )
     parser.add_argument(
         "--input-blocksize", type=str, default="1.5GiB", help="Target partition size for input data (e.g. '512MB')"
     )

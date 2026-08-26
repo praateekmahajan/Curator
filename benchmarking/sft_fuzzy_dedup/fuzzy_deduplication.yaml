@@ -79,3 +79,63 @@ entries:
       --bands-per-iteration=20
       --input-blocksize=1.5GiB
     timeout_s: 12000
+
+  - name: dedup_fuzzy_question_normalized_default
+    script: fuzzy_dedup_identification_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={dataset:sft_qa_parse_success,parquet}
+      --cache-path={session_entry_dir}/scratch/cache
+      --output-path={session_entry_dir}/output
+      --input-filetype=parquet
+      --id-field=int_id
+      --text-field=question
+      --normalize-text
+      --bands-per-iteration=20
+      --input-blocksize=1.5GiB
+    timeout_s: 12000
+
+  - name: dedup_fuzzy_answer_normalized_default
+    script: fuzzy_dedup_identification_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={dataset:sft_qa_parse_success,parquet}
+      --cache-path={session_entry_dir}/scratch/cache
+      --output-path={session_entry_dir}/output
+      --input-filetype=parquet
+      --id-field=int_id
+      --text-field=answer
+      --normalize-text
+      --bands-per-iteration=20
+      --input-blocksize=1.5GiB
+    timeout_s: 12000
+
+  - name: dedup_fuzzy_combined_question_answer_normalized_default
+    script: fuzzy_dedup_identification_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={dataset:sft_qa_parse_success,parquet}
+      --cache-path={session_entry_dir}/scratch/cache
+      --output-path={session_entry_dir}/output
+      --input-filetype=parquet
+      --id-field=int_id
+      --text-field=combined_question_answer
+      --normalize-text
+      --bands-per-iteration=20
+      --input-blocksize=1.5GiB
+    timeout_s: 12000
+
+  - name: dedup_fuzzy_original_text_normalized_default
+    script: fuzzy_dedup_identification_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={dataset:sft_qa_parse_success,parquet}
+      --cache-path={session_entry_dir}/scratch/cache
+      --output-path={session_entry_dir}/output
+      --input-filetype=parquet
+      --id-field=int_id
+      --text-field=original_text
+      --normalize-text
+      --bands-per-iteration=20
+      --input-blocksize=1.5GiB
+    timeout_s: 12000

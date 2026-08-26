@@ -223,6 +223,35 @@ class TestMinHashStage:
         )
 
     @pytest.mark.usefixtures("ray_client_with_id_generator")
+    def test_normalizes_case_and_spaces_before_minhashing(self, tmp_path: Path) -> None:
+        """Case and spacing variants produce identical normalized minhashes."""
+        task = DocumentBatch(
+            dataset_name="normalized_text",
+            data=pd.DataFrame(
+                {
+                    CURATOR_DEDUP_ID_STR: [0, 1],
+                    "text": ["Hello   WORLD from MinHash", "hello world from minhash"],
+                }
+            ),
+            _metadata={},
+        )
+        stage = MinHashStage(
+            output_path=str(tmp_path / "normalized"),
+            text_field="text",
+            normalize_text=True,
+            num_hashes=64,
+            char_ngrams=3,
+            pool=False,
+        )
+
+        stage.setup()
+        output_task = stage.process(task)
+        stage.teardown()
+
+        signatures = cudf.read_parquet(output_task.data[0])["_minhash_signature"].to_pandas().tolist()
+        assert signatures[0] == signatures[1]
+
+    @pytest.mark.usefixtures("ray_client_with_id_generator")
     def test_error_handling_missing_column(self, tmp_path: Path) -> None:
         """Test error handling when text column is missing."""
         # Create data without the expected column

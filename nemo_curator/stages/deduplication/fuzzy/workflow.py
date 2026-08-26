@@ -86,6 +86,7 @@ class FuzzyDeduplicationWorkflow(WorkflowBase):
         lsh_spill_memory_limit: int | Literal["auto"] | None = "auto",
         env_vars: dict[str, Any] | None = None,
         use_async_memory: bool = True,
+        normalize_text: bool = False,
     ):
         """
         Configuration for MinHash based fuzzy duplicates detection.
@@ -121,6 +122,8 @@ class FuzzyDeduplicationWorkflow(WorkflowBase):
 
         text_field: str
             Field containing the text to deduplicate.
+        normalize_text: bool
+            Whether to lowercase and normalize spaces before computing minhashes.
         id_field: str | None
             Existing integer ID field to preserve. When omitted, the workflow assigns IDs
             with the IdGenerator actor and writes its mapping to the output directory.
@@ -171,6 +174,7 @@ class FuzzyDeduplicationWorkflow(WorkflowBase):
         self.write_kwargs = write_kwargs
 
         self.text_field = text_field
+        self.normalize_text = normalize_text
         self.id_field = id_field
         self.perform_removal = perform_removal
 
@@ -221,6 +225,7 @@ class FuzzyDeduplicationWorkflow(WorkflowBase):
             MinHashStage(
                 output_path=self.cache_path,
                 text_field=self.text_field,
+                normalize_text=self.normalize_text,
                 id_field=self.id_field,
                 char_ngrams=self.char_ngrams,
                 num_hashes=self.num_hashes,
@@ -361,7 +366,9 @@ class FuzzyDeduplicationWorkflow(WorkflowBase):
                 id_generator_path = output_fs.sep.join([self.output_path, ID_GENERATOR_OUTPUT_FILENAME])
                 write_id_generator_to_disk(
                     id_generator_path,
-                    storage_options=self.write_kwargs.get("storage_options") if self.write_kwargs is not None else None,
+                    storage_options=self.write_kwargs.get("storage_options")
+                    if self.write_kwargs is not None
+                    else None,
                 )
                 logger.info(f"Id generator written to {id_generator_path}")
                 workflow_result.add_metadata("id_generator_path", id_generator_path)

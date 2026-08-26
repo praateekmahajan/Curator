@@ -203,6 +203,8 @@ class MinHashStage(ProcessingStage[FileGroupTask | DocumentBatch, FileGroupTask]
         Base path where minhash output files will be written
     text_field : str, default="text"
         Name of the field containing text to compute minhashes from
+    normalize_text : bool, default=False
+        Whether to lowercase and normalize spaces before computing minhashes
     id_field : str | None, default=None
         Existing integer ID field to preserve for file-backed inputs. When omitted,
         IDs are assigned with the IdGenerator actor.
@@ -250,12 +252,14 @@ class MinHashStage(ProcessingStage[FileGroupTask | DocumentBatch, FileGroupTask]
         read_kwargs: dict[str, Any] | None = None,
         write_kwargs: dict[str, Any] | None = None,
         pool: bool = True,
+        normalize_text: bool = False,
     ):
         # Set ProcessingStage attributes
         self.name = self.__class__.__name__
         self.resources = Resources(gpus=1.0)  # Requires 1 GPU
 
         self.text_field = text_field
+        self.normalize_text = normalize_text
         self.id_field = id_field
         self.minhash_field = minhash_field
         self.char_ngrams = char_ngrams
@@ -346,8 +350,11 @@ class MinHashStage(ProcessingStage[FileGroupTask | DocumentBatch, FileGroupTask]
         output_file = self.output_fs.sep.join([self.output_path, f"{task.task_id}.parquet"])
 
         result_df = df[[CURATOR_DEDUP_ID_STR]]
+        text_series = df[self.text_field]
+        if self.normalize_text:
+            text_series = text_series.str.lower().str.normalize_spaces()
         with self._time_metric("minhash_compute_time"):
-            result_df[self.minhash_field] = self.minhash_processor.compute_minhashes(df[self.text_field])
+            result_df[self.minhash_field] = self.minhash_processor.compute_minhashes(text_series)
 
         # Write output file
         with self._time_metric("minhash_write_time"):
