@@ -2,13 +2,16 @@
 
 import argparse
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
-from benchmarking.scripts.utils import load_dataset_files, setup_executor, write_benchmark_results
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+from utils import load_dataset_files, setup_executor, write_benchmark_results  # noqa: E402
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.text.embedders.vllm import VLLMEmbeddingModelStage
 from nemo_curator.stages.text.io.reader import ParquetReader
