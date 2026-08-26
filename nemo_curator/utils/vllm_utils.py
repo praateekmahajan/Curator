@@ -199,7 +199,10 @@ def create_vllm_llm_with_retry(*, max_port_retries: int = 3, **engine_kwargs: ob
     for attempt in range(1, max_port_retries + 1):
         preferred_port = 20000 + ((os.getpid() + 7919 * attempt) % 30000)
         free_port = pick_free_port(preferred_port)
-        os.environ["MASTER_PORT"] = str(free_port)
+        # vLLM's UniProcExecutor selects its distributed-init port through
+        # VLLM_PORT, not MASTER_PORT. Give each Ray actor a distinct starting
+        # point so its independently selected port cannot race another actor.
+        os.environ["VLLM_PORT"] = str(free_port)
         try:
             return LLM(**engine_kwargs)
         except RuntimeError as e:
@@ -218,7 +221,7 @@ def create_vllm_llm_with_retry(*, max_port_retries: int = 3, **engine_kwargs: ob
                 raise
             logger.warning(
                 f"[vLLM] Engine startup failed on attempt {attempt}/{max_port_retries} "
-                f"(port {free_port}, likely a MASTER_PORT collision), retrying: {e}"
+                f"(port {free_port}, likely a vLLM port collision), retrying: {e}"
             )
             time.sleep(2 + random.uniform(0, 3))  # noqa: S311 - jitter only, not security-sensitive
 
