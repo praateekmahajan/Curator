@@ -15,6 +15,9 @@
 from dataclasses import dataclass, field
 from typing import Any
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 from nemo_curator.tasks import DocumentBatch
 
 from .base import BaseWriter
@@ -30,7 +33,14 @@ class ParquetWriter(BaseWriter):
     name: str = "parquet_writer"
 
     def write_data(self, task: DocumentBatch, file_path: str) -> None:
-        """Write data to Parquet file using pandas DataFrame.to_parquet."""
+        """Write Arrow-backed batches natively and retain the pandas fallback."""
+        if isinstance(task.data, pa.Table):
+            table = task.data.select(self.fields) if self.fields is not None else task.data
+            write_kwargs = dict(self.write_kwargs)
+            write_kwargs.pop("index", None)
+            write_kwargs.pop("storage_options", None)
+            pq.write_table(table, file_path, **write_kwargs)
+            return
         df = task.to_pandas()  # Convert to pandas DataFrame if needed
         if self.fields is not None:
             df = df[self.fields]

@@ -70,6 +70,7 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         model_inference_batch_size: int | None = 8192,
         # Keep float32 when feeding semantic dedup; cuDF cannot read nested Float16 Parquet as numeric list values.
         embedding_output_dtype: Literal["float16", "float32", "float64"] = "float32",
+        embedding_fields: dict[str, str] | None = None,
     ):
         self.model_identifier = model_identifier
         self.vllm_init_kwargs = vllm_init_kwargs or {}
@@ -77,6 +78,11 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         self.text_field = text_field
         self.pretokenize = pretokenize
         self.embedding_field = embedding_field
+        self.embedding_fields = dict(embedding_fields or {text_field: embedding_field})
+        if not self.embedding_fields:
+            raise ValueError("embedding_fields must contain at least one field")
+        if len(self.embedding_fields) != len(set(self.embedding_fields.values())):
+            raise ValueError("embedding_fields output names must be unique")
         self.embedding_output_dtype = embedding_output_dtype
         # Retained columns are opt-in so large source-text columns are not carried
         # alongside embeddings unless a caller explicitly requests them.
@@ -104,13 +110,17 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         self.name = format_name_with_suffix(model_identifier, suffix="_vllm")
 
     def inputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [self.text_field]
+        return ["data"], list(self.embedding_fields)
 
     def outputs(self) -> tuple[list[str], list[str]]:
         output_fields = list(self.metadata_fields)
-        if self.embedding_field not in output_fields:
-            output_fields.append(self.embedding_field)
+        for embedding_field in self.embedding_fields.values():
+            if embedding_field not in output_fields:
+                output_fields.append(embedding_field)
         return ["data"], output_fields
+
+    def num_workers(self) -> int | None:
+        return getattr(self, "_num_workers_override", None)
 
     def _initialize_vllm(self, local_files_only: bool) -> None:
         """Download (or locate) the model and initialize vLLM.
@@ -257,9 +267,9 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
     def _select_output_table(self, input_table: pa.Table) -> pa.Table:
         """Validate the input and select columns retained beside embeddings."""
-        if self.text_field not in input_table.column_names:
-            msg = f"Input batch is missing required text field {self.text_field!r}"
-            raise ValueError(msg)
+        missing_text_fields = [field for field in self.embedding_fields if field not in input_table.column_names]
+        if missing_text_fields:
+            raise ValueError(f"Input batch is missing required text fields: {missing_text_fields}")
 
         missing_fields = [field for field in self.metadata_fields if field not in input_table.column_names]
         if missing_fields:
@@ -309,14 +319,18 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     def process(self, batch: DocumentBatch) -> DocumentBatch:
         input_table = batch.to_pyarrow()
         output_table = self._select_output_table(input_table)
-        embedding_array, metrics = self._collect_embeddings(input_table[self.text_field], input_table.num_rows)
-        if self.embedding_field in output_table.column_names:
-            embedding_index = output_table.column_names.index(self.embedding_field)
-            output_table = output_table.set_column(embedding_index, self.embedding_field, embedding_array)
-        else:
-            output_table = output_table.append_column(self.embedding_field, embedding_array)
+        aggregate_metrics: dict[str, float] = {}
+        for text_field, embedding_field in self.embedding_fields.items():
+            embedding_array, metrics = self._collect_embeddings(input_table[text_field], input_table.num_rows)
+            aggregate_metrics = {key: aggregate_metrics.get(key, 0.0) + value for key, value in metrics.items()}
+            if embedding_field in output_table.column_names:
+                output_table = output_table.set_column(
+                    output_table.column_names.index(embedding_field), embedding_field, embedding_array
+                )
+            else:
+                output_table = output_table.append_column(embedding_field, embedding_array)
 
-        self._log_metrics(metrics)
+        self._log_metrics(aggregate_metrics)
 
         return DocumentBatch(
             dataset_name=batch.dataset_name,

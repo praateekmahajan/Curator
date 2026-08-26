@@ -29,6 +29,11 @@ if TYPE_CHECKING:
 _HEAD_NODE_ID_CACHE: str | None = None
 
 
+def get_num_gpus() -> int:
+    """Return the number of GPUs registered in the connected Ray cluster."""
+    return int(ray.cluster_resources().get("GPU", 0))
+
+
 def is_head_node(node: dict[str, Any]) -> bool:
     """Check if a Ray node dict represents the cluster head."""
     return "node:__internal_head__" in node.get("Resources", {})
