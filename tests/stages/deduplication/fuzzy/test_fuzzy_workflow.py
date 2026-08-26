@@ -266,6 +266,32 @@ class TestFuzzyDuplicates:
         lsh_df = cudf.read_parquet(cache_path / "LSHStage")
         assert len(lsh_df) == 0
 
+    def test_fuzzy_dedup_preserves_file_ids(
+        self,
+        fuzzy_dedup_data_parquet: list[FileGroupTask],
+        tmp_path: Path,
+    ) -> None:
+        cache_path = tmp_path / "cache"
+        output_path = tmp_path / "output"
+
+        workflow = FuzzyDeduplicationWorkflow(
+            cache_path=str(cache_path),
+            output_path=str(output_path),
+            input_filetype="parquet",
+            text_field="text",
+            id_field="id",
+            char_ngrams=5,
+            num_bands=5,
+            minhashes_per_band=1,
+            bands_per_iteration=5,
+        )
+
+        workflow.run(initial_tasks=fuzzy_dedup_data_parquet)
+
+        minhash_df = cudf.read_parquet(cache_path / "MinHashStage")
+        assert set(minhash_df[CURATOR_DEDUP_ID_STR].to_arrow().to_pylist()) == {-1, 1, 2, 4, 300}
+        assert not (output_path / ID_GENERATOR_OUTPUT_FILENAME).exists()
+
     def test_input_file_extensions_default_to_input_filetype(self, tmp_path: Path) -> None:
         workflow = FuzzyDeduplicationWorkflow(
             input_path="/dummy",

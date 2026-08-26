@@ -72,6 +72,7 @@ class FuzzyDeduplicationWorkflow(WorkflowBase):
         cache_kwargs: dict[str, Any] | None = None,
         write_kwargs: dict[str, Any] | None = None,
         text_field: str = "text",
+        id_field: str | None = None,
         perform_removal: bool = False,
         # Minhash + LSH Config
         seed: int = 42,
@@ -120,6 +121,9 @@ class FuzzyDeduplicationWorkflow(WorkflowBase):
 
         text_field: str
             Field containing the text to deduplicate.
+        id_field: str | None
+            Existing integer ID field to preserve. When omitted, the workflow assigns IDs
+            with the IdGenerator actor and writes its mapping to the output directory.
         perform_removal: bool
             Whether to remove the duplicates from the original dataset.
 
@@ -167,6 +171,7 @@ class FuzzyDeduplicationWorkflow(WorkflowBase):
         self.write_kwargs = write_kwargs
 
         self.text_field = text_field
+        self.id_field = id_field
         self.perform_removal = perform_removal
 
         self.seed = seed
@@ -216,6 +221,7 @@ class FuzzyDeduplicationWorkflow(WorkflowBase):
             MinHashStage(
                 output_path=self.cache_path,
                 text_field=self.text_field,
+                id_field=self.id_field,
                 char_ngrams=self.char_ngrams,
                 num_hashes=self.num_hashes,
                 seed=self.seed,
@@ -324,15 +330,17 @@ class FuzzyDeduplicationWorkflow(WorkflowBase):
 
         total_start_time = time.time()
 
-        try:
-            create_id_generator_actor()
-        except ValueError:
-            err_msg = """
-            An existing id generator actor was found. Please remove or save the existing id generator with
-            `nemo_curator.stages.deduplication.id_generator.write_id_generator_to_disk` (if needed) and remove the actor with
-            `nemo_curator.stages.deduplication.id_generator.kill_id_generator_actor` before running the fuzzy deduplication pipeline.
-            """
-            raise RuntimeError(err_msg) from None
+        use_id_generator = self.id_field is None
+        if use_id_generator:
+            try:
+                create_id_generator_actor()
+            except ValueError:
+                err_msg = """
+                An existing id generator actor was found. Please remove or save the existing id generator with
+                `nemo_curator.stages.deduplication.id_generator.write_id_generator_to_disk` (if needed) and remove the actor with
+                `nemo_curator.stages.deduplication.id_generator.kill_id_generator_actor` before running the fuzzy deduplication pipeline.
+                """
+                raise RuntimeError(err_msg) from None
 
         id_generator_path = None
         try:
@@ -345,17 +353,18 @@ class FuzzyDeduplicationWorkflow(WorkflowBase):
             workflow_result.add_pipeline_tasks("minhash", minhash_tasks)
             workflow_result.add_metadata("minhash_time", minhash_time)
             logger.info(f"Minhash pipeline completed in {minhash_time:.2f} seconds")
-            output_fs = get_fs(
-                self.output_path,
-                self.write_kwargs.get("storage_options") if self.write_kwargs is not None else None,
-            )
-            id_generator_path = output_fs.sep.join([self.output_path, ID_GENERATOR_OUTPUT_FILENAME])
-            write_id_generator_to_disk(
-                id_generator_path,
-                storage_options=self.write_kwargs.get("storage_options") if self.write_kwargs is not None else None,
-            )
-            logger.info(f"Id generator written to {id_generator_path}")
-            workflow_result.add_metadata("id_generator_path", id_generator_path)
+            if use_id_generator:
+                output_fs = get_fs(
+                    self.output_path,
+                    self.write_kwargs.get("storage_options") if self.write_kwargs is not None else None,
+                )
+                id_generator_path = output_fs.sep.join([self.output_path, ID_GENERATOR_OUTPUT_FILENAME])
+                write_id_generator_to_disk(
+                    id_generator_path,
+                    storage_options=self.write_kwargs.get("storage_options") if self.write_kwargs is not None else None,
+                )
+                logger.info(f"Id generator written to {id_generator_path}")
+                workflow_result.add_metadata("id_generator_path", id_generator_path)
 
             # Step 2: LSH
             lsh_pipeline = self._create_lsh_pipeline()
@@ -390,7 +399,8 @@ class FuzzyDeduplicationWorkflow(WorkflowBase):
                 workflow_result.add_metadata("num_duplicates", num_duplicates_identified)
                 logger.info(f"Number of documents removed: {num_duplicates_identified}")
         finally:
-            kill_id_generator_actor()
+            if use_id_generator:
+                kill_id_generator_actor()
 
         total_end_time = time.time()
         total_time = total_end_time - total_start_time

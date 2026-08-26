@@ -42,6 +42,7 @@ def run_duplicate_identification_benchmark(  # noqa: PLR0913
     lsh_rmm_pool_size: int | Literal["auto"] | None = "auto",
     lsh_spill_memory_limit: int | Literal["auto"] | None = "auto",
     use_async_memory: bool = True,
+    id_field: str | None = None,
     **kwargs,  # noqa: ARG001
 ) -> dict[str, Any]:
     """Run the duplicate identification benchmark and collect comprehensive metrics."""
@@ -66,6 +67,7 @@ def run_duplicate_identification_benchmark(  # noqa: PLR0913
         lsh_rmm_pool_size=lsh_rmm_pool_size,
         lsh_spill_memory_limit=lsh_spill_memory_limit,
         use_async_memory=use_async_memory,
+        id_field=id_field,
     )
 
     # Run the workflow, extract metrics from the WorkflowRunResult object
@@ -121,6 +123,7 @@ def main() -> int:
         "--bands-per-iteration", type=int, default=20, help="Bands per iteration (for LSH deduplication)"
     )
     parser.add_argument("--text-field", default="text", help="Text field to use for duplicate identification")
+    parser.add_argument("--id-field", default=None, help="Existing integer ID field to preserve instead of generating IDs")
     parser.add_argument(
         "--input-blocksize", type=str, default="1.5GiB", help="Target partition size for input data (e.g. '512MB')"
     )

@@ -203,6 +203,9 @@ class MinHashStage(ProcessingStage[FileGroupTask | DocumentBatch, FileGroupTask]
         Base path where minhash output files will be written
     text_field : str, default="text"
         Name of the field containing text to compute minhashes from
+    id_field : str | None, default=None
+        Existing integer ID field to preserve for file-backed inputs. When omitted,
+        IDs are assigned with the IdGenerator actor.
     minhash_field : str, default="_minhash_signature"
         Name of the field where minhash signatures will be stored
     char_ngrams : int, default=24
@@ -237,6 +240,7 @@ class MinHashStage(ProcessingStage[FileGroupTask | DocumentBatch, FileGroupTask]
         self,
         output_path: str,
         text_field: str = "text",
+        id_field: str | None = None,
         minhash_field: str = CURATOR_DEFAULT_MINHASH_FIELD,
         char_ngrams: int = 24,
         num_hashes: int = 260,
@@ -252,6 +256,7 @@ class MinHashStage(ProcessingStage[FileGroupTask | DocumentBatch, FileGroupTask]
         self.resources = Resources(gpus=1.0)  # Requires 1 GPU
 
         self.text_field = text_field
+        self.id_field = id_field
         self.minhash_field = minhash_field
         self.char_ngrams = char_ngrams
         self.num_hashes = num_hashes
@@ -275,14 +280,15 @@ class MinHashStage(ProcessingStage[FileGroupTask | DocumentBatch, FileGroupTask]
         # are assigned at read time. DocumentBatch inputs must already carry _curator_dedup_id,
         # so a missing actor is tolerated here; the file path surfaces a clear error at
         # process time if it actually needs the ID generator.
-        try:
-            self.id_generator = get_id_generator_actor()
-        except ValueError:
-            logger.warning(
-                "IdGenerator actor was not found during MinHashStage setup. "
-                "FileGroupTask inputs will fail at process time; DocumentBatch inputs are unaffected."
-            )
-            self.id_generator = None
+        if self.id_field is None:
+            try:
+                self.id_generator = get_id_generator_actor()
+            except ValueError:
+                logger.warning(
+                    "IdGenerator actor was not found during MinHashStage setup. "
+                    "FileGroupTask inputs will fail at process time; DocumentBatch inputs are unaffected."
+                )
+                self.id_generator = None
 
         # Initialize the GPU minhash processor
         self.minhash_processor = GPUMinHash(
@@ -363,7 +369,7 @@ class MinHashStage(ProcessingStage[FileGroupTask | DocumentBatch, FileGroupTask]
     def _read_file_group(self, task: FileGroupTask) -> "cudf.DataFrame":
         """Read a FileGroupTask's files into cuDF, assigning IDs at read time."""
         with self._time_metric("minhash_file_read_time"):
-            if self.id_generator is None:
+            if self.id_field is None and self.id_generator is None:
                 msg = (
                     "IdGenerator actor is required for FileGroupTask input but was not found. "
                     "Start it via create_id_generator_actor(), or pass a DocumentBatch whose data "
@@ -373,14 +379,23 @@ class MinHashStage(ProcessingStage[FileGroupTask | DocumentBatch, FileGroupTask]
 
             read_kwargs = self.read_kwargs.copy()
 
+            columns = [self.text_field]
+            if self.id_field is not None and self.id_field != self.text_field:
+                columns.append(self.id_field)
+            assign_id = self.id_field is None
+
             # Read input file based on format
             if self.read_format == "jsonl":
-                return self.read_jsonl(filepath=task.data, columns=[self.text_field], assign_id=True, **read_kwargs)
+                df = self.read_jsonl(filepath=task.data, columns=columns, assign_id=assign_id, **read_kwargs)
             elif self.read_format == "parquet":
-                return self.read_parquet(filepath=task.data, columns=[self.text_field], assign_id=True, **read_kwargs)
+                df = self.read_parquet(filepath=task.data, columns=columns, assign_id=assign_id, **read_kwargs)
             else:
                 msg = f"read_format must be 'jsonl' or 'parquet' to process a FileGroupTask; got {self.read_format!r}"
                 raise ValueError(msg)
+
+            if self.id_field is not None and self.id_field != CURATOR_DEDUP_ID_STR:
+                df = df.rename(columns={self.id_field: CURATOR_DEDUP_ID_STR})
+            return df
 
     def _read_document_batch(self, task: DocumentBatch) -> "cudf.DataFrame":
         """Convert an in-memory DocumentBatch to cuDF, keeping only the ID and text columns.
