@@ -112,22 +112,11 @@ def _is_engine_startup_failure(exc: BaseException) -> bool:
     return any(marker in message for marker in _ENGINE_STARTUP_FAILURE_MARKERS)
 
 
-def pick_free_port(preferred_port: int | None = None) -> int:
-    """Return a free TCP port on the local machine.
-
-    ``preferred_port`` lets concurrently created workers reserve distinct port
-    candidates instead of all racing for arbitrary ephemeral ports.
-    """
+def pick_free_port() -> int:
+    """Return a free TCP port on the local machine."""
     import socket
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        if preferred_port is not None:
-            try:
-                s.bind(("", preferred_port))
-            except OSError:
-                pass
-            else:
-                return preferred_port
         s.bind(("", 0))
         return s.getsockname()[1]
 
@@ -197,8 +186,7 @@ def create_vllm_llm_with_retry(*, max_port_retries: int = 3, **engine_kwargs: ob
     from vllm import LLM
 
     for attempt in range(1, max_port_retries + 1):
-        preferred_port = 20000 + ((os.getpid() + 7919 * attempt) % 30000)
-        free_port = pick_free_port(preferred_port)
+        free_port = pick_free_port()
         os.environ["MASTER_PORT"] = str(free_port)
         try:
             return LLM(**engine_kwargs)
