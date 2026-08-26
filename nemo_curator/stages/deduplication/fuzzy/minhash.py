@@ -378,6 +378,8 @@ class MinHashStage(ProcessingStage[FileGroupTask | DocumentBatch, FileGroupTask]
                 raise RuntimeError(msg)
 
             read_kwargs = self.read_kwargs.copy()
+            if self.id_field is not None and "dataset_kwargs" not in read_kwargs:
+                read_kwargs["dataset_kwargs"] = {"partitioning": None}
 
             columns = [self.text_field]
             if self.id_field is not None and self.id_field != self.text_field:

@@ -125,6 +125,21 @@ def fuzzy_dedup_data_parquet(tmp_path: Path) -> list[FileGroupTask]:
 
 
 @pytest.fixture
+def fuzzy_dedup_partitioned_path_parquet(tmp_path: Path) -> list[FileGroupTask]:
+    """Create parquet files where a Hive-style path conflicts with a physical bool column."""
+    df = create_fuzzy_dedup_test_data()
+    df["qa_parse_status"] = True
+    partition_dir = tmp_path / "qa_parse_status=true"
+    partition_dir.mkdir()
+    file1 = partition_dir / "part1.parquet"
+    file2 = partition_dir / "part2.parquet"
+    df.iloc[:3].to_parquet(file1)
+    df.iloc[3:].to_parquet(file2)
+    files = [str(file1), str(file2)]
+    return [FileGroupTask(dataset_name="test_dataset", data=files, _metadata={"source_files": files})]
+
+
+@pytest.fixture
 def no_duplicates_fuzzy_dedup_data(tmp_path: Path) -> list[FileGroupTask]:
     """Create test data with no duplicates."""
     data = {
@@ -268,7 +283,7 @@ class TestFuzzyDuplicates:
 
     def test_fuzzy_dedup_preserves_file_ids(
         self,
-        fuzzy_dedup_data_parquet: list[FileGroupTask],
+        fuzzy_dedup_partitioned_path_parquet: list[FileGroupTask],
         tmp_path: Path,
     ) -> None:
         cache_path = tmp_path / "cache"
@@ -286,7 +301,7 @@ class TestFuzzyDuplicates:
             bands_per_iteration=5,
         )
 
-        workflow.run(initial_tasks=fuzzy_dedup_data_parquet)
+        workflow.run(initial_tasks=fuzzy_dedup_partitioned_path_parquet)
 
         minhash_df = cudf.read_parquet(cache_path / "MinHashStage")
         assert set(minhash_df[CURATOR_DEDUP_ID_STR].to_arrow().to_pylist()) == {-1, 1, 2, 4, 300}
