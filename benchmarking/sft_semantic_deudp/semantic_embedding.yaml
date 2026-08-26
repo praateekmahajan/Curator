@@ -21,6 +21,10 @@ datasets:
     formats:
       - type: files
         path: "{model_weights_path}/hub/models--microsoft--harrier-oss-v1-270m/snapshots/31de22b673913c7d658c0f03f792d77c2dcf8ebd"
+  - name: qwen3_embedding_0_6b
+    formats:
+      - type: files
+        path: "{model_weights_path}/hub/models--Qwen--Qwen3-Embedding-0.6B/snapshots/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
 
 gpu_stats_recorder:
   interval_s: 1.0
@@ -40,6 +44,19 @@ entries:
       --output-path={output_path}
       --executor=ray_data
       --model-identifier={dataset:harrier_model,files}
+      --model-inference-batch-size=32
+      --num-vllm-replicas-per-gpu=${NUM_VLLM_REPLICAS_PER_GPU}
+      --dataset-ratio=0.1
+      --cache-dir={model_weights_path}
+    timeout_s: 12000
+  - name: qwen3_embedding_0_6b_${SLURM_ARRAY_TASK_ID}_${SLURM_JOB_ID}
+    script: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/users/praateekm/benchmarking/sft_fuzzy_dedup/worktree/benchmarking/sft_semantic_deudp/01_embedding.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={dataset:sft_qa_parse_success,parquet}
+      --output-path={output_path}/qwen3_embedding_0_6b
+      --executor=ray_data
+      --model-identifier={dataset:qwen3_embedding_0_6b,files}
       --model-inference-batch-size=32
       --num-vllm-replicas-per-gpu=${NUM_VLLM_REPLICAS_PER_GPU}
       --dataset-ratio=0.1
