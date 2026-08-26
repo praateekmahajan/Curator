@@ -63,10 +63,15 @@ def run_embedding_benchmark(
 
     stage = VLLMEmbeddingModelStage(
         model_identifier=model_identifier,
-        vllm_init_kwargs={"gpu_memory_utilization": gpu_memory_utilization},
+        vllm_init_kwargs={
+            "enable_prefix_caching": False,
+            "gpu_memory_utilization": gpu_memory_utilization,
+            "max_num_batched_tokens": 65536,
+        },
         embedding_fields=EMBEDDING_FIELDS,
         metadata_fields=["int_id"],
         model_inference_batch_size=model_inference_batch_size,
+        pretokenize=True,
         cache_dir=cache_dir,
     ).with_(
         num_workers=num_workers,
@@ -103,8 +108,8 @@ def main() -> int:
     parser.add_argument("--output-path", required=True)
     parser.add_argument("--executor", default="ray_data")
     parser.add_argument("--model-identifier", required=True)
-    parser.add_argument("--model-inference-batch-size", type=int, default=1024)
-    parser.add_argument("--num-vllm-replicas-per-gpu", type=int, default=4)
+    parser.add_argument("--model-inference-batch-size", type=int, default=32)
+    parser.add_argument("--num-vllm-replicas-per-gpu", type=int, default=1)
     parser.add_argument("--dataset-ratio", type=float, default=0.1)
     parser.add_argument("--cache-dir", default=None)
     args = parser.parse_args()
