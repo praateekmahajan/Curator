@@ -63,6 +63,7 @@ def run_embedding_benchmark(
         metadata_fields=["int_id"],
         model_inference_batch_size=model_inference_batch_size,
         cache_dir=cache_dir,
+        initialize_on_node=False,
     ).with_(
         num_workers=num_workers,
         resources=Resources(cpus=1, gpus=1 / num_vllm_replicas_per_gpu),

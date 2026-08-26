@@ -72,6 +72,7 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         # Keep float32 when feeding semantic dedup; cuDF cannot read nested Float16 Parquet as numeric list values.
         embedding_output_dtype: Literal["float16", "float32", "float64"] = "float32",
         embedding_fields: dict[str, str] | None = None,
+        initialize_on_node: bool = True,
     ):
         self.model_identifier = model_identifier
         self.vllm_init_kwargs = vllm_init_kwargs or {}
@@ -85,6 +86,7 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         if len(self.embedding_fields) != len(set(self.embedding_fields.values())):
             raise ValueError("embedding_fields output names must be unique")
         self.embedding_output_dtype = embedding_output_dtype
+        self.initialize_on_node = initialize_on_node
         # Retained columns are opt-in so large source-text columns are not carried
         # alongside embeddings unless a caller explicitly requests them.
         self.metadata_fields = list(dict.fromkeys(metadata_fields or []))
@@ -163,6 +165,8 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         self.model = create_vllm_llm_with_retry(model=model_path, **vllm_init_kwargs)
 
     def setup_on_node(self, node_info: NodeInfo | None = None, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
+        if not self.initialize_on_node:
+            return
         if not self.verbose:
             from huggingface_hub.utils import disable_progress_bars
 
