@@ -97,6 +97,34 @@ def reset_head_node_cache() -> Iterator[None]:
 class TestExecuteSetupOnNode:
     """Test class for execute_setup_on_node function."""
 
+    def test_execute_setup_on_node_tears_down_setup_copy(
+        self,
+        shared_ray_client: None,
+        tmp_path: Path,
+    ):
+        """Node setup releases resources held by its serialized stage copy."""
+
+        class ResourceHoldingStage(ProcessingStage):
+            name = "resource_holding_stage"
+            resources = Resources(cpus=1.0, gpus=0.0)
+
+            def process(self, task: "Task") -> "Task":
+                return task
+
+            def setup_on_node(
+                self, node_info: NodeInfo | None = None, worker_metadata: WorkerMetadata | None = None
+            ) -> None:
+                self.marker_path = tmp_path / f"{node_info.node_id}_{uuid.uuid4()}"
+                self.marker_path.with_suffix(".setup").touch()
+
+            def teardown(self) -> None:
+                self.marker_path.with_suffix(".teardown").touch()
+
+        execute_setup_on_node([ResourceHoldingStage()])
+
+        assert len(list(tmp_path.glob("*.setup"))) == len(ray.nodes())
+        assert len(list(tmp_path.glob("*.teardown"))) == len(ray.nodes())
+
     def test_execute_setup_on_node_with_two_stages(
         self,
         shared_ray_client: None,
