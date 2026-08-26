@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import ray
 from loguru import logger
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -49,7 +50,11 @@ def run_embedding_benchmark(
         raise ValueError("num_vllm_replicas_per_gpu must be positive")
 
     input_files = load_dataset_files(Path(input_path), dataset_ratio=dataset_ratio, keep_extensions="parquet")
-    num_gpus = get_num_gpus()
+    ray.init(address="auto", ignore_reinit_error=True)
+    try:
+        num_gpus = get_num_gpus()
+    finally:
+        ray.shutdown()
     if num_gpus <= 0:
         raise RuntimeError("Ray reported no GPUs")
     num_workers = num_vllm_replicas_per_gpu * num_gpus
