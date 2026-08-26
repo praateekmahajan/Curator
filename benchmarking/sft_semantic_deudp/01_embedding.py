@@ -55,7 +55,7 @@ def run_embedding_benchmark(
     if num_gpus <= 0:
         raise RuntimeError("Ray reported no GPUs")
     num_workers = num_vllm_replicas_per_gpu * num_gpus
-    gpu_memory_utilization = 0.80 / num_vllm_replicas_per_gpu
+    gpu_memory_utilization = 0.60 / num_vllm_replicas_per_gpu
     logger.info(
         f"Using {num_gpus} GPUs and {num_workers} vLLM workers "
         f"with {gpu_memory_utilization:.2f} GPU memory utilization per worker"
