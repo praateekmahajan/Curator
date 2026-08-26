@@ -24,6 +24,7 @@ import numpy as np
 import pyarrow as pa
 import torch
 from huggingface_hub import snapshot_download
+from loguru import logger
 
 try:
     from vllm import LLM
@@ -66,6 +67,7 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         cache_dir: str | None = None,
         hf_token: str | None = None,
         verbose: bool = False,
+        log_task_progress: bool = False,
         *,
         metadata_fields: list[str] | None = None,
         model_inference_batch_size: int | None = 8192,
@@ -100,6 +102,7 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         self.hf_token = hf_token
 
         self.verbose = verbose
+        self.log_task_progress = log_task_progress
         # after setup
         self.model: None | LLM = None
         self.tokenizer: None | AutoTokenizer = None
@@ -326,6 +329,12 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:
         input_table = batch.to_pyarrow()
+        source_files = batch._metadata.get("source_files") or []
+        source = Path(source_files[0]).name if source_files else "unknown"
+        if self.log_task_progress:
+            logger.info(
+                f"embedding START task_id={batch.task_id} source={source} rows={input_table.num_rows}"
+            )
         output_table = self._select_output_table(input_table)
         aggregate_metrics: dict[str, float] = {}
         for text_field, embedding_field in self.embedding_fields.items():
@@ -339,6 +348,11 @@ class VLLMEmbeddingModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 output_table = output_table.append_column(embedding_field, embedding_array)
 
         self._log_metrics(aggregate_metrics)
+
+        if self.log_task_progress:
+            logger.info(
+                f"embedding FINISH task_id={batch.task_id} source={source} rows={input_table.num_rows}"
+            )
 
         return DocumentBatch(
             dataset_name=batch.dataset_name,

@@ -72,6 +72,7 @@ def run_embedding_benchmark(
         metadata_fields=["int_id"],
         model_inference_batch_size=model_inference_batch_size,
         pretokenize=True,
+        log_task_progress=True,
         cache_dir=cache_dir,
     ).with_(
         num_workers=num_workers,

@@ -197,6 +197,42 @@ class TestVLLMEmbeddingModelStage:
             with pytest.raises(ValueError, match=message):
                 stage.process(DocumentBatch(dataset_name="test_dataset", data=table))
 
+    def test_process_logs_compact_source_progress_when_enabled(self) -> None:
+        """A stalled actor identifies its current source without logging task payloads."""
+        from io import StringIO
+
+        from loguru import logger
+
+        class _NoopEmbeddingStage(VLLMEmbeddingModelStage):
+            def _collect_embeddings(
+                self, text_column: pa.ChunkedArray, num_rows: int  # noqa: ARG002
+            ) -> tuple[pa.ChunkedArray, dict[str, float]]:
+                return pa.chunked_array([pa.array([[0.1]] * num_rows)]), {
+                    "tokenization_time": 0.0,
+                    "vllm_embedding_time": 0.0,
+                    "input_tokens": 0,
+                }
+
+        stage = _NoopEmbeddingStage(model_identifier=TEST_MODEL, log_task_progress=True)
+        batch = DocumentBatch(
+            dataset_name="test_dataset",
+            data=pa.table({"text": ["hello"]}),
+            _metadata={"source_files": ["/dataset/compact-source.parquet"]},
+        )
+
+        log_output = StringIO()
+        sink_id = logger.add(log_output, format="{message}")
+        try:
+            stage.process(batch)
+        finally:
+            logger.remove(sink_id)
+
+        logs = log_output.getvalue()
+        assert "embedding START" in logs
+        assert "embedding FINISH" in logs
+        assert "source=compact-source.parquet" in logs
+        assert "rows=1" in logs
+
     def test_arrow_embeddings_split_before_list_offset_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import nemo_curator.stages.text.embedders.vllm as _vllm_mod
 
