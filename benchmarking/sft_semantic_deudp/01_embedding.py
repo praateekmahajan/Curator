@@ -7,17 +7,16 @@ import time
 from pathlib import Path
 from typing import Any
 
-import ray
 from loguru import logger
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from utils import load_dataset_files, setup_executor, write_benchmark_results  # noqa: E402
+from nemo_curator.backends.utils import get_available_cpu_gpu_resources
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.text.embedders.vllm import VLLMEmbeddingModelStage
 from nemo_curator.stages.text.io.reader import ParquetReader
 from nemo_curator.stages.text.io.writer import ParquetWriter
-from nemo_curator.utils.ray_utils import get_num_gpus
 
 EMBEDDING_FIELDS = {
     "question": "question_embedding",
@@ -50,11 +49,7 @@ def run_embedding_benchmark(
         raise ValueError("num_vllm_replicas_per_gpu must be positive")
 
     input_files = load_dataset_files(Path(input_path), dataset_ratio=dataset_ratio, keep_extensions="parquet")
-    ray.init(address="auto", ignore_reinit_error=True)
-    try:
-        num_gpus = get_num_gpus()
-    finally:
-        ray.shutdown()
+    _, num_gpus = get_available_cpu_gpu_resources(init_and_shutdown=True)
     if num_gpus <= 0:
         raise RuntimeError("Ray reported no GPUs")
     num_workers = num_vllm_replicas_per_gpu * num_gpus
