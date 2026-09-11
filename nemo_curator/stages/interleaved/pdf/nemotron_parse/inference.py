@@ -128,7 +128,7 @@ class NemotronParseInferenceStage(ProcessingStage[InterleavedBatch, InterleavedB
     enforce_eager: bool = False
     engine_kwargs: dict[str, Any] | None = None
     name: str = "nemotron_parse_inference"
-    resources: Resources = field(default_factory=lambda: Resources(cpus=4.0, gpus=1.0))
+    resources: Resources = field(default_factory=lambda: Resources(cpus=4.0, gpus=0.5))
 
     def __post_init__(self) -> None:
         if self.task_prompt is None:
@@ -184,6 +184,7 @@ class NemotronParseInferenceStage(ProcessingStage[InterleavedBatch, InterleavedB
 
         resolved_path = resolve_local_model_path(self.model_path)
         engine_kwargs = {
+            "gpu_memory_utilization": 0.4,
             "max_num_seqs": self.max_num_seqs,
             "enforce_eager": self.enforce_eager,
             **(self.engine_kwargs or {}),
