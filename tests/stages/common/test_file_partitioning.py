@@ -142,6 +142,21 @@ class TestFilePartitioningStage:
         assert result[0].data == [test_files[0]]
         assert result[0].dataset_name == "path"
 
+    def test_remote_file_list_skips_metadata_requests(self, monkeypatch: pytest.MonkeyPatch):
+        """Explicit remote paths partitioned by count do not need per-file sizes."""
+        files = ["s3://bucket/b.parquet", "s3://bucket/a.parquet"]
+        stage = FilePartitioningStage(file_paths=files, files_per_partition=1, file_extensions=[".parquet"])
+
+        monkeypatch.setattr(
+            "nemo_curator.stages.file_partitioning.get_all_file_paths_and_size_under",
+            lambda *_args, **_kwargs: pytest.fail("remote metadata lookup should be skipped"),
+        )
+
+        assert stage._get_file_list_with_sizes(sort_by_size=False) == [
+            ("s3://bucket/a.parquet", -1),
+            ("s3://bucket/b.parquet", -1),
+        ]
+
     def test_process_with_files_per_partition(self, empty_task: EmptyTask, tmp_path: Path):
         """Test processing with files_per_partition setting."""
         test_files = _create_test_jsonl_files(tmp_path, num_files=4, subdir="path")

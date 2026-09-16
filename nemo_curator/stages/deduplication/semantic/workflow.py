@@ -348,7 +348,10 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
         logger.info("=" * 60)
         logger.info("SEMANTIC DEDUPLICATION WORKFLOW CONFIGURATION")
         logger.info("=" * 60)
-        logger.info(f"Input path: {self.input_path}")
+        input_path = self.input_path
+        if isinstance(input_path, list) and len(input_path) > 5:
+            input_path = [*input_path[:3], f"... ({len(input_path) - 5} more files) ...", *input_path[-2:]]
+        logger.info(f"Input path: {input_path}")
         logger.info(f"Output path: {self.output_path}")
         logger.info(f"K-means output path: {self.kmeans_output_path}")
         logger.info(f"Pairwise output path: {self.pairwise_output_path}")

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,8 +21,10 @@ from loguru import logger
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import EmptyTask, FileGroupTask
+from nemo_curator.utils.client_utils import is_remote_url
 from nemo_curator.utils.file_utils import (
     _split_files_as_per_blocksize,
+    filter_files_by_extension,
     get_all_file_paths_and_size_under,
     infer_dataset_name_from_path,
     parse_bytes_string_to_int,
@@ -105,17 +108,28 @@ class FilePartitioningStage(ProcessingStage[EmptyTask, FileGroupTask]):
         This stage expects a simple Task with file paths information
         and outputs multiple FileGroupTasks for parallel processing.
         """
+        total_start = time.perf_counter()
         sort_by_size = self.blocksize is not None
+        discovery_start = time.perf_counter()
         files_with_sizes = self._get_file_list_with_sizes(sort_by_size)
+        discovery_time = time.perf_counter() - discovery_start
         # Extract list[str] from list[tuple[str, int]]
         files = [file[0] for file in files_with_sizes]
 
         logger.info(f"Found {len(files)} files")
         if len(files) == 0:
             logger.warning(f"No files found under {self.file_paths}")
+            self._log_metrics(
+                {
+                    "file_discovery_time": discovery_time,
+                    "file_partitioning_total_time": time.perf_counter() - total_start,
+                    "file_count": 0,
+                }
+            )
             return []
 
         # Partition files
+        partition_start = time.perf_counter()
         if self.files_per_partition:
             partitions = self._partition_by_count(files, self.files_per_partition)
         elif self.blocksize:
@@ -124,14 +138,16 @@ class FilePartitioningStage(ProcessingStage[EmptyTask, FileGroupTask]):
             # Default to one file per partition
             logger.info("No partitions specified, defaulting to one file per partition")
             partitions = self._partition_by_count(files, 1)
+        partition_time = time.perf_counter() - partition_start
 
         # Build a dictionary of path: size of all files
+        validation_start = time.perf_counter()
         path_to_size: dict[str, int] = dict(files_with_sizes)
 
         # Check that no files have size less than 0 (since -1 is used to indicate unknown size)
         if any(size < 0 for size in path_to_size.values()):
             msg = "Skipping storage limit check because some files have unknown size"
-            logger.warning(msg)
+            (logger.debug if self._uses_trusted_remote_file_list() else logger.warning)(msg)
         else:
             # Verify storage size of input files is not greater than self._blocksize (512 MB by default)
             # This should be a very quick check per file, so we do it first before reading the data
@@ -156,8 +172,10 @@ class FilePartitioningStage(ProcessingStage[EmptyTask, FileGroupTask]):
                         "Any individual file(s) larger than the storage limit should be split into smaller chunks using nemo_curator.utils.split_large_files."
                     )
                     logger.warning(msg)
+        validation_time = time.perf_counter() - validation_start
 
         # Create FileGroupTask for each partition
+        task_start = time.perf_counter()
         tasks = []
         dataset_name = self._get_dataset_name(files)
 
@@ -179,14 +197,36 @@ class FilePartitioningStage(ProcessingStage[EmptyTask, FileGroupTask]):
             )
             tasks.append(file_task)
 
+        metrics = {
+            "file_discovery_time": discovery_time,
+            "file_partition_time": partition_time,
+            "file_validation_time": validation_time,
+            "file_task_creation_time": time.perf_counter() - task_start,
+            "file_partitioning_total_time": time.perf_counter() - total_start,
+            "file_count": len(files),
+            "partition_count": len(tasks),
+            "trusted_remote_file_list": self._uses_trusted_remote_file_list(),
+        }
+        self._log_metrics(metrics)
+        logger.info(f"File partitioning metrics: {metrics}")
         logger.info(f"Created {len(tasks)} file groups from {len(files)} files")
         return tasks
+
+    def _uses_trusted_remote_file_list(self) -> bool:
+        return (
+            isinstance(self.file_paths, list)
+            and self.blocksize is None
+            and all(is_remote_url(path) for path in self.file_paths)
+        )
 
     def _get_file_list_with_sizes(self, sort_by_size: bool = True) -> list[tuple[str, int]]:
         """
         Get the list of files to process.
         """
         logger.debug(f"Getting file list with sizes for {self.file_paths}")
+        if self._uses_trusted_remote_file_list():
+            files = filter_files_by_extension(self.file_paths, self.file_extensions)
+            return sorted(((path, -1) for path in files), key=lambda item: item[0])
         if isinstance(self.file_paths, str):
             # Directory: list contents (recursively) and filter extensions
             output_ls = get_all_file_paths_and_size_under(
