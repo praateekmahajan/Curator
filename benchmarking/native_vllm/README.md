@@ -153,6 +153,49 @@ through Curator. If using an existing host environment instead of containers,
 activate the worktree's `.venv` on the worker and verify `command -v python`
 before the driver step. Keep that launch mode consistent throughout the series.
 
+## Read the Rust frontend logs
+
+With this launch bundle, vLLM's frontend statistics appear in
+`$TASK_ROOT/logs/qwen-$JOB_ID.err` and `deepseek-$JOB_ID.err`; check `.out` too
+if a different image routes logs there. Follow either server from the login
+node without running inference:
+
+```bash
+tail -F "$TASK_ROOT/logs/deepseek-$JOB_ID.err" | \
+  rg --line-buffered 'RustFrontend.*(Avg prompt tput|Preemptions|ERROR)'
+# Inspect initialization separately; confirm graph capture actually finished.
+rg 'enforce_eager|cudagraph|Captur|ready|ERROR' "$TASK_ROOT/logs/deepseek-$JOB_ID."{out,err}
+```
+
+Example from our running nightly (active statistics arrived about every 10 s):
+
+```text
+(RustFrontend pid=3226278) INFO 09-17 15:57:17 [log_stats.rs:273] Avg prompt tput: 672.5 toks/s, Avg generation tput: 1931.6 toks/s, Reqs Running: 57, Waiting: 0, GPU KV cache used: 1.8%, Prefix cache hit rate: 0.0%
+```
+
+| Field | Interpretation |
+| --- | --- |
+| `Avg prompt tput` / `Avg generation tput` | Input/output tokens per second over the last logging interval, not the entire benchmark. This Rust frontend aggregates its engines: Qwen's DP8 value is already the total, not a per-GPU value to multiply by eight. |
+| `Reqs Running` / `Waiting` | Current scheduler counts. Repeated drops in running requests with no queue suggest the clients may not keep the server fed. A persistent queue means requests are arriving faster than the server admits them. |
+| `GPU KV cache used` | Occupancy of the allocated KV cache, not total GPU memory usage. A small value does not mean model weights or CUDA graphs leave most GPU memory free. |
+| `Prefix cache hit rate` | Prefix-cache hits over the interval. Reset caches between entries to avoid giving repeated prompts an unfair advantage. |
+| `Preemptions` (when present) | Preemptions during the interval; rising counts warrant checking cache pressure before increasing concurrency. |
+
+For example, our DeepSeek run repeatedly dropped from 64 active requests to
+roughly 20–30 with `Waiting: 0`, and output throughput fell alongside it.
+Tasks wait for their remaining responses before taking the next file. More
+client replicas can overlap these task tails; increasing `max-num-seqs` alone
+cannot supply missing requests. Conversely, a queue plus high cache occupancy
+is not a reason to blindly increase concurrency.
+
+Compare steady serving intervals with the same time window in `gpustats.csv`.
+Frontend timestamps here use the worker's local timezone; the CSV uses UTC.
+Exclude loading and idle periods when diagnosing serving, but use `metrics.json`
+for end-to-end benchmark throughput, including the final request drain.
+GPU busy time near 100% and power below the limit do not by themselves establish
+peak throughput or quantify available speedup. Idle frontend statistics may
+drop to DEBUG level, so a quiet INFO log alone does not indicate a failed server.
+
 ## Results and viewer-compatible GPU stats
 
 Each completed entry is at `$RESULTS_PATH/$SESSION/<entry>/`:
