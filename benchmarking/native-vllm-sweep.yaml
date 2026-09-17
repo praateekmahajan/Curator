@@ -1,0 +1,59 @@
+# benchmarking/run.py owns sessions, execution, entry logs and benchmark artifacts.
+# All three pipelines use the Ray Data executor with CPU-only stage resources.
+# Set WORKTREE, QWEN_HOST and DEEPSEEK_HOST before invoking it.
+paths:
+  - name: results_path
+    host_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/users/praateekm/benchmarking/results
+default_timeout_s: 3600
+max_timeout_s: 3600
+delete_scratch: false
+sinks: []
+gpu_stats_recorder: {interval_s: 0}  # Separate recorders capture both serving nodes.
+object_store_size: 17179869184
+ray: {num_cpus: 64, num_gpus: 0, enable_object_spilling: false}
+
+native_vllm:
+  input:
+    paths:
+      - /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/datasets/sft/deduped/question_only_stratified_8k
+    prompt_field: curator_question  # The text field contains existing answers.
+  generation: {max_tokens: 2048, temperature: 0.0, top_p: 1.0, seed: 42}
+  models:
+    qwen:
+      model: Qwen/Qwen3.8-27B
+      endpoint: http://${QWEN_HOST}:8000/v1
+      replicas: 8
+      gpus_per_replica: 1
+      chat_template_kwargs: {enable_thinking: false}
+    deepseek:
+      model: deepseek-ai/DeepSeek-V4.1-Flash
+      endpoint: http://${DEEPSEEK_HOST}:8000/v1
+      replicas: 1
+      gpus_per_replica: 8
+      chat_template_kwargs: {thinking: false}
+
+# Three initial experiments: identical questions and generation settings.
+# Request concurrency is 16 * 4 * model replicas: Qwen 512, DeepSeek 64.
+# Shared calls both endpoints concurrently with independent per-model limits.
+# Each file already contains 64 rows; no stage splits DocumentBatches.
+entries:
+  - name: qwen_dp8_batch16_clients4_per_replica_no_thinking_max2048
+    script: native_vllm_benchmark.py
+    args: >-
+      --workload-config=${WORKTREE}/benchmarking/native-vllm-sweep.yaml
+      --layout=qwen --batch-size=16 --num-client-replicas-per-model-replica=4
+      --benchmark-results-path={session_entry_dir}
+
+  - name: deepseek_tp8_batch16_clients4_per_replica_no_thinking_max2048
+    script: native_vllm_benchmark.py
+    args: >-
+      --workload-config=${WORKTREE}/benchmarking/native-vllm-sweep.yaml
+      --layout=deepseek --batch-size=16 --num-client-replicas-per-model-replica=4
+      --benchmark-results-path={session_entry_dir}
+
+  - name: both_shared_pipeline_batch16_clients4_per_replica_no_thinking_max2048
+    script: native_vllm_benchmark.py
+    args: >-
+      --workload-config=${WORKTREE}/benchmarking/native-vllm-sweep.yaml
+      --layout=shared --batch-size=16 --num-client-replicas-per-model-replica=4
+      --benchmark-results-path={session_entry_dir}
