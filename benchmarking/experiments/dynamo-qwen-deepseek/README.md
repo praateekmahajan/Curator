@@ -39,11 +39,12 @@ Set `HF_HOME` to the existing model cache and `SERVING_CACHE` to writable
 persistent storage. Use an empty results directory for each run and a free GPU:
 
 ```bash
-mkdir -p "$SERVING_CACHE"/{cuda,triton,vllm} "$PWD/qwen-results"
+RESULTS_DIR=/raid/praateekm/tmp_ai_agent/qwen-results
+mkdir -p "$SERVING_CACHE"/{cuda,triton,vllm} "$RESULTS_DIR"
 docker run --rm --init --gpus '"device=0"' --shm-size=4g \
   -e HF_HOME=/hf -e HF_HUB_OFFLINE=1 -e OMP_NUM_THREADS=4 -e MKL_NUM_THREADS=4 \
   -v "$HF_HOME:/hf:ro" -v "$SERVING_CACHE:/cache" \
-  -v "$PWD/qwen-results:/results" \
+  -v "$RESULTS_DIR:/results" \
   -v "$PWD/benchmarking/experiments/dynamo-qwen-deepseek/smoke_qwen.py:/smoke_qwen.py:ro" \
   --entrypoint python3 nemo-curator:dynamo-vllm-nightly-20260917 /smoke_qwen.py
 ```
