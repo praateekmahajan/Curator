@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1
+FROM vllm/vllm-openai@sha256:c4392d76e3eec8983fa152651365158cb062e348fd40398963f499d5867b9e28
+
+COPY nemo_curator /opt/Curator/nemo_curator
+COPY pyproject.toml README.md LICENSE /opt/Curator/
+
+RUN --mount=type=cache,target=/root/.cache/uv python3 - <<'PY'
+import subprocess
+from importlib.metadata import version
+from pathlib import Path
+
+# The model needs vLLM's nightly architecture support, newer than Dynamo's pin.
+stack = Path("/tmp/serving-stack.txt")
+stack.write_text("".join(f"{p}=={version(p)}\n" for p in ("vllm", "torch", "torchvision", "torchaudio", "triton")))
+with stack.open("a") as f:
+    f.write("nixl-cu12 ; sys_platform == 'never'\n")
+subprocess.run(
+    ["uv", "pip", "install", "--system", "--no-sources", "--override", str(stack),
+     "/opt/Curator", "ai-dynamo[vllm]==1.5.0.dev20260914"],
+    cwd="/tmp", check=True,
+)
+stack.unlink()
+subprocess.run(["python3", "-I", "-c", "import nemo_curator.core.serve.subprocess_mgr; import dynamo.vllm"], check=True)
+PY
+
+COPY --from=nvcr.io/nvidian/nemo-curator:nightly-2026-09-10 /usr/local/bin/etcd /usr/local/bin/nats-server /usr/local/bin/
