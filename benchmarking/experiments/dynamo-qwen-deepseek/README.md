@@ -1,114 +1,45 @@
-# Qwen / DeepSeek serving environment experiment
+# Curator pipeline with a local Dynamo endpoint
 
-This branch builds on PR #2422. Model versions, images and hardware-specific
-settings belong here; the base PR only contains generic runtime support and
-agent guidance.
+The tested pipeline is `JsonlReader` / `ParquetReader` → `AsyncOpenAIClient` →
+`JsonlWriter` / `ParquetWriter`, executed by Xenna. The same container hosts
+Dynamo and the model. It needs Curator's base and client dependencies, not every
+Curator extra or a particular CUDA version in the pipeline environment.
 
-## Model requirements
+## Images
 
-| Model | Cached revision | Serving requirements |
-|---|---|---|
-| `Qwen/Qwen3.8-27B` | `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` | `Qwen3_5ForConditionalGeneration`; the [vLLM recipe](https://recipes.vllm.ai/Qwen/Qwen3.8-27B) specifies Transformers >=5.8. |
-| `deepseek-ai/DeepSeek-V4.1-Flash` | `dba1be0a40aa45a94ad051997016db3960a90277` | `DeepseekV41ForCausalLM`; the [vLLM recipe](https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4.1-Flash) requires the post-September-10 nightly implementation, including its tokenizer and reasoning/tool parsers. |
+| Dockerfile | Layout | Local tag | Uncompressed size |
+|---|---|---|---|
+| `Dockerfile.nightly` | vLLM CUDA 13 base + Dynamo + Curator without extras; one compatible preinstalled Python environment | `nemo-curator:dynamo-vllm-nightly-20260917` | 26.39 GB |
+| `Dockerfile.curator` | Full Curator image; preserved `/opt/venv` plus separate `/opt/dynamo-models` serving venv | `nemo-curator:full-dynamo-models-20260917` | 52.10 GB |
 
-The DeepSeek Dynamo preview release documents SGLang, but that is not a
-restriction on native vLLM support. Check both projects' current recipes.
-Neither stable Dynamo's vLLM pin nor a model config's `transformers_version`
-alone establishes support for an architecture.
+Both passed the complete pipeline. Prefer the smaller image for this CPU/API
+workflow. The full-image variant is for pipelines needing the existing Curator
+image's other dependencies. Its driver uses Python 3.13, Ray 2.57 and CUDA 12.9
+Torch; its serving actors use the same Python/Ray versions with CUDA 13 Torch.
+The smaller image uses Python 3.12, Ray 2.58 and CUDA 13 Torch throughout.
+Sizes exclude model weights and external caches.
 
-## Shared runtime candidate
+`runtime_env={"py_executable": ...}` selects the baked interpreter for Dynamo
+workers and the shared frontend. No Ray package install or venv clone is needed.
+A separate venv is useful when pipeline and serving dependencies conflict; it is
+not necessary merely because the client talks to an HTTP endpoint. The serving
+venv still needs Curator without extras for actor bootstrap (including Xenna),
+and must match the driver's Python minor version and Ray version.
 
-The pinned vLLM image is
-`vllm/vllm-openai@sha256:c4392d76e3eec8983fa152651365158cb062e348fd40398963f499d5867b9e28`.
-Its build revision is `0bfc7a15d095fe83ecc82b50561a93c177fece2d`, Python is
-3.12, Torch is `2.13.0+cu130`, and Transformers is 5.17.0. The wheel reports
-`0.3.1.dev3+g0bfc7a15d`; use the image digest/build revision to identify this
-nightly, rather than inferring feature support from its version string.
+## Build and run
 
-`Dockerfile.nightly` adds Curator without extras and Dynamo
-`1.5.0.dev20260914`. It overrides Dynamo's older vLLM pin with the installed
-nightly and preserves the image's Torch stack. This is an experimental
-combination, not a published Dynamo compatibility guarantee. `--no-sources`
-prevents Curator's development wheel sources from selecting another CUDA stack.
-It reuses the image's baked `/usr/bin/python3` environment, selected with
-`runtime_env={"py_executable": "/usr/bin/python3"}`; no Ray package install or
-environment clone is needed. Driver and actors run in that same image/Python.
-The CUDA 13 base supplies NIXL; the override excludes Dynamo's CUDA 12 NIXL
-dependency. The resulting local image is 26.39 GB (24.57 GiB), versus 21.57 GB
-(20.09 GiB) for the vLLM base: an added 4.81 GB (4.48 GiB), excluding model
-weights and persistent caches. These are Docker's uncompressed image sizes.
-
-Build from the repository root:
+Build the smaller image from the repository root:
 
 ```bash
 docker build -f benchmarking/experiments/dynamo-qwen-deepseek/Dockerfile.nightly \
   -t nemo-curator:dynamo-vllm-nightly-20260917 .
 ```
 
-## Native vLLM bring-up
-
-Qwen passes with this image. The DeepSeek command currently reproduces an
-upstream SM120 attention failure; see validation below.
-
-Set `HF_HOME` to the existing cache and `SERVING_CACHE` to a writable persistent
-directory. No model downloads are performed. Run each command in its own shell:
+Set `HF_HOME` to the existing model cache and `SERVING_CACHE` to writable
+persistent storage. Use an empty results directory for each run and a free GPU:
 
 ```bash
-bash benchmarking/experiments/dynamo-qwen-deepseek/run_native.sh qwen
-bash benchmarking/experiments/dynamo-qwen-deepseek/run_native.sh deepseek
-```
-
-Defaults use GPU 0 / port 18101 for Qwen and GPUs 1–4 / port 18102 for DeepSeek.
-`GPUS`, `PORT`, and `SERVING_IMAGE` override these defaults. The tests start with
-8K context, eager execution and text-only requests; they do not establish
-full-context, multimodal or production-throughput performance.
-
-The cached weights are 51.75 GiB for Qwen and approximately 475 GiB for
-DeepSeek. Seven GPUs are visible, each with about 95.6 GiB usable VRAM.
-Total memory alone does not determine a valid tensor-parallel size. DeepSeek's
-Engram CPU offload allows a TP4 attempt while leaving room for Qwen; host RAM
-is also required for the offloaded tables and loading buffers.
-The launcher caps OpenMP/MKL threads to avoid CPU oversubscription across
-ranks during weight conversion. An uncapped attempt spent prolonged time in
-OpenMP tensor copies; the capped run completed model loading in 132–143 seconds
-per rank. The second run also benefited from the OS file cache, so these runs
-do not isolate the effect of thread count.
-
-## Validation
-
-- Native Qwen on the pinned image returned `4` for `2 + 2`, with thinking disabled.
-- Curator + Dynamo Qwen on the derived image also returned `4`; readiness took
-  138.4 seconds in this run. Ray workers and the frontend used the baked Python.
-- Native DeepSeek loaded its real weights on GPUs 1–4 with Engram CPU offload
-  while native Qwen remained resident on GPU 0. vLLM reported 78.72 GiB of model
-  memory per rank and 4.33 GiB available for KV cache. It then failed during
-  attention warmup, before readiness or generation:
-
-  ```text
-  ValueError: SM120 sparse-MLA has no decode kernel for this shape:
-  num_tokens=16, num_heads=16, topk=128, d_qk=512,
-  page_block_size=32, model_type=1, extra_topk=0.
-  ```
-
-  The installed model code hardcodes SWA `block_size=32`; FlashInfer's SM120
-  decode dispatch requires 64. The generic CLI block-size setting does not
-  override that constructor. This matches [vLLM issue #56461](https://github.com/vllm-project/vllm/issues/56461).
-  [Upstream PR #56509](https://github.com/vllm-project/vllm/pull/56509) proposes
-  geometry changes but was still open at testing time and is not applied here.
-  [Issue #56837](https://github.com/vllm-project/vllm/issues/56837) also reports
-  an unsupported top-k shape and that the FlashMLA alternative requires other
-  GPU architectures. Fixing the first error alone does not establish serving
-  compatibility. Disabling warmup would not supply the missing kernel.
-
-Thus one installed runtime is a candidate for both architectures, but only
-Qwen has passed generation. DeepSeek and the combined two-model Dynamo
-endpoint remain unvalidated. This is a kernel compatibility blocker on the
-tested RTX PRO 6000 Blackwell (SM120), not an observed GPU out-of-memory error.
-
-To repeat the Curator/Ray integration test from the repository root:
-
-```bash
-mkdir -p "$PWD/qwen-results"
+mkdir -p "$SERVING_CACHE"/{cuda,triton,vllm} "$PWD/qwen-results"
 docker run --rm --init --gpus '"device=0"' --shm-size=4g \
   -e HF_HOME=/hf -e HF_HUB_OFFLINE=1 -e OMP_NUM_THREADS=4 -e MKL_NUM_THREADS=4 \
   -v "$HF_HOME:/hf:ro" -v "$SERVING_CACHE:/cache" \
@@ -117,23 +48,108 @@ docker run --rm --init --gpus '"device=0"' --shm-size=4g \
   --entrypoint python3 nemo-curator:dynamo-vllm-nightly-20260917 /smoke_qwen.py
 ```
 
-Stop any other server on the selected GPU first. `result.json` contains the
-readiness measurement and checked completion; the Ray logs remain in the
-mounted results directory.
+For the full-image variant, build `Dockerfile.curator` with its tag above, then
+use that image with `--entrypoint /opt/venv/bin/python` and
+`-e SERVING_PYTHON=/opt/dynamo-models/bin/python`.
 
-An initial attempt to install Dynamo 1.4.2 / vLLM 0.26 into the older CUDA 12
-Curator image resolved successfully but selected CUDA 12 Torch alongside CUDA
-13 vLLM, failing GPU import with `libcudart.so.13`. A resolver dry run with
-`--no-sources` selected the requested CUDA 13 Torch correctly. Starting from
-the serving backend's image preserves its tested CUDA stack; CPU-only import
-checks missed the initial problem.
+The smoke script starts Ray and Dynamo, runs all four JSONL/Parquet input/output
+combinations using Curator's existing `BaseSyntheticStage` and `AsyncOpenAIClient`,
+and checks the saved answers. `result.json` records interpreter versions,
+readiness time and outputs. Ray logs remain in the results directory. Weights
+are mounted read-only and downloads are disabled. Stage worker counts are
+bounded for this tiny test. These are 8K-context, eager-mode text tests, not
+full-context, multimodal or throughput measurements.
+
+## Backend selection
+
+| Model | Cached revision | Requirement |
+|---|---|---|
+| `Qwen/Qwen3.8-27B` | `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` | `Qwen3_5ForConditionalGeneration`; [recipe](https://recipes.vllm.ai/Qwen/Qwen3.8-27B) specifies Transformers >=5.8. |
+| `deepseek-ai/DeepSeek-V4.1-Flash` | `dba1be0a40aa45a94ad051997016db3960a90277` | `DeepseekV41ForCausalLM`; [recipe](https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4.1-Flash) needs the newer nightly architecture implementation and tokenizer/parsers. |
+
+The pinned vLLM image is
+`vllm/vllm-openai@sha256:c4392d76e3eec8983fa152651365158cb062e348fd40398963f499d5867b9e28`.
+Its build revision is `0bfc7a15d095fe83ecc82b50561a93c177fece2d`; its unusual
+reported version is `0.3.1.dev3+g0bfc7a15d`. The full-image variant reads package
+versions from this image, then installs the corresponding wheels into a new
+venv using the driver's Python. It does not copy a Python 3.12 environment
+into a Python 3.13 Ray cluster.
+
+Dynamo `1.5.0.dev20260914` pins an older vLLM, so the experiment overrides that
+pin and excludes CUDA 12 NIXL in favor of the CUDA 13 stack. `--no-sources`
+prevents Curator's development indexes from changing the serving resolution.
+This is an experimental combination: Dynamo logs a missing
+`get_kv_cache_group_metadata` method and falls back to its configured block size.
+The simple request path passed; KV-aware routing/disaggregated serving is not
+validated. Version changes stay here; PR #2422 contains only generic runtime
+support and setup guidance.
+
+## Results and hardware limits
+
+Both images passed all four pipeline combinations, preserving both input rows
+and producing the expected answers `4` and `8`. Observed server readiness was
+109.0 seconds for the lean image and 115.8 seconds for the full image. The tests
+ran concurrently on separate GPUs, so these are smoke-test observations rather
+than a controlled performance comparison.
+
+The earlier native DeepSeek test used four RTX PRO 6000 Blackwell GPUs (SM120)
+with `--engram-config '{"cpu_offload":true}'`. Qwen remained resident on a fifth
+GPU. Real DeepSeek weights loaded at 78.72 GiB per rank, with 4.33 GiB available
+for KV cache, then attention warmup failed before readiness or generation:
+
+```text
+ValueError: SM120 sparse-MLA has no decode kernel for this shape:
+num_tokens=16, num_heads=16, topk=128, d_qk=512,
+page_block_size=32, model_type=1, extra_topk=0.
+```
+
+The model hardcodes SWA page size 32; FlashInfer's SM120 decode dispatch requires
+64. CLI block size does not override that constructor. See [issue #56461](https://github.com/vllm-project/vllm/issues/56461)
+and the still-open [geometry fix #56509](https://github.com/vllm-project/vllm/pull/56509).
+[Issue #56837](https://github.com/vllm-project/vllm/issues/56837) reports another
+unsupported top-k shape. Changing the image base or weight loader does not
+supply a missing attention kernel. DeepSeek and the combined two-model endpoint
+remain unvalidated; this was not an observed GPU out-of-memory failure.
+
+`run_native.sh qwen|deepseek` retains the original native-vLLM reproducer.
+Defaults use GPU 0 for Qwen and GPUs 1–4 for DeepSeek. It is diagnostic; the
+pipeline example above demonstrates Curator hosting and consuming its endpoint.
+
+## Weight-loading options
+
+ModelExpress's local InstantTensor strategy delegates to vLLM's existing
+`instanttensor` loader. Test it without a ModelExpress service by adding
+`-e LOAD_FORMAT=instanttensor` to the pipeline command; this sets
+`engine_kwargs={"load_format": "instanttensor", ...}`. The experiment's runtime
+already contains the package. Loader timing and inference correctness must both
+be checked before changing the default.
+
+The InstantTensor run passed all four pipeline combinations on Qwen:
+
+| Lean-image run | Weight-loading step | Model construction + loading | Endpoint ready |
+|---|---|---|---|
+| Default loader | 23.41 s | 27.99 s | 108.97 s |
+| InstantTensor | 5.89 s | 10.16 s | 96.11 s |
+
+Both used the existing local HF cache and GPU 0. The default run overlapped the
+full-image test, while InstantTensor ran afterward; cache state and host load
+were not controlled. Treat these as observations, not a guaranteed speedup.
+InstantTensor does not eliminate Python startup, model initialization, profiling
+or warmup (engine initialization still took 29.24 seconds). DeepSeek loading
+with InstantTensor has not been validated.
+
+ModelExpress P2P is useful when another compatible replica already holds the
+same model: later replicas can receive weights through NIXL. One Qwen replica
+and one DeepSeek replica cannot seed each other. For a single cold replica with
+weights in `HF_HOME`, first compare native local loaders. Existing host-mounted
+compilation caches also avoid needing a cache-distribution service on this node.
+See [ModelExpress's path guide](https://github.com/ai-dynamo/modelexpress/blob/main/docs/guides/choose-a-path.md).
 
 ## One endpoint
 
-Curator supports `InferenceServer(models=[...], backend=DynamoServerConfig(...))`.
-Each config gets its own model workers and GPU allocation; clients choose the
-model through the request's `model` field on the same HTTP endpoint. The shared
-frontend's runtime environment is merged from the models. Under PR #2422,
-preinstalled configs must select the same interpreter. Separate incompatible
-venvs are not combined by that merge; they require separate endpoints or a
-separate design for selecting the frontend's environment.
+Pass multiple configs to `InferenceServer(models=[...], backend=...)`. Each
+model has separate workers/GPU allocations; the request's `model` field selects
+one through the shared endpoint. All configs must select the same preinstalled
+interpreter because the frontend merges their runtime environments. That merge
+does not combine incompatible venvs. Pipeline stages communicate with the
+frontend over HTTP, whether their interpreter is shared or separate.

@@ -1,0 +1,44 @@
+# syntax=docker/dockerfile:1
+# Read compatible backend versions without copying its Python environment.
+FROM vllm/vllm-openai@sha256:c4392d76e3eec8983fa152651365158cb062e348fd40398963f499d5867b9e28 AS serving_versions
+RUN python3 - <<'PY'
+from importlib.metadata import version
+from pathlib import Path
+packages = ("vllm", "torch", "torchvision", "torchaudio", "triton", "flashinfer-python", "flashinfer-cubin", "flashinfer-jit-cache", "nixl-cu13")
+Path("/tmp/serving-stack.txt").write_text("".join(f"{p}=={version(p)}\n" for p in packages))
+PY
+
+FROM nvcr.io/nvidian/nemo-curator:nightly-2026-09-10
+COPY nemo_curator /opt/Curator/nemo_curator
+COPY pyproject.toml README.md LICENSE /opt/Curator/
+
+# Preserve the full pipeline environment; only the serving actors use this venv.
+RUN --mount=type=cache,target=/opt/uv_cache \
+    --mount=from=serving_versions,source=/tmp/serving-stack.txt,target=/tmp/serving-stack.txt \
+    /opt/venv/bin/python - <<'PY'
+import subprocess
+import sys
+from importlib.metadata import version
+from pathlib import Path
+
+python = "/opt/dynamo-models/bin/python"
+subprocess.run(["uv", "venv", "--python", sys.executable, "/opt/dynamo-models"], check=True)
+overrides = Path("/tmp/serving-overrides.txt")
+overrides.write_text(
+    Path("/tmp/serving-stack.txt").read_text()
+    + f"ray=={version('ray')}\ncloudpickle=={version('cloudpickle')}\n"
+    + "nixl-cu12 ; sys_platform == 'never'\n"
+)
+subprocess.run(
+    ["uv", "pip", "install", "--python", python, "--no-sources",
+     "--override", str(overrides), "--torch-backend", "cu130",
+     "--extra-index-url", "https://wheels.vllm.ai/0bfc7a15d095fe83ecc82b50561a93c177fece2d",
+     "--extra-index-url", "https://flashinfer.ai/whl/cu130",
+     "--extra-index-url", "https://flashinfer.ai/whl",
+     "/opt/Curator", "ai-dynamo[vllm]==1.5.0.dev20260914",
+     "nixl-cu13", "flashinfer-cubin", "flashinfer-jit-cache"],
+    cwd="/tmp", check=True,
+)
+overrides.unlink()
+subprocess.run([python, "-I", "-c", "import cosmos_xenna; import nemo_curator.core.serve.subprocess_mgr; import dynamo.vllm"], check=True)
+PY
