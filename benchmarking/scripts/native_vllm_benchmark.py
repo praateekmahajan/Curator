@@ -191,7 +191,7 @@ def _run_pipeline(  # noqa: PLR0913
     return tasks, time.perf_counter() - started
 
 
-def _compute_native_vllm_metrics(paths: list[Path], elapsed: float) -> dict[str, float]:
+def _compute_native_vllm_metrics(paths: list[Path], elapsed: float, gpu_counts: dict[str, int]) -> dict[str, float]:
     metrics: dict[str, dict[str, float]] = {}
     for path in paths:
         for file in Path(path).glob("*.parquet"):
@@ -234,7 +234,7 @@ def _compute_native_vllm_metrics(paths: list[Path], elapsed: float) -> dict[str,
             mean_input_tokens=total["prompt_tokens"] / count,
             mean_output_tokens=total["completion_tokens"] / count,
             mean_request_latency_s=total["latency_sum_s"] / count,
-            gpu_hours_per_million_requests=8 * 1_000_000 * elapsed / count / 3600,
+            gpu_hours_per_million_requests=gpu_counts[alias] * 1_000_000 * elapsed / count / 3600,
         )
         flat.update({f"{alias}_{key}": value for key, value in total.items()})
     if not metrics:
@@ -265,7 +265,10 @@ def run_native_vllm_benchmark(args: argparse.Namespace) -> BenchmarkResults:
     paths.append(output)
     runs = [_run_pipeline(config, aliases, output, args.batch_size, replicas, args.layout == "shared")]
     elapsed = time.perf_counter() - started
-    metrics = _compute_native_vllm_metrics(paths, elapsed)
+    gpu_counts = {
+        alias: config["models"][alias]["replicas"] * config["models"][alias]["gpus_per_replica"] for alias in aliases
+    }
+    metrics = _compute_native_vllm_metrics(paths, elapsed, gpu_counts)
     metrics["pipeline_started_unix_s"] = started_unix
     metrics["pipeline_finished_unix_s"] = started_unix + elapsed
     metrics["max_individual_pipeline_wall_time_s"] = max(duration for _, duration in runs)

@@ -79,11 +79,12 @@ def test_http_routing_concurrency_and_metrics(tmp_path: Path) -> None:
         assert peak == {"qwen": 2, "deepseek": 1}
         assert all(kwargs == {"thinking": False} for _, kwargs in seen)
         pq.write_table(pa.Table.from_pylist(records), tmp_path / "results.parquet")
-        metrics = _compute_native_vllm_metrics([tmp_path], 2.0)
+        metrics = _compute_native_vllm_metrics([tmp_path], 2.0, {"qwen": 4, "deepseek": 8})
         assert metrics["qwen_requests"] == 4
         assert metrics["deepseek_mean_input_tokens"] == 7
         assert metrics["qwen_output_tokens_per_s"] == 6
         assert metrics["deepseek_mean_output_tokens"] == 3
+        assert metrics["deepseek_gpu_hours_per_million_requests"] == 2 * metrics["qwen_gpu_hours_per_million_requests"]
     finally:
         server.shutdown()
         server.server_close()

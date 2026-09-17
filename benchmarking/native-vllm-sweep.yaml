@@ -1,9 +1,10 @@
 # benchmarking/run.py owns sessions, execution, entry logs and benchmark artifacts.
 # All three pipelines use the Ray Data executor with CPU-only stage resources.
-# Set WORKTREE, QWEN_HOST and DEEPSEEK_HOST before invoking it.
+# Setup and multi-node GPU telemetry: native_vllm/README.md.
 paths:
   - name: results_path
-    host_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/users/praateekm/benchmarking/results
+    host_path: ${RESULTS_PATH}
+    container_path: ${RESULTS_PATH}
 default_timeout_s: 3600
 max_timeout_s: 3600
 delete_scratch: false
@@ -15,7 +16,7 @@ ray: {num_cpus: 64, num_gpus: 0, enable_object_spilling: false}
 native_vllm:
   input:
     paths:
-      - /lustre/fsw/portfolios/nemotron/projects/nemotron_n4_pre/datasets/sft/deduped/question_only_stratified_8k
+      - ${INPUT_PATH}
     prompt_field: curator_question  # The text field contains existing answers.
   generation: {max_tokens: 2048, temperature: 0.0, top_p: 1.0, seed: 42}
   models:
