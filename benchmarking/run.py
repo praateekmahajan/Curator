@@ -558,7 +558,19 @@ def main() -> int:  # noqa: C901, PLR0911, PLR0912, PLR0915
 
     session_overall_success = True
     logger.info(f"Started session {session_name}...")
-    env_dict = dump_env(session_obj=session, output_path=session_path)
+    # Array drivers share a session but have distinct worker environments.
+    env_path = session_path
+    if os.environ.get("SLURM_ARRAY_JOB_ID") and os.environ.get("SLURM_ARRAY_TASK_ID"):
+        env_path = (
+            session_path
+            / "array_environments"
+            / (
+                f"{os.environ['SLURM_ARRAY_JOB_ID']}_{os.environ['SLURM_ARRAY_TASK_ID']}"
+                f"_restart_{os.environ.get('SLURM_RESTART_COUNT', '0')}"
+            )
+        )
+        ensure_dir(env_path)
+    env_dict = dump_env(session_obj=session, output_path=env_path)
 
     if not run_data_setups(
         setup_entries=session.data_setups,

@@ -1,0 +1,42 @@
+# One model per logical session; MODEL_KEY selects qwen or deepseek.
+paths:
+  - name: results_path
+    host_path: ${BENCHMARK_ROOT}
+    container_path: ${BENCHMARK_ROOT}
+default_timeout_s: 10800
+max_timeout_s: 10800
+delete_scratch: false
+sinks: []
+gpu_stats_recorder: {interval_s: 1}
+object_store_size: 17179869184
+ray: {num_cpus: 128, num_gpus: 0, enable_object_spilling: false}
+
+manifest_inference:
+  generation: {max_tokens: 4096, temperature: 0.0, top_p: 1.0, seed: 42}
+  models:
+    qwen:
+      model: nvidia/Qwen3.8-27B-NVFP4
+      endpoint: ${MODEL_ENDPOINT}
+      replicas: 4
+      gpus_per_replica: 1
+      chat_template_kwargs: {enable_thinking: false, preserve_thinking: false}
+    deepseek:
+      model: deepseek-ai/DeepSeek-V4.1-Flash
+      endpoint: ${MODEL_ENDPOINT}
+      replicas: 2
+      gpus_per_replica: 2
+      chat_template_kwargs: {thinking: false}
+
+entries:
+  - name: ${MODEL_KEY}_${SLURM_ARRAY_TASK_ID}_${SLURM_ARRAY_JOB_ID}
+    script: manifest_inference.py
+    args: >-
+      --manifest="${MANIFEST_PATH}"
+      --input-dir="${INPUT_DIR}"
+      --output-dir="${OUTPUT_DIR}"
+      --checkpoint-path="${CHECKPOINT_PATH}"
+      --workload-config="${WORKTREE}/benchmarking/manifest-inference.yaml"
+      --model-key=${MODEL_KEY}
+      --client-workers=64
+      --max-concurrent-requests=${REQUEST_CONCURRENCY}
+      --benchmark-results-path="{session_entry_dir}"

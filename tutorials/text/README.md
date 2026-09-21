@@ -15,6 +15,7 @@ Hands-on tutorials for curating text data with NeMo Curator. Complete working ex
 | **[Classification](distributed-data-classification/)** | Quality assessment and categorization | `quality-classification.ipynb`, `domain-classification.ipynb`, `fineweb-edu-classification.ipynb`, and more |
 | **[PEFT Curation](peft-curation/)** | Instruction-tuning data preparation | `main.py`, `stages.py` |
 | **[TinyStories](tinystories/)** | End-to-end processing pipeline | `main.py`, `stages.py` |
+| **[Manifest Inference](manifest_inference/)** | Byte-range JSONL tasks, SLURM arrays, and checkpointed Qwen/DeepSeek inference | Manifest generator, reader, inference, writer, pipeline, and launch scripts |
 | **[Megatron Tokenizing](megatron-tokenizer/)** | Tokenization pipeline that produces Megatron-LM ready files | `main.py` |
 | **[Llama Nemotron Data Curation](llama-nemotron-data-curation/)** | Data curation on the Llama Nemotron Post-Training Dataset | `main.py` and helper files |
 | **[GLiNER-based PII Redaction](gliner-pii-redaction/)** | Redacting personally identifiable information with NVIDIA's GLiNER-PII model | `gliner_pii_redaction.ipynb` |
