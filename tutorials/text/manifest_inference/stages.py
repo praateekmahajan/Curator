@@ -2,15 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Manifest source and bounded JSONL reader; no database or full-file scan."""
 
-import hashlib
-import json
 from dataclasses import dataclass
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.json as paj
 
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.tasks import DocumentBatch, EmptyTask, FileGroupTask
+from nemo_curator.stages.text.io.reader.base import ReaderOutput
+from nemo_curator.stages.text.io.reader.jsonl import JsonlReaderStage
+from nemo_curator.tasks import EmptyTask, FileGroupTask
 
 from .manifest import read_manifest, record_id
 
@@ -55,43 +56,27 @@ class ManifestFilePartitioningStage(ProcessingStage[EmptyTask, ManifestTask]):
 
 
 @dataclass
-class SpecificJsonlReader(ProcessingStage[ManifestTask, DocumentBatch]):
+class SpecificJsonlReader(JsonlReaderStage):
+    """Read a manifest byte range using the standard reader's Arrow JSON parser."""
+
     name: str = "specific_jsonl_reader"
 
-    def inputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], []
-
-    def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], []
-
-    def process(self, task: ManifestTask) -> DocumentBatch:
+    def read_task(self, task: ManifestTask, _read_kwargs: dict | None, fields: list[str] | None) -> ReaderOutput:
         record = task._metadata["manifest"]
-        path = Path(task.data[0])
-        stat = path.stat()
-        if (stat.st_size, stat.st_mtime_ns) != (record["size_bytes"], record["mtime_ns"]):
-            msg = f"Input changed since manifest generation: {path}"
-            raise ValueError(msg)
-        rows = []
-        digest = hashlib.sha256()
-        with path.open("rb") as stream:
+        size = record["end_byte"] - record["start_byte"]
+        with Path(task.data[0]).open("rb") as stream:
             stream.seek(record["start_byte"])
-            for _ in range(record["num_rows"]):
-                remaining = record["end_byte"] - stream.tell()
-                if remaining <= 0:
-                    msg = "Manifest range ended before expected row count"
-                    raise ValueError(msg)
-                raw = stream.readline(remaining)
-                digest.update(raw)
-                row = json.loads(raw)
-                if not isinstance(row, dict):
-                    msg = "Each JSONL line must be an object"
-                    raise TypeError(msg)
-                rows.append(row)
-            if stream.tell() != record["end_byte"] or digest.hexdigest() != record["sha256"]:
-                msg = "Input range does not match manifest checksum"
-                raise ValueError(msg)
-        columns = dict.fromkeys(key for row in rows for key in row)
-        table = pa.Table.from_pydict({key: [row.get(key) for row in rows] for key in columns})
-        return DocumentBatch(
-            dataset_name=task.dataset_name, data=table, _metadata=task._metadata, _stage_perf=task._stage_perf
+            payload = stream.read(size)
+        if len(payload) != size:
+            msg = "Input range ended before the manifest byte boundary"
+            raise ValueError(msg)
+        table = paj.read_json(
+            pa.BufferReader(payload),
+            read_options=paj.ReadOptions(block_size=max(size, 1), use_threads=False),
         )
+        if table.num_rows != record["num_rows"]:
+            msg = "Input range does not match the manifest row count"
+            raise ValueError(msg)
+        if fields is not None:
+            table = table.select(fields)
+        return ReaderOutput(table)

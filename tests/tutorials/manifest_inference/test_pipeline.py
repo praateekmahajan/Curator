@@ -1,22 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-
-from tutorials.text.manifest_inference.pipeline import pin_run
-
-
-def test_concurrent_contract_publication_and_incompatible_retry(tmp_path: Path):
-    contract = {"manifest": "abc", "model": "qwen"}
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        list(pool.map(lambda _: pin_run(tmp_path, contract), range(8)))
-    pin_run(tmp_path, contract)
-    with pytest.raises(ValueError, match="configuration changed"):
-        pin_run(tmp_path, {**contract, "model": "deepseek"})
 
 
 def test_failed_source_replays_and_completed_source_skips_after_restart(

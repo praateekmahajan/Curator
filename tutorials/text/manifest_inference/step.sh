@@ -6,6 +6,7 @@ SERVER_SCRIPT="${SERVER_SCRIPT:-$WORKTREE/tutorials/text/manifest_inference/serv
 entry="${MODEL_KEY}_${SLURM_ARRAY_TASK_ID:?}_${SLURM_ARRAY_JOB_ID:?}"
 attempt="$BENCHMARK_ROOT/$SESSION_NAME/$entry/logs/restart_${SLURM_RESTART_COUNT:-0}"
 mkdir -p "$attempt"
+export SERVER_CLI_FILE="$attempt/server-cli.json"
 if [[ -e "$attempt/worker-environment.txt" ]]; then
   echo "Attempt already exists: $attempt; use a new submission or restart count" >&2
   exit 1
@@ -19,7 +20,6 @@ fi
   printf 'model=%s\ninput=%s\nmanifest=%s\noutput=%s\ncheckpoint=%s\nshard=%s/%s\nserver=%s\n' \
     "$MODEL_KEY" "$INPUT_DIR" "$MANIFEST_PATH" "$OUTPUT_DIR" "$CHECKPOINT_PATH" \
     "$NEMO_CURATOR_SLURM_ARRAY_SHARD_INDEX" "$TOTAL_SHARDS" "$SERVER_SCRIPT"
-  sha256sum "$SERVER_SCRIPT" "$MANIFEST_PATH"
 } > "$attempt/worker-environment.txt"
 if curl --fail --silent --max-time 3 "${MODEL_ENDPOINT%/v1}/health" > /dev/null; then
   echo 'A server is already healthy at MODEL_ENDPOINT; refusing to start a second server' >&2

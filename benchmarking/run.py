@@ -560,9 +560,11 @@ def main() -> int:  # noqa: C901, PLR0911, PLR0912, PLR0915
     logger.info(f"Started session {session_name}...")
     # Array drivers share a session but have distinct worker environments.
     env_path = session_path
-    if os.environ.get("SLURM_ARRAY_JOB_ID") and os.environ.get("SLURM_ARRAY_TASK_ID"):
+    if session.entries and os.environ.get("SLURM_ARRAY_JOB_ID") and os.environ.get("SLURM_ARRAY_TASK_ID"):
         env_path = (
             session_path
+            / session.entries[0].name
+            / "logs"
             / "array_environments"
             / (
                 f"{os.environ['SLURM_ARRAY_JOB_ID']}_{os.environ['SLURM_ARRAY_TASK_ID']}"

@@ -51,3 +51,53 @@ def test_exhausted_row_fails_task_with_durable_row_identity(tmp_path: Path, monk
     assert diagnostic["failed_rows"][0]["line"] == 512
     assert diagnostic["failed_rows"][0]["attempts"] == 2
     assert "service unavailable" in diagnostic["failed_rows"][0]["reason"]
+
+
+@pytest.mark.parametrize("alias", ["qwen", "deepseek"])
+def test_output_metadata_is_nested_and_answers_stay_aligned(alias: str, monkeypatch: pytest.MonkeyPatch):
+    class Client:
+        def __init__(self, **kwargs):
+            self.client = SimpleNamespace(with_options=lambda **_kw: self.client, close=AsyncMock())
+
+        def setup(self) -> None:
+            pass
+
+        async def query_model_response(self, *, messages: list[dict[str, str]], **kwargs) -> SimpleNamespace:
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=messages[0]["content"] + " answer", reasoning=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=2, completion_tokens=1),
+            )
+
+    monkeypatch.setattr(inference, "AsyncOpenAIClient", Client)
+    stage = inference.NativeVLLMClientStage(
+        model_alias=alias,
+        model={"model": "test", "endpoint": "http://unused/v1", "chat_template_kwargs": {}},
+        prompt_field="question",
+        generation={"max_tokens": 8192},
+        max_concurrent_requests=2,
+    )
+    output = stage.process(
+        DocumentBatch(dataset_name="test", data=pa.table({"question": ["first", "second"]}))
+    ).to_pyarrow()
+    assert output.column_names == [
+        "question",
+        f"updated_{alias}_answer",
+        f"updated_{alias}_reasoning",
+        f"updated_{alias}_metadata",
+    ]
+    for row in output.to_pylist():
+        assert row[f"updated_{alias}_answer"] == row["question"] + " answer"
+        assert row[f"updated_{alias}_metadata"] == {
+            "finish_reason": "stop",
+            "prompt_tokens": 2,
+            "completion_tokens": 1,
+            "attempt_count": 1,
+            "retry_count": 0,
+            "is_success": True,
+            "failed_reason": None,
+        }

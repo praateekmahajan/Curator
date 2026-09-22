@@ -3,6 +3,7 @@
 """Async inference shared with the native vLLM benchmark."""
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -18,7 +19,6 @@ from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import DocumentBatch, FailedTask, Task
 
 from .manifest import record_id
-from .writer import atomic_jsonl
 
 SUCCESSFUL_FINISH_REASONS = {"stop", "length"}
 
@@ -67,19 +67,7 @@ class ReasoningBudgetExhaustedError(InvalidCompletionError):
 
 
 def _output_columns(alias: str) -> dict[str, str]:
-    prefix = f"updated_{alias}"
-    return {
-        "answer": f"{prefix}_answer",
-        "reasoning": f"{prefix}_reasoning",
-        "finish_reason": f"{prefix}_finish_reason",
-        "prompt_tokens": f"{prefix}_prompt_tokens",
-        "completion_tokens": f"{prefix}_completion_tokens",
-        "request_latency_s": f"{prefix}_request_latency_s",
-        "attempt_count": f"{prefix}_attempt_count",
-        "retry_count": f"{prefix}_retry_count",
-        "is_success": f"{prefix}_is_success",
-        "failed_reason": f"{prefix}_failed_reason",
-    }
+    return {name: f"updated_{alias}_{name}" for name in ("answer", "reasoning", "metadata")}
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -143,7 +131,6 @@ class NativeVLLMClientStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     async def query(  # noqa: C901, PLR0915 — bounded request/retry lifecycle
         self, rows: list[dict[str, Any]]
     ) -> tuple[list[dict[str, Any]], int, int, float, float]:
-        columns = _output_columns(self.model_alias)
         client = AsyncOpenAIClient(
             base_url=self.model["endpoint"],
             api_key="unused",  # pragma: allowlist secret
@@ -166,7 +153,6 @@ class NativeVLLMClientStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             nonlocal requests_retried, total_retries
             for index, row in pending:
                 first_request_started_unix_s = min(first_request_started_unix_s, time.time())
-                request_started = time.perf_counter()
                 prompt = row.get(self.prompt_field)
                 last_exc: Exception | None = None
                 attempts_made = 0
@@ -262,16 +248,15 @@ class NativeVLLMClientStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                         continue
 
                     results[index] = {
-                        columns["answer"]: answer,
-                        columns["reasoning"]: reasoning or "",
-                        columns["finish_reason"]: finish_reason,
-                        columns["prompt_tokens"]: response.usage.prompt_tokens,
-                        columns["completion_tokens"]: response.usage.completion_tokens,
-                        columns["request_latency_s"]: time.perf_counter() - request_started,
-                        columns["attempt_count"]: attempts_made,
-                        columns["retry_count"]: attempt,
-                        columns["is_success"]: True,
-                        columns["failed_reason"]: None,
+                        "answer": answer,
+                        "reasoning": reasoning or "",
+                        "finish_reason": finish_reason,
+                        "prompt_tokens": response.usage.prompt_tokens,
+                        "completion_tokens": response.usage.completion_tokens,
+                        "attempt_count": attempts_made,
+                        "retry_count": attempt,
+                        "is_success": True,
+                        "failed_reason": None,
                     }
                     break
 
@@ -279,25 +264,24 @@ class NativeVLLMClientStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                     if last_exc is None:
                         last_exc = RuntimeError("Request ended without a response or exception")
                     results[index] = {
-                        columns["answer"]: diagnostic_answer,
-                        columns["reasoning"]: diagnostic_reasoning,
-                        columns["finish_reason"]: diagnostic_finish_reason,
-                        columns["prompt_tokens"]: diagnostic_prompt_tokens,
-                        columns["completion_tokens"]: diagnostic_completion_tokens,
-                        columns["request_latency_s"]: time.perf_counter() - request_started,
-                        columns["attempt_count"]: attempts_made,
-                        columns["retry_count"]: max(0, attempts_made - 1),
-                        columns["is_success"]: False,
-                        columns["failed_reason"]: _failed_reason(last_exc),
+                        "answer": diagnostic_answer,
+                        "reasoning": diagnostic_reasoning,
+                        "finish_reason": diagnostic_finish_reason,
+                        "prompt_tokens": diagnostic_prompt_tokens,
+                        "completion_tokens": diagnostic_completion_tokens,
+                        "attempt_count": attempts_made,
+                        "retry_count": max(0, attempts_made - 1),
+                        "is_success": False,
+                        "failed_reason": _failed_reason(last_exc),
                     }
                     logger.error(
                         "Recording failed {} request {} after {} API attempt(s): {}",
                         self.model_alias,
                         index,
                         attempts_made,
-                        results[index][columns["failed_reason"]],
+                        results[index]["failed_reason"],
                     )
-                if results[index][columns["retry_count"]] > 0:
+                if results[index]["retry_count"] > 0:
                     requests_retried += 1
                 last_response_finished_unix_s = max(last_response_finished_unix_s, time.time())
 
@@ -330,38 +314,39 @@ class NativeVLLMClientStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             first_request_started_unix_s,
             last_response_finished_unix_s,
         ) = asyncio.run(self.query(table.to_pylist()))
-        output_types = {
-            "answer": pa.string(),
-            "reasoning": pa.string(),
-            "finish_reason": pa.string(),
-            "prompt_tokens": pa.int64(),
-            "completion_tokens": pa.int64(),
-            "request_latency_s": pa.float64(),
-            "attempt_count": pa.int64(),
-            "retry_count": pa.int64(),
-            "is_success": pa.bool_(),
-            "failed_reason": pa.string(),
-        }
-        for logical_name, column_name in output_columns.items():
+        metadata_types = pa.struct(
+            [
+                ("finish_reason", pa.string()),
+                ("prompt_tokens", pa.int64()),
+                ("completion_tokens", pa.int64()),
+                ("attempt_count", pa.int64()),
+                ("retry_count", pa.int64()),
+                ("is_success", pa.bool_()),
+                ("failed_reason", pa.string()),
+            ]
+        )
+        for name in ("answer", "reasoning"):
             table = table.append_column(
-                column_name,
-                pa.array([row[column_name] for row in updates], type=output_types[logical_name]),
+                output_columns[name], pa.array([row[name] for row in updates], type=pa.string())
             )
-        successful_updates = [row for row in updates if row[output_columns["is_success"]]]
-        failed_updates = [row for row in updates if not row[output_columns["is_success"]]]
-        failed_reasons = [row[output_columns["failed_reason"]] for row in failed_updates]
+        table = table.append_column(
+            output_columns["metadata"],
+            pa.array(
+                [{field.name: row[field.name] for field in metadata_types} for row in updates], type=metadata_types
+            ),
+        )
+        successful_updates = [row for row in updates if row["is_success"]]
+        failed_updates = [row for row in updates if not row["is_success"]]
+        failed_reasons = [row["failed_reason"] for row in failed_updates]
         self._log_metrics(
             {
                 "num_requests": len(updates),
                 "num_successful_completions": len(successful_updates),
                 "num_failed_completions": len(failed_updates),
-                "num_api_attempts": sum(row[output_columns["attempt_count"]] for row in updates),
-                "num_input_tokens": sum(row[output_columns["prompt_tokens"]] or 0 for row in successful_updates),
-                "num_output_tokens": sum(row[output_columns["completion_tokens"]] or 0 for row in successful_updates),
-                "request_latency_sum_s": sum(row[output_columns["request_latency_s"]] for row in updates),
-                "num_truncated_responses": sum(
-                    row[output_columns["finish_reason"]] == "length" for row in successful_updates
-                ),
+                "num_api_attempts": sum(row["attempt_count"] for row in updates),
+                "num_input_tokens": sum(row["prompt_tokens"] or 0 for row in successful_updates),
+                "num_output_tokens": sum(row["completion_tokens"] or 0 for row in successful_updates),
+                "num_truncated_responses": sum(row["finish_reason"] == "length" for row in successful_updates),
                 "num_empty_responses": sum(reason.startswith("empty_completion:") for reason in failed_reasons),
                 "num_zero_token_responses": sum(
                     reason.startswith("zero_completion_tokens:") for reason in failed_reasons
@@ -395,29 +380,31 @@ class ResumableInferenceStage(NativeVLLMClientStage):
             msg = "failure_dir is required"
             raise ValueError(msg)
         result = super().process(task)
-        columns = _output_columns(self.model_alias)
         failed = []
         record = task._metadata["manifest"]
         for offset, row in enumerate(result.to_pyarrow().to_pylist()):
-            if not row[columns["is_success"]]:
+            metadata = row[f"updated_{self.model_alias}_metadata"]
+            if not metadata["is_success"]:
                 failed.append(
                     {
                         "line": record["start_line"] + offset,
-                        "reason": row[columns["failed_reason"]],
-                        "attempts": row[columns["attempt_count"]],
+                        "reason": metadata["failed_reason"],
+                        "attempts": metadata["attempt_count"],
                     }
                 )
         if failed:
-            atomic_jsonl(
-                Path(self.failure_dir) / f"{record_id(record)}.jsonl",
-                [
+            path = Path(self.failure_dir) / f"{record_id(record)}.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
                     {
                         "manifest": record,
                         "task_id": task.task_id,
                         "model": self.model["model"],
                         "failed_rows": failed,
                     }
-                ],
+                )
+                + "\n"
             )
             return FailedTask()
         return result

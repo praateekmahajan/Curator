@@ -18,7 +18,7 @@ if your application requires that behavior.
 | `manifest.py` | Stream inputs once, index byte ranges, estimate actual shard loads |
 | `stages.py` | Emit deterministic source tasks; seek and read only one range |
 | `inference.py` | Bounded async requests, retries, durable task failure diagnostics |
-| `writer.py` | Publish one named JSONL atomically after every row succeeds |
+| `writer.py` | Reuse JsonlWriter with manifest filenames after every row succeeds |
 | `pipeline.py` | Compose stages, pin run configuration, enable checkpointing |
 | `worker-env.sh` | Activate the worker environment and export logical shard settings |
 | `serve.sh` | Reference Qwen/DeepSeek vLLM server flags for four GB300 GPUs |
@@ -68,7 +68,7 @@ reader and is not supported by this tutorial.
 
 Keep the manifest outside `INPUT_DIR`. Relative paths in the manifest are resolved
 against `INPUT_DIR`; generated manifests contain no absolute dataset paths.
-The runtime contract and logs intentionally record resolved paths for recovery.
+The logs record resolved paths for recovery.
 Never put site-specific paths, manifests, or generated outputs into Git.
 
 ## Step 2: Generate the manifest once
@@ -94,7 +94,7 @@ For example, input `part-001.jsonl` produces outputs named
 Including the relative input path avoids basename collisions across subdirectories.
 
 Readers seek directly to the stored byte offset, retain at most one task's rows,
-and verify size, modification time, and range checksum before inference. This
+and validate the range length and row count before inference. This
 avoids the repeated prefix scans required by line-number-only slicing.
 
 ## Step 3: Size the array using its heaviest shard
@@ -213,11 +213,9 @@ BENCHMARK_ROOT/SESSION_NAME/
     params.json
   array_environments/             # distinct environment capture per attempt
   .nemo_curator_checkpoint_dir/
-    run_contract.json
     .nemo_curator_metadata/        # LMDB, shard completion, failure records
 
 OUTPUT_DIR/
-  .manifest_inference/run_contract.json
   part-001.jsonl/part-001_task_0.jsonl
   part-001.jsonl/part-001_task_1.jsonl
 ```
@@ -235,7 +233,7 @@ other tasks can finish and checkpoint normally. The wrapper exits nonzero when
 the attempt has any failed tasks.
 
 Diagnostics live under the checkpoint's `.nemo_curator_metadata/.failed_tasks/`
-attempt directories, in `invocation_<uuid>/tasks/<source-id>.jsonl`. Each includes
+attempt directories, in `tasks/<source-id>.jsonl`. Each includes
 the original manifest record, task lineage, model, zero-based failed row numbers,
 reasons, and request counts. Historical diagnostics remain after successful
 retries; use current shard-completion state to determine whether work is pending.
@@ -263,16 +261,28 @@ with the same `TOTAL_SHARDS` and all other run settings. Curator reruns only the
 incomplete source tasks inside each selected shard. Never run two attempts of
 the same logical shard concurrently.
 
-Checkpointing is at-least-once: if output is published immediately before a
-crash, that task can replay. The writer fsyncs a temporary file in the destination
-directory, atomically replaces its deterministic final name, then fsyncs the
-directory. A partial temporary file is never treated as completed output.
-Completed checkpoints assume final outputs are retained; deleting an output
-does not invalidate its checkpoint. Keep both together.
+Checkpointing is at-least-once: a task can replay after a crash. The writer reuses
+Curator's `JsonlWriter.write_data()` and overwrites the exact manifest output path
+on retry. An interrupted write can leave a partial file; a file's existence alone
+is not proof of completion. Use Curator's checkpoints and shard verification.
+Keep checkpoint files and their outputs together.
 
-Changing the manifest, model, generation parameters, prompt field, shard count,
-or output path is rejected by the pinned run contract. Changes to source code,
-server settings, or prompt semantics also require a fresh logical run; the
-contract cannot automatically detect all such changes. Check git/environment
-captures before every retry. Refer to the [resumability documentation](../../../fern/versions/main/pages/reference/infrastructure/resumable-processing.mdx)
-for completion semantics and shared-filesystem constraints.
+The launcher supplies the logical shard count even for a one-element pilot or a
+subset retry (300 for Qwen and 230 for DeepSeek in this run). Curator owns task
+assignment and completion tracking. Manifest range IDs distinguish multiple
+tasks from the same input file; they are not output filenames.
+
+Inputs must remain unchanged while using the byte-offset manifest. The reader
+uses Arrow's JSON parser on each bounded range, checks its row count, and does
+not recompute content checksums. Malformed JSON or incompatible field types fail
+that task rather than silently dropping or moving rows.
+
+Use a new checkpoint and output directory when changing inputs, models, or
+sampling settings. There is no custom pinned run contract.
+
+Output retains `updated_<model>_answer` and `updated_<model>_reasoning`. The
+`updated_<model>_metadata` object contains `finish_reason`, `prompt_tokens`,
+`completion_tokens`, `attempt_count`, `retry_count`, `is_success`, and
+`failed_reason`. No per-row request latency is written. `generation_lineage`
+records the model, captured server arguments, and request settings. Compressed
+files keep the manifest filename with `.zst` appended.

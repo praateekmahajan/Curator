@@ -114,10 +114,20 @@ def shard_loads(manifest: Path, shards: int) -> list[int]:
     if shards < 1:
         msg = "shards must be positive"
         raise ValueError(msg)
+    from nemo_curator.backends.base import BaseStageAdapter
+    from nemo_curator.backends.slurm_array import SlurmArrayConfig, slurm_array_shard_for_task
+    from nemo_curator.tasks import EmptyTask
+
+    from .stages import ManifestFilePartitioningStage
+
+    stage = ManifestFilePartitioningStage(str(manifest), str(manifest.parent))
+    stage.is_source_stage = True
+    root = EmptyTask()
+    tasks = BaseStageAdapter(stage)._post_process_task_ids([root], stage.process(root))
+    config = SlurmArrayConfig(shard_index=0, total_shards=shards)
     loads = [0] * shards
-    for record in read_manifest(manifest):
-        digest = hashlib.sha256(f"0_{record_id(record)}".encode()).hexdigest()
-        loads[int(digest[:16], 16) % shards] += record["num_rows"]
+    for task in tasks:
+        loads[slurm_array_shard_for_task(task, config)] += task._metadata["manifest"]["num_rows"]
     return loads
 
 

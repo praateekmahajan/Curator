@@ -1,8 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-import os
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 
 from nemo_curator.backends.base import BaseStageAdapter
@@ -32,16 +32,15 @@ def test_reader_ranges_and_planner_match_real_adapter(tmp_path: Path):
     assert reader.process(tasks[1]).to_pyarrow().to_pylist() == [{"a": 3}]
 
 
-def test_reader_detects_same_size_same_mtime_corruption(tmp_path: Path):
+def test_bad_row_fails_only_its_range(tmp_path: Path):
     source = tmp_path / "input"
     source.mkdir()
-    path = source / "part.jsonl"
-    path.write_text('{"a":1}\n')
+    (source / "part.jsonl").write_text('{"a":1}\n{"a":broken}\n{"a":3}\n')
     manifest = tmp_path / "manifest.jsonl"
-    generate_manifest(source, manifest)
-    task = ManifestFilePartitioningStage(str(manifest), str(source)).process(EmptyTask())[0]
-    stat = path.stat()
-    path.write_text('{"a":2}\n')
-    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
-    with pytest.raises(ValueError, match="checksum"):
-        SpecificJsonlReader().process(task)
+    generate_manifest(source, manifest, 1)
+    tasks = ManifestFilePartitioningStage(str(manifest), str(source)).process(EmptyTask())
+    reader = SpecificJsonlReader()
+    assert reader.process(tasks[0]).to_pyarrow().to_pylist() == [{"a": 1}]
+    with pytest.raises(pa.ArrowInvalid):
+        reader.process(tasks[1])
+    assert reader.process(tasks[2]).to_pyarrow().to_pylist() == [{"a": 3}]

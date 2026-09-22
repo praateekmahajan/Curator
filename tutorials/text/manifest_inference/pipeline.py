@@ -3,11 +3,9 @@
 """Run one model and one logical manifest shard with durable source checkpoints."""
 
 import argparse
-import hashlib
 import json
 import os
 import time
-import uuid
 from pathlib import Path
 
 import yaml
@@ -19,33 +17,14 @@ from nemo_curator.backends.failed_task_markers import (
     failed_task_manifest_exists,
 )
 from nemo_curator.backends.ray_data import RayDataExecutor
-from nemo_curator.backends.slurm_array import SlurmArrayConfig, configure_slurm_array_source_filtering
+from nemo_curator.backends.slurm_array import SlurmArrayConfig
 from nemo_curator.core.client import RayClient
 from nemo_curator.pipeline import Pipeline
-from nemo_curator.utils.atomic_io import write_json_atomically_if_absent
 
 from .inference import GenerationSettings, ModelSettings, ResumableInferenceStage
 from .manifest import read_manifest
 from .stages import ManifestFilePartitioningStage, SpecificJsonlReader
 from .writer import NamedJsonlWriter
-
-
-def file_digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while block := stream.read(1024 * 1024):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def pin_run(checkpoint: Path, contract: dict) -> None:
-    """Publish a complete immutable run contract safely across array drivers."""
-    checkpoint.mkdir(parents=True, exist_ok=True)
-    target = checkpoint / "run_contract.json"
-    write_json_atomically_if_absent(target, contract)
-    if json.loads(target.read_text()) != contract:
-        msg = "Run configuration changed; use a new session/checkpoint and output directory"
-        raise ValueError(msg)
 
 
 def build_pipeline(
@@ -117,48 +96,15 @@ def run(args: argparse.Namespace) -> dict:
     ):
         msg = "Invalid concurrency/retry settings"
         raise ValueError(msg)
-    # Validate before starting workers; source adapters own task assignment.
     expected_rows = sum(record["num_rows"] for record in read_manifest(args.manifest))
     shard = SlurmArrayConfig.from_env()
-    if shard and not shard.minimum_shard_index <= shard.shard_index < shard.minimum_shard_index + shard.total_shards:
-        msg = "Logical shard index is outside the configured range"
-        raise ValueError(msg)
-    if shard:
-        configure_slurm_array_source_filtering(shard.shard_index, shard.total_shards, shard.minimum_shard_index)
     checkpoint = args.checkpoint_path.resolve()
-    model_contract = {key: value for key, value in model.items() if key != "endpoint"}
-    contract = {
-        "version": 1,
-        "manifest_sha256": file_digest(args.manifest),
-        "input_dir": str(args.input_dir.resolve()),
-        "output_dir": str(args.output_dir.resolve()),
-        "model_key": args.model_key,
-        "model": model_contract,
-        "generation": config["generation"],
-        "prompt_field": args.prompt_field,
-        "total_shards": shard.total_shards if shard else 1,
-        "minimum_shard_index": shard.minimum_shard_index if shard else 0,
-    }
-    if args.output_compression is not None or generation_lineage is not None:
-        contract.update(version=2, output_compression=args.output_compression, generation_lineage=generation_lineage)
-    pin_run(checkpoint, contract)
-    # Protect the output namespace against another model/session using the same filenames.
-    if (
-        args.output_dir.exists()
-        and not (args.output_dir / ".manifest_inference").exists()
-        and any(args.output_dir.iterdir())
-    ):
-        msg = "Output directory is nonempty and has no matching run contract"
-        raise ValueError(msg)
-    pin_run(args.output_dir.resolve() / ".manifest_inference", {**contract, "checkpoint": str(checkpoint)})
     os.environ.pop(FAILED_TASKS_DIR_ENV_VAR, None)
     attempt = (
         configure_slurm_array_failed_task_manifest_dir(checkpoint, shard.shard_index)
         if shard
         else configure_failed_task_manifest_dir(checkpoint)
     )
-    attempt = attempt / f"invocation_{uuid.uuid4().hex}"
-    os.environ[FAILED_TASKS_DIR_ENV_VAR] = str(attempt)
     failures = attempt / "tasks"
     pipeline = build_pipeline(args, model, config["generation"], failures, generation_lineage)
     client = RayClient()
