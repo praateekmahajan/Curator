@@ -42,7 +42,7 @@ sys.path.insert(0, _this_script_dir)
 # ruff: noqa: E402
 from runner.datasets import DatasetResolver
 from runner.entry import Entry
-from runner.env_capture import dump_env
+from runner.env_capture import dump_env, publish_session_environment
 from runner.environment import merge_subprocess_environment
 from runner.gpu_stats_recorder import GPUStatsRecorder
 from runner.path_resolver import PathResolver
@@ -571,6 +571,8 @@ def main() -> int:  # noqa: C901, PLR0911, PLR0912, PLR0915
         )
         ensure_dir(env_path)
     env_dict = dump_env(session_obj=session, output_path=env_path)
+    if env_path != session_path:
+        publish_session_environment(env_path, session_path)
 
     if not run_data_setups(
         setup_entries=session.data_setups,

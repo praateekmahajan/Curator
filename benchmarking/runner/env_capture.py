@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import json
 import os
 import platform
@@ -26,6 +27,18 @@ import pynvml
 from loguru import logger
 from runner.session import Session
 from runner.utils import get_obj_for_json, get_shm_usage, get_total_memory_bytes
+
+
+def publish_session_environment(attempt_path: Path, session_path: Path) -> None:
+    """Expose the first completed environment capture for session discovery."""
+    try:
+        os.link(attempt_path / "env.json", session_path / "env.json")
+    except FileExistsError:
+        return
+    packages = attempt_path / "packages.txt"
+    if packages.is_file():
+        with contextlib.suppress(FileExistsError):
+            os.link(packages, session_path / "packages.txt")
 
 
 def dump_env(session_obj: Session, output_path: Path) -> dict[str, Any]:

@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 import pyarrow as pa
 from loguru import logger
@@ -28,7 +28,10 @@ class ModelSettings(TypedDict):
     endpoint: str
     replicas: int
     gpus_per_replica: int
-    chat_template_kwargs: dict[str, bool]
+    chat_template_kwargs: dict[str, Any]
+    generation_overrides: NotRequired[dict[str, Any]]
+    request_extra_body: NotRequired[dict[str, Any]]
+    request_timeout_s: NotRequired[float]
 
 
 class InputSettings(TypedDict):
@@ -59,6 +62,10 @@ class InvalidCompletionError(RuntimeError):
     """A syntactically valid API response that is not a usable completion."""
 
 
+class ReasoningBudgetExhaustedError(InvalidCompletionError):
+    """The output cap was consumed by reasoning before a final answer."""
+
+
 def _output_columns(alias: str) -> dict[str, str]:
     prefix = f"updated_{alias}"
     return {
@@ -76,6 +83,8 @@ def _output_columns(alias: str) -> dict[str, str]:
 
 
 def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, ReasoningBudgetExhaustedError):
+        return False
     if isinstance(exc, InvalidCompletionError):
         return True
     if isinstance(exc, ValueError):
@@ -92,6 +101,8 @@ def _failed_reason(exc: Exception) -> str:
     status = getattr(exc, "status_code", None)
     if isinstance(exc, ValueError) and message.startswith("Invalid prompt in field"):
         prefix = "invalid_prompt"
+    elif isinstance(exc, ReasoningBudgetExhaustedError):
+        prefix = "reasoning_budget_exhausted"
     elif isinstance(exc, InvalidCompletionError) and message == "Completion answer is empty":
         prefix = "empty_completion"
     elif isinstance(exc, InvalidCompletionError) and message == "Completion token usage is zero":
@@ -138,7 +149,7 @@ class NativeVLLMClientStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             api_key="unused",  # pragma: allowlist secret
             max_concurrent_requests=self.max_concurrent_requests,
             max_retries=0,
-            timeout=1200,
+            timeout=self.model.get("request_timeout_s", 1200),
         )
         client.setup()
         client.client = client.client.with_options(max_retries=0)
@@ -170,14 +181,17 @@ class NativeVLLMClientStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                             msg = f"Invalid prompt in field {self.prompt_field}"
                             raise ValueError(msg)  # noqa: TRY301
                         attempts_made += 1
+                        extra_body = {
+                            **self.model.get("request_extra_body", {}),
+                            "chat_template_kwargs": self.model["chat_template_kwargs"],
+                        }
                         response = await client.query_model_response(
                             model=self.model["model"],
                             messages=[{"role": "user", "content": prompt}],
                             generation_config={
                                 **self.generation,
-                                "extra_kwargs": {
-                                    "extra_body": {"chat_template_kwargs": self.model["chat_template_kwargs"]}
-                                },
+                                **self.model.get("generation_overrides", {}),
+                                "extra_kwargs": {"extra_body": extra_body},
                             },
                         )
                         if response.usage is None or len(response.choices) != 1:
@@ -215,6 +229,14 @@ class NativeVLLMClientStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                         if not isinstance(response.usage.completion_tokens, int):
                             msg_0 = "Completion token usage must be an integer"
                             raise InvalidCompletionError(msg_0)  # noqa: TRY301
+                        if (
+                            finish_reason == "length"
+                            and not answer.strip()
+                            and isinstance(reasoning, str)
+                            and reasoning.strip()
+                        ):
+                            msg_0 = "Completion exhausted max tokens in reasoning before final answer"
+                            raise ReasoningBudgetExhaustedError(msg_0)  # noqa: TRY301
                         if not answer.strip():
                             msg_0 = "Completion answer is empty"
                             raise InvalidCompletionError(msg_0)  # noqa: TRY301

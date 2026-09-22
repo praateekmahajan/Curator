@@ -12,19 +12,25 @@ object_store_size: 17179869184
 ray: {num_cpus: 128, num_gpus: 0, enable_object_spilling: false}
 
 manifest_inference:
-  generation: {max_tokens: 4096, temperature: 0.0, top_p: 1.0, seed: 42}
+  generation: {max_tokens: 8192, seed: 42}
   models:
     qwen:
       model: nvidia/Qwen3.8-27B-NVFP4
       endpoint: ${MODEL_ENDPOINT}
       replicas: 4
       gpus_per_replica: 1
+      request_timeout_s: 2400
+      generation_overrides: {temperature: 0.7, top_p: 0.8}
       chat_template_kwargs: {enable_thinking: false, preserve_thinking: false}
+      request_extra_body:
+        {top_k: 20, min_p: 0.0, presence_penalty: 1.5, repetition_penalty: 1.0}
     deepseek:
       model: deepseek-ai/DeepSeek-V4.1-Flash
       endpoint: ${MODEL_ENDPOINT}
       replicas: 2
       gpus_per_replica: 2
+      request_timeout_s: 2400
+      generation_overrides: {temperature: 1.0, top_p: 0.95}
       chat_template_kwargs: {thinking: false}
 
 entries:
@@ -37,6 +43,8 @@ entries:
       --checkpoint-path="${CHECKPOINT_PATH}"
       --workload-config="${WORKTREE}/benchmarking/manifest-inference.yaml"
       --model-key=${MODEL_KEY}
+      --output-compression=zstd
+      --server-cli-file="${SERVER_CLI_FILE}"
       --client-workers=64
       --max-concurrent-requests=${REQUEST_CONCURRENCY}
       --benchmark-results-path="{session_entry_dir}"

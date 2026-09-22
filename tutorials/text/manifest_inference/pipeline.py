@@ -49,7 +49,11 @@ def pin_run(checkpoint: Path, contract: dict) -> None:
 
 
 def build_pipeline(
-    args: argparse.Namespace, model: ModelSettings, generation: GenerationSettings, failure_dir: Path
+    args: argparse.Namespace,
+    model: ModelSettings,
+    generation: GenerationSettings,
+    failure_dir: Path,
+    generation_lineage: dict | None = None,
 ) -> Pipeline:
     pipeline = Pipeline(name=f"manifest_{args.model_key}")
     pipeline.add_stage(ManifestFilePartitioningStage(str(args.manifest), str(args.input_dir)))
@@ -66,7 +70,11 @@ def build_pipeline(
             failure_dir=str(failure_dir),
         ).with_(num_workers=args.client_workers)
     )
-    pipeline.add_stage(NamedJsonlWriter(str(args.output_dir)))
+    pipeline.add_stage(
+        NamedJsonlWriter(
+            str(args.output_dir), compression=args.output_compression, generation_lineage=generation_lineage
+        )
+    )
     # The benchmark runner can start Ray before this driver's attempt path exists.
     # Explicit stage environments propagate shard/failure settings to those workers.
     environment = {
@@ -82,6 +90,23 @@ def build_pipeline(
 def run(args: argparse.Namespace) -> dict:
     config = yaml.safe_load(os.path.expandvars(args.workload_config.read_text()))["manifest_inference"]
     model = config["models"][args.model_key]
+    generation_lineage = None
+    if args.server_cli_file is not None:
+        server = json.loads(args.server_cli_file.read_text())
+        if server["model"] != model["model"]:
+            msg = "Captured server model does not match request model"
+            raise ValueError(msg)
+        generation_lineage = {
+            **server,
+            "request_kwargs": {
+                **config["generation"],
+                **model.get("generation_overrides", {}),
+                "extra_body": {
+                    **model.get("request_extra_body", {}),
+                    "chat_template_kwargs": model["chat_template_kwargs"],
+                },
+            },
+        }
     if "${" in model["endpoint"]:
         msg = "Unresolved model endpoint"
         raise ValueError(msg)
@@ -114,6 +139,8 @@ def run(args: argparse.Namespace) -> dict:
         "total_shards": shard.total_shards if shard else 1,
         "minimum_shard_index": shard.minimum_shard_index if shard else 0,
     }
+    if args.output_compression is not None or generation_lineage is not None:
+        contract.update(version=2, output_compression=args.output_compression, generation_lineage=generation_lineage)
     pin_run(checkpoint, contract)
     # Protect the output namespace against another model/session using the same filenames.
     if (
@@ -133,7 +160,7 @@ def run(args: argparse.Namespace) -> dict:
     attempt = attempt / f"invocation_{uuid.uuid4().hex}"
     os.environ[FAILED_TASKS_DIR_ENV_VAR] = str(attempt)
     failures = attempt / "tasks"
-    pipeline = build_pipeline(args, model, config["generation"], failures)
+    pipeline = build_pipeline(args, model, config["generation"], failures, generation_lineage)
     client = RayClient()
     started = time.monotonic()
     try:
@@ -141,7 +168,7 @@ def run(args: argparse.Namespace) -> dict:
         tasks = pipeline.run(RayDataExecutor(), checkpoint_path=checkpoint)
         successful = not failed_task_manifest_exists(attempt)
         return {
-            "params": vars(args),
+            "params": {**vars(args), "generation_lineage": generation_lineage},
             "tasks": tasks or [],
             "metrics": {
                 "is_success": successful,
@@ -165,6 +192,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--max-concurrent-requests", type=int, required=True)
     result.add_argument("--max-retries", type=int, default=3)
     result.add_argument("--retry-base-delay-s", type=float, default=1)
+    result.add_argument("--output-compression", choices=["zstd"])
+    result.add_argument("--server-cli-file", type=Path)
     return result
 
 

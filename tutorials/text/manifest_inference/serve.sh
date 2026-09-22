@@ -4,6 +4,17 @@ set -euo pipefail
 : "${MODEL_KEY:?qwen or deepseek}"
 export VLLM_USE_RUST_FRONTEND=1
 
+launch_vllm() {
+  if [[ -n ${SERVER_CLI_FILE:-} ]]; then
+    python3 "${WORKTREE:?}/tutorials/text/manifest_inference/capture_cli.py" "$SERVER_CLI_FILE" vllm "$@"
+  fi
+  if [[ ${SERVER_ARGS_ONLY:-0} == 1 ]]; then
+    : "${SERVER_CLI_FILE:?}"
+    return
+  fi
+  exec vllm "$@"
+}
+
 serve_qwen() {
   local model=$1
   shift
@@ -11,7 +22,7 @@ serve_qwen() {
   # This also avoids the nightly's ShmRingBuffer race in the redundant worker
   # subprocess when several DP engines finish loading at different times.
   export VLLM_ENABLE_V1_MULTIPROCESSING=0
-  exec vllm serve "$model" --host 0.0.0.0 --port 8000 \
+  launch_vllm serve "$model" --host 0.0.0.0 --port 8000 \
     --language-model-only --tensor-parallel-size 1 \
     --data-parallel-size "${QWEN_DP:-4}" \
     --kv-cache-dtype fp8_e4m3 --gpu-memory-utilization "${QWEN_GPU_MEMORY_UTILIZATION:-0.95}" \
@@ -30,7 +41,7 @@ serve_deepseek() {
   local compilation_config=${DEEPSEEK_COMPILATION_CONFIG:-'{"cudagraph_capture_sizes":[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256,272,288,304,320,336,352,368,384,400,416,432,448,464,480,496,512,768,1024,1536,2048]}'}
   export VLLM_ENGINE_READY_TIMEOUT_S=3600 VLLM_USE_V2_MODEL_RUNNER=1
   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-  exec vllm serve "$model" --host 0.0.0.0 --port 8000 \
+  launch_vllm serve "$model" --host 0.0.0.0 --port 8000 \
     --language-model-only --tokenizer-mode deepseek_v41 \
     --tensor-parallel-size "${DEEPSEEK_TP:-4}" \
     --data-parallel-size "${DEEPSEEK_DP:-1}" \

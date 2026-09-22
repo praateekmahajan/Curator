@@ -108,8 +108,8 @@ The successful four-GPU benchmark reference points are:
 
 | Profile | Rows/s | Time for 131,072 rows | Client workers | Requests per worker |
 | --- | ---: | ---: | ---: | ---: |
-| Qwen NVFP4, DP4/TP1 | 47.85 | 45.7 min | 64 | 128 |
-| DeepSeek default, DP2/TP2 + expert parallelism | 59.70 | 36.6 min | 64 | 80 |
+| Qwen NVFP4, DP4/TP1 | 38.02 | 57.5 min | 64 | 128 |
+| DeepSeek default, DP2/TP2 + expert parallelism | 50.90 | 42.9 min | 64 | 80 |
 
 These rates exclude model-server startup and depend on hardware, input/output
 length distributions, and server configuration. They are estimates, not runtime
@@ -119,14 +119,14 @@ throughput, a three-hour target, and a 3:30 SLURM wall limit.
 On a CPU worker, inspect an initial candidate:
 
 ```bash
-export TOTAL_SHARDS=240
+export TOTAL_SHARDS=300
 python -m tutorials.text.manifest_inference.manifest plan \
   --manifest "$MANIFEST_PATH" --shards "$TOTAL_SHARDS" \
-  --rows-per-second 47.847 --setup-minutes 30 \
+  --rows-per-second 38.016 --setup-minutes 30 \
   --throughput-fraction 0.8 --target-minutes 180
 ```
 
-Use `59.695` for the DeepSeek profile; 190 shards is an initial candidate for a
+Use `50.900` for the DeepSeek profile; 230 shards is an initial candidate for a
 69-million-row corpus. The planner uses the same source-ID hashing as Curator,
 reports minimum/maximum assigned rows, and estimates the heaviest shard's time.
 Increase the shard count if `within_target` is false. Validate throughput on the
@@ -153,7 +153,10 @@ reproduce the reference results, preserve the profiles in the bundled `serve.sh`
   memory utilization 0.95. Preserve that profile's loader, offload, parser,
   compilation sizes, and environment flags as well.
 
-Both generate at most 4096 tokens with thinking disabled. These profiles were
+Both generate at most 8192 tokens with thinking disabled and request seed 42.
+Qwen uses temperature 0.7, top-p 0.8, top-k 20, min-p 0, presence penalty 1.5,
+and repetition penalty 1.0. DeepSeek uses temperature 1.0 and top-p 0.95.
+These profiles were
 measured on four GB300 GPUs; they are not portable memory defaults for smaller GPUs.
 Reuse your validated server environment and shared caches throughout the run.
 
