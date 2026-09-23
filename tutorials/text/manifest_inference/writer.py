@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import pyarrow as pa
+
 from nemo_curator.stages.text.io.writer.jsonl import JsonlWriter
 from nemo_curator.tasks import DocumentBatch, FileGroupTask
 
@@ -28,6 +30,12 @@ class NamedJsonlWriter(JsonlWriter):
             msg = "Refusing to publish an incomplete task"
             raise ValueError(msg)
         frame = task.to_pandas().copy()
+        # Pandas otherwise promotes nullable integers inside structs to floats.
+        # Keep nested metadata types intact when successful and failed rows mix.
+        table = task.to_pyarrow()
+        for field in table.schema:
+            if pa.types.is_struct(field.type):
+                frame[field.name] = table.column(field.name).to_pylist()
         if self.generation_lineage is not None:
             if "generation_lineage" in frame.columns:
                 msg = "Refusing to overwrite source column generation_lineage"

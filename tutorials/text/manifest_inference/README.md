@@ -17,10 +17,12 @@ if your application requires that behavior.
 | --- | --- |
 | `manifest.py` | Stream inputs once, index byte ranges, estimate actual shard loads |
 | `stages.py` | Emit deterministic source tasks; seek and read only one range |
-| `inference.py` | Bounded async requests, retries, durable task failure diagnostics |
-| `writer.py` | Reuse JsonlWriter with manifest filenames after every row succeeds |
-| `pipeline.py` | Compose stages, pin run configuration, enable checkpointing |
-| `worker-env.sh` | Activate the worker environment and export logical shard settings |
+| `inference.py` | Bounded async requests, row diagnostics, and systemic-failure retries |
+| `writer.py` | Reuse JsonlWriter with exact manifest filenames and optional Zstandard compression |
+| `pipeline.py` | Compose stages and enable source checkpointing |
+| `recovery.py` | Bundle selected original logical shards into a standalone recovery manifest |
+| `verification.py` | Validate selected shard outputs and optionally publish completion manifests |
+| `worker-env.sh` | Activate the worker environment and preserve array or bundle settings |
 | `serve.sh` | Reference Qwen/DeepSeek vLLM server flags for four GB300 GPUs |
 | `step.sh` | Start vLLM, wait for readiness, run the benchmark wrapper |
 | `array.sbatch` | Execute the same validated step in each array element |
@@ -162,8 +164,7 @@ Reuse your validated server environment and shared caches throughout the run.
 
 First test a small, separately generated manifest in a held allocation matching
 the final topology. Use a separate smoke-test session/output directory. Export
-`SLURM_ARRAY_TASK_ID=0`, `SLURM_ARRAY_JOB_ID=$JOB_ID`, and `TOTAL_SHARDS=1` for this
-manual step, then run:
+`SLURM_ARRAY_TASK_ID=0` and `TOTAL_SHARDS=1` for this manual step, then run:
 
 ```bash
 srun --jobid="$JOB_ID" --overlap --ntasks=1 \
@@ -207,7 +208,7 @@ requests/client for DeepSeek and 128 for Qwen. The YAML always contains one entr
 
 ```text
 BENCHMARK_ROOT/SESSION_NAME/
-  qwen_<SLURM_ARRAY_TASK_ID>_<SLURM_ARRAY_JOB_ID>/
+  qwen_<SLURM_ARRAY_TASK_ID>_<SLURM_JOB_ID>/
     logs/                         # benchmark log and per-restart server logs
     metrics.json
     params.json
@@ -216,27 +217,38 @@ BENCHMARK_ROOT/SESSION_NAME/
     .nemo_curator_metadata/        # LMDB, shard completion, failure records
 
 OUTPUT_DIR/
-  part-001.jsonl/part-001_task_0.jsonl
-  part-001.jsonl/part-001_task_1.jsonl
+  part-001.jsonl/part-001_task_0.jsonl.zst
+  part-001.jsonl/part-001_task_1.jsonl.zst
 ```
 
-The entry name uses standard `SLURM_ARRAY_TASK_ID`, not `SLURM_ARRAY_JOB_IDX`.
+The entry name is `<model>_<physical-array-index>_<SLURM_JOB_ID>`. An automatic
+SLURM requeue keeps the same child job ID, so restart `N` uses a distinct
+`_restart_N` suffix. The YAML reads this complete name from `ENTRY`.
 Benchmark metrics count work written in the current attempt; resumed tasks are
 not counted again. `manifest_rows` describes the whole manifest, not one shard.
 
 ## Step 6: Inspect failures and resume
 
-If any row exhausts retries or has an invalid prompt, the inference stage writes
-a diagnostic record and returns `FailedTask()`. It publishes no final output
-for that task. The source remains pending and the shard remains incomplete;
-other tasks can finish and checkpoint normally. The wrapper exits nonzero when
-the attempt has any failed tasks.
+Request-specific terminal failures do not invalidate the other rows in a source
+task. An over-context prompt, invalid prompt or response, exhausted empty
+completion, zero-token completion, reasoning-budget exhaustion, or unexpected
+finish reason is written in place with `is_success=false` and a nonempty
+`failed_reason`. Its answer may be null or empty. The complete task is published
+and checkpointed, so a later attempt does not regenerate its successful rows.
+
+Exhausted transport errors, HTTP 5xx responses, and unknown systemic failures
+still return `FailedTask()`. If a task contains both a terminal row failure and
+a systemic failure, no output is published for that task. It remains pending and
+the shard remains incomplete; other tasks can finish and checkpoint normally.
+The wrapper exits nonzero when the attempt has any `FailedTask` records.
 
 Diagnostics live under the checkpoint's `.nemo_curator_metadata/.failed_tasks/`
 attempt directories, in `tasks/<source-id>.jsonl`. Each includes
 the original manifest record, task lineage, model, zero-based failed row numbers,
-reasons, and request counts. Historical diagnostics remain after successful
-retries; use current shard-completion state to determine whether work is pending.
+reasons, and request counts. These files describe tasks held for systemic retry;
+terminal row diagnostics live in the generated row metadata. Historical task
+diagnostics remain after successful retries; use current shard-completion state
+to determine whether work is pending.
 Reader/writer exceptions abort the pipeline and remain visible in its logs;
 their incomplete sources are also replayed.
 
@@ -245,7 +257,7 @@ environment to discover incomplete logical shard IDs:
 
 ```bash
 python tutorials/slurm/retry_array.py \
-  --checkpoint-path "$BENCHMARK_ROOT/$SESSION_NAME/.nemo_curator_checkpoint_dir" \
+  --checkpoint-path "$CHECKPOINT_PATH" \
   --format fields
 ```
 
@@ -256,10 +268,61 @@ session/output/model settings. Empty output means there are no incomplete shards
 See the [SLURM array retry workflow](../../slurm/README.md) for windowed submissions
 when scheduler array limits require nonzero `SHARD_INDEX_OFFSET`.
 
-Resubmit those IDs
-with the same `TOTAL_SHARDS` and all other run settings. Curator reruns only the
-incomplete source tasks inside each selected shard. Never run two attempts of
-the same logical shard concurrently.
+Resubmit those IDs with the same `TOTAL_SHARDS` and all other run settings.
+Curator reruns only the incomplete source tasks inside each selected shard.
+Never run two attempts of the same logical shard concurrently.
+
+For a small or fragmented recovery set, build one standalone bundle instead of
+starting one array element per original shard:
+
+```bash
+export RECOVERY_SHARDS=1,4,5,6
+export RECOVERY_MANIFEST=/shared/recovery/manifest.jsonl
+export RECOVERY_PLAN=/shared/recovery/plan.json
+
+python -m tutorials.text.manifest_inference.recovery \
+  --manifest "$MANIFEST_PATH" \
+  --input-dir "$INPUT_DIR" \
+  --shards "$RECOVERY_SHARDS" \
+  --total-shards "$TOTAL_SHARDS" \
+  --output "$RECOVERY_MANIFEST" \
+  --plan-file "$RECOVERY_PLAN"
+```
+
+The bundle contains every canonical source task assigned to the selected original
+logical shards. Completed sources are skipped only because the recovery run uses
+the original checkpoint. For the standalone job, keep `INPUT_DIR`, `OUTPUT_DIR`,
+`CHECKPOINT_PATH`, model settings, and the original `TOTAL_SHARDS`; set
+`MANIFEST_PATH=$RECOVERY_MANIFEST` and explicitly export
+`NEMO_CURATOR_SLURM_ARRAY_ENABLED=0`. The worker preserves that disabled value
+and names the entry `<model>_bundle_<SLURM_JOB_ID>` (plus `_restart_N` after an
+automatic requeue). Run at most one bundle GPU job per model, and do not overlap
+it with an array attempt that can touch any selected shard.
+
+The recovery plan records original shard counts and an optional disjoint
+`--exclude-shards` assertion. Bundle execution does not replace the original
+logical shard count or checkpoint identity.
+
+After recovery stops, validate the selected outputs before publishing their
+original logical-shard completion manifests:
+
+```bash
+python -m tutorials.text.manifest_inference.verification \
+  --original-manifest "$ORIGINAL_MANIFEST_PATH" \
+  --input-dir "$INPUT_DIR" \
+  --output-dir "$OUTPUT_DIR" \
+  --model-key "$MODEL_KEY" \
+  --total-shards "$TOTAL_SHARDS" \
+  --shards "$RECOVERY_SHARDS" \
+  --checkpoint-path "$CHECKPOINT_PATH" \
+  --report "$RECOVERY_REPORT"
+```
+
+The verifier checks every expected `.zst` file, row count, nested metadata,
+terminal-failure classification, lineage, and the 8192-token request cap. It
+writes completion manifests only after every selected output passes. Omit
+`--checkpoint-path` for a read-only verification. Use `--expected-max-tokens`
+when the logical run intentionally used a different cap.
 
 Checkpointing is at-least-once: a task can replay after a crash. The writer reuses
 Curator's `JsonlWriter.write_data()` and overwrites the exact manifest output path
@@ -267,9 +330,9 @@ on retry. An interrupted write can leave a partial file; a file's existence alon
 is not proof of completion. Use Curator's checkpoints and shard verification.
 Keep checkpoint files and their outputs together.
 
-The launcher supplies the logical shard count even for a one-element pilot or a
-subset retry (300 for Qwen and 230 for DeepSeek in this run). Curator owns task
-assignment and completion tracking. Manifest range IDs distinguish multiple
+The launcher supplies the original logical shard count even for a one-element
+pilot or a subset retry. Curator owns task assignment and completion tracking.
+Manifest range IDs distinguish multiple
 tasks from the same input file; they are not output filenames.
 
 Inputs must remain unchanged while using the byte-offset manifest. The reader

@@ -38,14 +38,17 @@ def test_aggregation_failure_preserves_pipeline_outcome(
 
 
 @pytest.mark.parametrize("success", [True, False])
-def test_jsonl_metrics_and_failed_pipeline_status(tmp_path: Path, success: bool):
+@pytest.mark.parametrize("failed_rows", [0, 2])
+def test_jsonl_metrics_and_failed_pipeline_status(tmp_path: Path, success: bool, failed_rows: int):
     task = FileGroupTask(dataset_name="test", data=["part.jsonl.zst"])
     task.add_stage_perf(
         StagePerfStats(
             stage_name="native_vllm_client",
             custom_metrics={
                 "num_requests": 4,
-                "num_successful_completions": 4,
+                "num_successful_completions": 4 - failed_rows,
+                "num_failed_completions": failed_rows,
+                "num_empty_responses": failed_rows,
                 "num_api_attempts": 5,
                 "num_input_tokens": 28,
                 "num_output_tokens": 12,
@@ -67,6 +70,8 @@ def test_jsonl_metrics_and_failed_pipeline_status(tmp_path: Path, success: bool)
     assert metrics["is_success"] is success
     assert metrics["is_complete"] is success
     assert metrics["num_rows_written"] == 4
+    assert metrics["num_failed_completions"] == failed_rows
+    assert metrics["num_successful_completions"] == 4 - failed_rows
     assert metrics["rows_per_sec"] == 2
     assert metrics["output_tokens_per_sec_per_gpu"] == 1.5
     assert metrics["retry_rate"] == 0.25

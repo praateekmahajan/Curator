@@ -21,6 +21,17 @@ from nemo_curator.tasks import DocumentBatch, FailedTask, Task
 from .manifest import record_id
 
 SUCCESSFUL_FINISH_REASONS = {"stop", "length"}
+TERMINAL_ROW_FAILURE_PREFIXES = frozenset(
+    {
+        "context_length_exceeded",
+        "empty_completion",
+        "invalid_prompt",
+        "invalid_response",
+        "reasoning_budget_exhausted",
+        "unexpected_finish_reason",
+        "zero_completion_tokens",
+    }
+)
 
 
 class ModelSettings(TypedDict):
@@ -106,6 +117,11 @@ def _failed_reason(exc: Exception) -> str:
     else:
         prefix = type(exc).__name__
     return f"{prefix}: {message}"[:1000]
+
+
+def _is_terminal_row_failure(reason: str | None) -> bool:
+    """Return whether a request-specific failure is safe to persist in the output."""
+    return isinstance(reason, str) and reason.partition(":")[0] in TERMINAL_ROW_FAILURE_PREFIXES
 
 
 @dataclass
@@ -371,7 +387,7 @@ class NativeVLLMClientStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
 @dataclass
 class ResumableInferenceStage(NativeVLLMClientStage):
-    """A failed row keeps its source task pending; diagnostics survive the attempt."""
+    """Persist terminal row failures while retrying tasks with systemic failures."""
 
     failure_dir: str = ""
 
@@ -381,18 +397,21 @@ class ResumableInferenceStage(NativeVLLMClientStage):
             raise ValueError(msg)
         result = super().process(task)
         failed = []
+        requires_task_retry = False
         record = task._metadata["manifest"]
         for offset, row in enumerate(result.to_pyarrow().to_pylist()):
             metadata = row[f"updated_{self.model_alias}_metadata"]
             if not metadata["is_success"]:
+                reason = metadata["failed_reason"]
                 failed.append(
                     {
                         "line": record["start_line"] + offset,
-                        "reason": metadata["failed_reason"],
+                        "reason": reason,
                         "attempts": metadata["attempt_count"],
                     }
                 )
-        if failed:
+                requires_task_retry = requires_task_retry or not _is_terminal_row_failure(reason)
+        if failed and requires_task_retry:
             path = Path(self.failure_dir) / f"{record_id(record)}.jsonl"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(
@@ -407,4 +426,10 @@ class ResumableInferenceStage(NativeVLLMClientStage):
                 + "\n"
             )
             return FailedTask()
+        if failed:
+            logger.warning(
+                "Persisting {} terminal {} row failure(s) with failure metadata",
+                len(failed),
+                self.model_alias,
+            )
         return result

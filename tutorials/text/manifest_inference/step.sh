@@ -3,8 +3,8 @@
 set -euo pipefail
 source "${WORKTREE:?}/tutorials/text/manifest_inference/worker-env.sh"
 SERVER_SCRIPT="${SERVER_SCRIPT:-$WORKTREE/tutorials/text/manifest_inference/serve.sh}"
-entry="${MODEL_KEY}_${SLURM_ARRAY_TASK_ID:?}_${SLURM_ARRAY_JOB_ID:?}"
-attempt="$BENCHMARK_ROOT/$SESSION_NAME/$entry/logs/restart_${SLURM_RESTART_COUNT:-0}"
+restart_count=${SLURM_RESTART_COUNT:-0}
+attempt="$BENCHMARK_ROOT/$SESSION_NAME/$ENTRY/logs/restart_${restart_count}"
 mkdir -p "$attempt"
 export SERVER_CLI_FILE="$attempt/server-cli.json"
 if [[ -e "$attempt/worker-environment.txt" ]]; then
@@ -17,9 +17,10 @@ fi
   python --version
   git rev-parse HEAD
   git diff --stat
-  printf 'model=%s\ninput=%s\nmanifest=%s\noutput=%s\ncheckpoint=%s\nshard=%s/%s\nserver=%s\n' \
-    "$MODEL_KEY" "$INPUT_DIR" "$MANIFEST_PATH" "$OUTPUT_DIR" "$CHECKPOINT_PATH" \
-    "$NEMO_CURATOR_SLURM_ARRAY_SHARD_INDEX" "$TOTAL_SHARDS" "$SERVER_SCRIPT"
+  printf 'entry=%s\nmodel=%s\ninput=%s\nmanifest=%s\noutput=%s\ncheckpoint=%s\narray_enabled=%s\nshard=%s/%s\nserver=%s\n' \
+    "$ENTRY" "$MODEL_KEY" "$INPUT_DIR" "$MANIFEST_PATH" "$OUTPUT_DIR" "$CHECKPOINT_PATH" \
+    "$NEMO_CURATOR_SLURM_ARRAY_ENABLED" "${NEMO_CURATOR_SLURM_ARRAY_SHARD_INDEX:-bundle}" \
+    "$TOTAL_SHARDS" "$SERVER_SCRIPT"
 } > "$attempt/worker-environment.txt"
 if curl --fail --silent --max-time 3 "${MODEL_ENDPOINT%/v1}/health" > /dev/null; then
   echo 'A server is already healthy at MODEL_ENDPOINT; refusing to start a second server' >&2
