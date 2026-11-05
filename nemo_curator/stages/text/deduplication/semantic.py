@@ -46,6 +46,7 @@ from nemo_curator.stages.deduplication.semantic.pairwise import (
     PairwiseComputeDtype,
 )
 from nemo_curator.stages.deduplication.semantic.ranking import RankingStrategy
+from nemo_curator.stages.deduplication.semantic.weighted import WeightedPruningConfig
 from nemo_curator.stages.deduplication.semantic.workflow import SemanticDeduplicationWorkflow
 from nemo_curator.stages.text.deduplication.removal_workflow import TextDuplicatesRemovalWorkflow
 from nemo_curator.stages.text.embedders.vllm import VLLMEmbeddingModelStage
@@ -123,6 +124,8 @@ class TextSemanticDeduplicationWorkflow:
     # Pairwise precision (appended for positional compatibility)
     pairwise_compute_dtype: PairwiseComputeDtype = "float16"
     kmeans_embedding_output_dtype: KMeansEmbeddingOutputDtype = "float16"
+    weighted_pruning: WeightedPruningConfig | None = None
+    kmeans_spherical: bool = False
     """
     Initialize the text semantic deduplication workflow.
 
@@ -154,6 +157,8 @@ class TextSemanticDeduplicationWorkflow:
         kmeans_random_state: Random state for K-means (None for random)
         kmeans_init: Initialization method for K-means centroids
         kmeans_n_init: Number of K-means initialization runs
+        kmeans_spherical: Normalize centers after every Lloyd update; requires kmeans_init='random'
+            and kmeans_n_init=1. kmeans_tol then measures maximum center displacement.
         kmeans_oversampling_factor: Oversampling factor for K-means
         kmeans_max_samples_per_batch: Maximum samples per batch for K-means
         kmeans_fit_data_fraction: Fraction of generated Parquet embedding files (in (0, 1]) used to
@@ -163,6 +168,8 @@ class TextSemanticDeduplicationWorkflow:
         ranking_strategy: Custom ranking strategy for documents within clusters (None uses which_to_keep/distance_metric)
         pairwise_compute_dtype: Multiplication precision for Pairwise, or ``"auto"`` to retain decoded precision.
         pairwise_batch_size: Positive batch size for the bounded Pairwise workspace.
+        weighted_pruning: Opt into sequential weighted pruning (eps is ignored).
+            Default removal order is ascending ID; custom ranking sets removal priority.
         _duplicates_num_row_groups_hint: Hint for number of row groups in duplicates output
 
         # ID generator parameters
@@ -201,7 +208,11 @@ class TextSemanticDeduplicationWorkflow:
         self.embeddings_path = os.path.join(self.cache_path, "embeddings")
         self.semantic_dedup_path = os.path.join(self.cache_path, "semantic_dedup")
         # Output paths
-        self.duplicates_path = None if self.eps is None else os.path.join(self.output_path, "duplicates")
+        self.duplicates_path = (
+            os.path.join(self.output_path, "duplicates")
+            if self.eps is not None or self.weighted_pruning is not None
+            else None
+        )
         self.deduplicated_output_path = (
             None if not self.perform_removal else os.path.join(self.output_path, "deduplicated")
         )
@@ -218,7 +229,7 @@ class TextSemanticDeduplicationWorkflow:
             )
             raise ValueError(msg)
 
-        if self.perform_removal and self.eps is None:
+        if self.perform_removal and self.eps is None and self.weighted_pruning is None:
             msg = "perform_removal=True but eps=None. Without eps, duplicates can't be identified. "
             msg += "Either set eps or set perform_removal=False"
             raise ValueError(msg)
@@ -350,6 +361,8 @@ class TextSemanticDeduplicationWorkflow:
             ranking_strategy=self.ranking_strategy,
             pairwise_compute_dtype=self.pairwise_compute_dtype,
             pairwise_batch_size=self.pairwise_batch_size,
+            weighted_pruning=self.weighted_pruning,
+            spherical=self.kmeans_spherical,
             # Duplicate identification parameters (optional)
             eps=self.eps,
             _duplicates_num_row_groups_hint=self._duplicates_num_row_groups_hint,

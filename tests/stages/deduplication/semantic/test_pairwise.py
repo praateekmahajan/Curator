@@ -30,6 +30,7 @@ import torch
 
 # Suppress GPU-related import errors when running pytest -m "not gpu"
 with suppress(ImportError):
+    from nemo_curator.stages.deduplication.semantic.identify_duplicates import IdentifyDuplicatesStage
     from nemo_curator.stages.deduplication.semantic.pairwise import (
         PairwiseCosineSimilarityStage,
         PairwiseStage,
@@ -37,6 +38,7 @@ with suppress(ImportError):
     )
     from nemo_curator.stages.deduplication.semantic.pairwise_io import ClusterWiseFilePartitioningStage
     from nemo_curator.stages.deduplication.semantic.ranking import RankingStrategy
+    from nemo_curator.stages.deduplication.semantic.weighted import WeightedPruningConfig
     from nemo_curator.stages.text.embedders.utils import create_list_series_from_1d_or_2d_ar
     from nemo_curator.tasks import FileGroupTask
 
@@ -137,6 +139,74 @@ class TestPairwiseCosineSimilarityBatched:
 @pytest.mark.gpu
 class TestPairwiseCosineSimilarityStage:
     """Test cases for PairwiseCosineSimilarityStage."""
+
+    @pytest.mark.parametrize("size", [1, 3])
+    @pytest.mark.parametrize("fp16", [False, True])
+    @pytest.mark.parametrize("spill", [False, True])
+    def test_weighted_file_contract(self, tmp_path: Path, size: int, fp16: bool, spill: bool) -> None:
+        ids = ["c", "a", "b"][:size]
+        data = cudf.DataFrame({"doc_id": ids})
+        vectors = cp.ones((size, 4), dtype=cp.float32)
+        if fp16:
+            vectors = vectors.astype(cp.float16).view(cp.uint16)
+        data["embeddings"] = create_list_series_from_1d_or_2d_ar(vectors, index=data.index)
+        source = tmp_path / "input.parquet"
+        data.to_parquet(source)
+        composite = PairwiseStage(
+            id_field="doc_id",
+            embedding_field="embeddings",
+            input_path=str(tmp_path),
+            output_path=str(tmp_path / "pairwise"),
+            compute_dtype="auto",
+            weighted_pruning=WeightedPruningConfig(spill_embeddings=spill, scratch_path=str(tmp_path)),
+        )
+        stage = composite.decompose()[1]
+        task = FileGroupTask(
+            data=[str(source)], dataset_name="test", _metadata={"centroid_id": 0, "filetype": "parquet"}
+        )
+        result = stage.process(task)
+        frame = cudf.read_parquet(result.data[0])
+        assert list(frame.columns) == ["id", "removed"]
+        assert frame[~frame.removed].id.to_pandas().tolist() == ["c"]
+        duplicates = tmp_path / "duplicates"
+        duplicates.mkdir()
+        removal = IdentifyDuplicatesStage(str(duplicates), eps=0.99, use_removal_mask=True)
+        removed = removal.process_batch([result])[0]
+        assert len(cudf.read_parquet(removed.data[0])) == size - 1
+
+    @pytest.mark.parametrize("compute_dtype", ["float32", "float16"])
+    def test_spilled_weighted_matches_resident(self, tmp_path: Path, compute_dtype: str) -> None:
+        rng = np.random.default_rng(713)
+        vectors = rng.normal(size=(127, 32)).astype(np.float32)
+        vectors[20:40] = vectors[0]
+        frame = cudf.DataFrame({"id": rng.permutation(127), "priority": rng.permutation(127)})
+        frame["embeddings"] = create_list_series_from_1d_or_2d_ar(cp.asarray(vectors), index=frame.index)
+        files = [str(tmp_path / "a.parquet"), str(tmp_path / "b.parquet")]
+        frame.iloc[:17].to_parquet(files[0], row_group_size_rows=13)
+        frame.iloc[17:].to_parquet(files[1], row_group_size_rows=13)
+        task = FileGroupTask(data=files, dataset_name="test", _metadata={"centroid_id": 19, "filetype": "parquet"})
+        results = []
+        for spill in [False, True]:
+            output = tmp_path / str(spill)
+            output.mkdir()
+            stage = PairwiseCosineSimilarityStage(
+                id_field="id",
+                embedding_field="embeddings",
+                output_path=str(output),
+                ranking_strategy=RankingStrategy.metadata_based(["priority"], ascending=False),
+                pairwise_batch_size=7,
+                compute_dtype=compute_dtype,
+                weighted_pruning=WeightedPruningConfig(
+                    rules=((0.98, 10), (0.5, 7), (0.1, 3)),
+                    shard_size=47,
+                    spill_embeddings=spill,
+                    scratch_path=str(tmp_path),
+                    read_memory_bytes=1024,
+                ),
+            )
+            results.append(cudf.read_parquet(stage.process(task).data[0]).to_pandas())
+        assert results[0].equals(results[1])
+        assert results[0].removed.any()
 
     @patch("torch.cuda.memory.change_current_allocator")
     @patch("rmm.mr.set_current_device_resource")

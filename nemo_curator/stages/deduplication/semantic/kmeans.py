@@ -57,6 +57,14 @@ def validate_embedding_output_dtype(embedding_output_dtype: object) -> None:
         raise ValueError(msg)
 
 
+def validate_spherical_config(spherical: bool, init: object, n_init: object, max_iter: int, tol: float) -> None:
+    if spherical and (
+        (isinstance(init, str) and init != "random") or n_init != 1 or max_iter < 1 or not np.isfinite(tol) or tol <= 0
+    ):
+        msg = "spherical=True requires init='random' or explicit centers, n_init=1, max_iter>=1 and finite tol>0"
+        raise ValueError(msg)
+
+
 class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], DeduplicationIO):
     """KMeans clustering stage that requires RAFT for distributed processing."""
 
@@ -83,6 +91,8 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         read_kwargs: dict[dict] | None = None,
         write_kwargs: dict[dict] | None = None,
         embedding_output_dtype: KMeansEmbeddingOutputDtype = "float32",
+        write_embeddings: bool = True,
+        spherical: bool = False,
     ):
         """KMeans clustering stage that requires RAFT for distributed processing.
 
@@ -107,6 +117,9 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             read_kwargs (dict[dict]): Keyword arguments for the read stage.
             write_kwargs (dict[dict]): Keyword arguments for the write stage.
             embedding_output_dtype: Precision used to store embeddings in KMeans output files.
+            write_embeddings: Include vectors in output; disable for downstream metadata-only scoring.
+            spherical: Normalize centers after each native Lloyd update. Requires random or explicit
+                initialization and n_init=1. tol bounds the largest Euclidean center displacement.
         """
         self.id_field = id_field
         self.embedding_field = embedding_field
@@ -132,6 +145,9 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         self.cache_path = cache_path
         validate_embedding_output_dtype(embedding_output_dtype)
         self.embedding_output_dtype = embedding_output_dtype
+        self.write_embeddings = write_embeddings
+        validate_spherical_config(spherical, init, n_init, max_iter, tol)
+        self.spherical = spherical
         self.read_kwargs = read_kwargs.copy() if read_kwargs is not None else {}
         self.write_kwargs = write_kwargs.copy() if write_kwargs is not None else {}
 
@@ -234,7 +250,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         del embeddings
 
         fit_start = time.perf_counter()
-        self.kmeans.fit(fit_embeddings, sample_weight=None)
+        self._fit_embeddings(fit_embeddings)
         fit_time = time.perf_counter() - fit_start
         self._log_metrics(
             {
@@ -367,6 +383,10 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
 
     def _set_output_embeddings(self, frame: "cudf.DataFrame", embeddings: "cp.ndarray") -> None:
         """Materialize embeddings, carrying FP16 as uint16 until cuDF supports it."""
+        if not self.write_embeddings:
+            if self.embedding_field in frame:
+                del frame[self.embedding_field]
+            return
         if self.embedding_output_dtype == "float16":
             embeddings = embeddings.astype(cp.float16).view(cp.uint16)
         frame[self.embedding_field] = create_list_series_from_1d_or_2d_ar(embeddings, index=frame.index)
@@ -409,7 +429,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
         self._log_metrics({"kmeans_read_time": t1 - t0, "num_rows": len(df)})
         logger.debug(f"Read time: {(t1 - t0):.2f} seconds")
 
-        self.kmeans.fit(embeddings, sample_weight=None)
+        self._fit_embeddings(embeddings)
         self._save_centroids(cp.asarray(self.kmeans.cluster_centers_))
         df["centroid"] = self.kmeans.predict(embeddings).astype(cp.int32)
 
@@ -492,7 +512,7 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             f"(fit_data_fraction={fraction:.4f}, {len(fit_files)}/{len(files)} files)"
         )
 
-        self.kmeans.fit(concatenated_samples, sample_weight=None)
+        self._fit_embeddings(concatenated_samples)
         del concatenated_samples
         gc.collect()
         # Stop the fit-time clock before centroid I/O so the metric isn't skewed
@@ -548,6 +568,47 @@ class KMeansReadFitWriteStage(ProcessingStage[FileGroupTask, EmptyTask], Dedupli
             pass2_read_time,
             total_rows,
         )
+
+    def _fit_embeddings(self, embeddings: "cp.ndarray") -> None:
+        if not self.spherical:
+            self.kmeans.fit(embeddings, sample_weight=None)
+            return
+
+        model = self.kmeans
+        original_init, original_max_iter = model.init, model.max_iter
+        previous = None
+        if not isinstance(original_init, str):
+            previous = cp.asarray(original_init, dtype=embeddings.dtype).copy()
+            norms = cp.linalg.norm(previous, axis=1, keepdims=True)
+            if not bool(cp.all(cp.isfinite(norms) & (norms > 0))):
+                msg = "Spherical initial centers must be finite and nonzero"
+                raise ValueError(msg)
+            previous /= norms
+            model.init = previous
+        model.max_iter = 1
+        try:
+            for _iteration in range(self.max_iter):
+                model.fit(embeddings, sample_weight=None)
+                centers = cp.asarray(model.cluster_centers_).copy()
+                norms = cp.linalg.norm(centers, axis=1, keepdims=True)
+                if not bool(cp.all(cp.isfinite(norms))):
+                    msg = "Spherical fitting produced non-finite centers; check input vectors"
+                    raise ValueError(msg)
+                # Native KMeans retains empty centers. A cancelling mean can still be zero;
+                # preserve its last direction, or use a deterministic unit axis on the first step.
+                fallback = previous
+                if fallback is None:
+                    fallback = cp.zeros_like(centers)
+                    fallback[:, 0] = 1
+                centers = cp.where(norms > 0, centers / cp.maximum(norms, 1e-30), fallback)
+                shift = float(cp.max(cp.linalg.norm(centers - previous, axis=1))) if previous is not None else np.inf
+                model.cluster_centers_ = centers
+                if shift <= self.tol:
+                    break
+                model.init = previous = centers
+            self._log_metric("kmeans_spherical_iterations", _iteration + 1)
+        finally:
+            model.init, model.max_iter = original_init, original_max_iter
 
     def setup(self, _: WorkerMetadata | None = None) -> None:
         from cuml.cluster.kmeans_mg import KMeansMG as cumlKMeans
@@ -630,6 +691,8 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
     fit_data_fraction: float | None = None
     cache_path: str | None = None
     embedding_output_dtype: KMeansEmbeddingOutputDtype = "float32"
+    write_embeddings: bool = True
+    spherical: bool = False
     """KMeans clustering stage that requires RAFT for distributed processing.
 
     Args:
@@ -655,6 +718,9 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
             one pass.
         cache_path (str | None): The path to save the centroids to. If None, the centroids will not be saved.
         embedding_output_dtype: Precision used to store embeddings in KMeans output files.
+        write_embeddings: Include vectors in output; disable for downstream metadata-only scoring.
+        spherical: Fit unit-length centers using native one-step Lloyd updates. Requires
+            init='random' or explicit centers, n_init=1; tol is maximum center displacement.
     """
 
     def __post_init__(self):
@@ -674,6 +740,7 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
                 "available for Parquet input"
             )
         validate_embedding_output_dtype(self.embedding_output_dtype)
+        validate_spherical_config(self.spherical, self.init, self.n_init, self.max_iter, self.tol)
 
     def decompose(self) -> list[ProcessingStage]:
         # Set default file extensions based on input_filetype if not provided
@@ -707,5 +774,7 @@ class KMeansStage(CompositeStage[EmptyTask, EmptyTask]):
                 write_kwargs=self.write_kwargs,
                 cache_path=self.cache_path,
                 embedding_output_dtype=self.embedding_output_dtype,
+                write_embeddings=self.write_embeddings,
+                spherical=self.spherical,
             ),
         ]

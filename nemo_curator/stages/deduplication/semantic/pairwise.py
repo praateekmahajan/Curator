@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from itertools import chain
@@ -20,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import cudf
 import cupy as cp
+import numpy as np
 import rmm.mr
 import torch
 from loguru import logger
@@ -36,8 +38,10 @@ from .ranking import RankingStrategy
 from .utils import (
     break_parquet_partition_into_groups,
     get_array_from_df,
+    read_parquet_chunks,
     read_parquet_file_info,
 )
+from .weighted import WeightedPruningConfig, sequential_weighted_pruning
 
 if TYPE_CHECKING:
     from nemo_curator.backends.base import WorkerMetadata
@@ -204,6 +208,7 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
         read_kwargs: dict[str, Any] | None = None,
         write_kwargs: dict[str, Any] | None = None,
         compute_dtype: PairwiseComputeDtype = "float32",
+        weighted_pruning: WeightedPruningConfig | None = None,
     ):
         """Initialize the pairwise cosine similarity stage.
 
@@ -217,6 +222,8 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
             compute_dtype: Multiplication dtype. ``"auto"`` retains the decoded embedding precision.
             read_kwargs: Kwargs for reading parquet files.
             write_kwargs: Kwargs for writing parquet files.
+            weighted_pruning: Opt into sequential weighted pruning. Ranking becomes
+                removal priority; output is ``id, removed`` rather than cosine scores.
         """
         self.id_field = id_field
         self.embedding_field = embedding_field
@@ -227,6 +234,7 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
             msg = f"Unsupported compute_dtype: {compute_dtype}"
             raise ValueError(msg)
         self.compute_dtype = compute_dtype
+        self.weighted_pruning = weighted_pruning
         self.ranking_strategy = ranking_strategy
         self.verbose = verbose
         self.read_kwargs = read_kwargs.copy() if read_kwargs is not None else {}
@@ -235,6 +243,9 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
         check_disallowed_kwargs(self.write_kwargs, ["index"])
         self.input_storage_options = self.read_kwargs.pop("storage_options", None) if self.read_kwargs else None
         self.output_storage_options = self.write_kwargs.pop("storage_options", None) if self.write_kwargs else None
+        if weighted_pruning is not None and weighted_pruning.spill_embeddings and self.read_kwargs:
+            msg = "Spilled weighted pruning supports storage_options but no other read_kwargs"
+            raise ValueError(msg)
         self.name = "PairwiseCosineSimilarityStage"
         self.resources = Resources(cpus=1.0, gpus=1.0)
 
@@ -247,7 +258,7 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
         rmm.mr.set_current_device_resource(self._rmm_memory_resource)
         torch.cuda.memory.change_current_allocator(rmm_torch_allocator)
 
-    def process(self, task: FileGroupTask) -> FileGroupTask:  # noqa: PLR0915
+    def process(self, task: FileGroupTask) -> FileGroupTask:  # noqa: C901, PLR0912, PLR0915
         """Process a PairwiseFileGroupTask to compute pairwise similarities."""
         # TODO(NMCUR-457): Remove IdentifyDuplicatesStage's temporary Pairwise
         # metric propagation once core preserves every input across N-to-1 fan-in.
@@ -288,6 +299,15 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
         )
         footer_time = time.perf_counter() - footer_start
 
+        if self.weighted_pruning is not None and self.weighted_pruning.spill_embeddings:
+            return self._process_spilled_weighted(
+                task,
+                input_files,
+                metadata_cols,
+                sum(info.num_rows for info in file_info),
+                {"pairwise_file_discovery_time": discovery_time, "pairwise_footer_scan_time": footer_time},
+            )
+
         read_start = time.perf_counter()
         frames = [
             self.read_parquet(
@@ -321,6 +341,8 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
                     "cosine_sim_score": cudf.Series([0], dtype="float32"),
                 }
             )
+            if self.weighted_pruning is not None:
+                result_df = cudf.DataFrame({"id": metadata_cluster_df[self.id_field], "removed": [False]})
             write_start = time.perf_counter()
             self.write_parquet(
                 result_df, output_path, storage_options=self.output_storage_options, index=False, **self.write_kwargs
@@ -388,26 +410,27 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
         # Compute pairwise similarities after any requested precision conversion.
         compute_start = time.perf_counter()
         resolved_batch_size = min(self.pairwise_batch_size, num_rows)
-        max_similarity, max_indices = pairwise_cosine_similarity_batched(cluster_embeddings, resolved_batch_size)
+        if self.weighted_pruning is not None:
+            removed = sequential_weighted_pruning(
+                cluster_embeddings, self.weighted_pruning, resolved_batch_size, int(cluster_id)
+            )
+            points_to_remove_df = cudf.DataFrame({"id": ids, "removed": removed})
+        else:
+            max_similarity, max_indices = pairwise_cosine_similarity_batched(cluster_embeddings, resolved_batch_size)
+            points_to_remove_df = cudf.DataFrame(
+                {
+                    "id": ids,
+                    "max_id": ids.iloc[max_indices].reset_index(drop=True),
+                    # cuDF has no numeric FP16 column.
+                    "cosine_sim_score": max_similarity.astype(cp.float32, copy=False),
+                }
+            )
         # Finish the matrix multiplications before recording compute time and
         # returning their now-unused Torch workspace to the allocator.
         torch.cuda.synchronize()
         del cluster_embeddings, ranked_embeddings
         compute_time = time.perf_counter() - compute_start
 
-        # Convert indices back to IDs
-        max_indices_id = ids.iloc[max_indices].reset_index(drop=True)
-
-        # Create result dataframe
-        points_to_remove_df = cudf.DataFrame(
-            {
-                "id": ids,
-                "max_id": max_indices_id,
-                # cuDF has no numeric FP16 column, so retain FP16 through the
-                # reduction and promote only when materializing the output.
-                "cosine_sim_score": max_similarity.astype(cp.float32, copy=False),
-            }
-        )
         # Write results
         write_start = time.perf_counter()
         self.write_parquet(
@@ -443,6 +466,91 @@ class PairwiseCosineSimilarityStage(ProcessingStage[FileGroupTask, FileGroupTask
             data=[output_path],
         )
 
+    def _process_spilled_weighted(  # noqa: PLR0915
+        self,
+        task: FileGroupTask,
+        files: list[str],
+        metadata_cols: list[str],
+        num_rows: int,
+        timings: dict[str, float],
+    ) -> FileGroupTask:
+        """Keep rank metadata on GPU, but stage embeddings on disk and prune one shard at a time."""
+        config = self.weighted_pruning
+        if config is None:
+            msg = "Spilled pruning requires weighted_pruning configuration"
+            raise RuntimeError(msg)
+        started = time.perf_counter()
+        frames = list(read_parquet_chunks(files, metadata_cols, config.read_memory_bytes, self.input_storage_options))
+        if not frames or not num_rows:
+            return FileGroupTask(
+                data=[], dataset_name=task.dataset_name, _metadata=task._metadata, _stage_perf=task._stage_perf
+            )
+        metadata = cudf.concat(frames, ignore_index=True)
+        del frames
+        if len(metadata) != num_rows:
+            msg = "Weighted metadata row count differs from Parquet footers"
+            raise RuntimeError(msg)
+        timings["pairwise_read_time"] = time.perf_counter() - started
+        started = time.perf_counter()
+        metadata["_original_idx"] = cp.arange(num_rows)
+        ranked = self.ranking_strategy.rank_cluster(metadata)
+        order = ranked["_original_idx"].to_numpy()
+        destination = np.empty(num_rows, dtype=np.int64)
+        destination[order] = np.arange(num_rows)
+        ids = ranked[self.id_field]
+        del metadata, ranked, order
+        timings["pairwise_rank_time"] = time.perf_counter() - started
+
+        with tempfile.TemporaryFile(dir=config.scratch_path) as scratch:
+            stored = None
+            offset = 0
+            started = time.perf_counter()
+            for frame in read_parquet_chunks(
+                files, [self.embedding_field], config.read_memory_bytes, self.input_storage_options
+            ):
+                if not len(frame):
+                    continue
+                values = _decode_embedding_array(frame, self.embedding_field)
+                if stored is None:
+                    stored = np.memmap(scratch, mode="w+", dtype=values.dtype, shape=(num_rows, values.shape[1]))
+                if values.shape[1] != stored.shape[1] or values.dtype != stored.dtype:
+                    msg = "All Pairwise embedding files must have the same width and storage dtype"
+                    raise TypeError(msg)
+                stop = offset + len(values)
+                if stop > num_rows:
+                    msg = "Embedding reads exceeded the Parquet footer row count"
+                    raise RuntimeError(msg)
+                stored[destination[offset:stop]] = values.get()
+                offset = stop
+                del frame, values
+            if offset != num_rows:
+                msg = "Embedding reads differ from the Parquet footer row count"
+                raise RuntimeError(msg)
+            timings["pairwise_read_time"] += time.perf_counter() - started
+            started = time.perf_counter()
+            # Conversion is per shard, never a second full-cluster GPU allocation.
+            tensor = torch.from_numpy(stored)
+            dtype = _resolve_compute_dtype(tensor, self.compute_dtype)
+            removed = sequential_weighted_pruning(
+                tensor, config, self.pairwise_batch_size, int(task._metadata["centroid_id"]), compute_dtype=dtype
+            )
+            del tensor, stored
+            timings["pairwise_compute_time"] = time.perf_counter() - started
+        started = time.perf_counter()
+        output = os.path.join(self.output_path, f"cluster_{task._metadata['centroid_id']}.parquet")
+        self.write_parquet(
+            cudf.DataFrame({"id": ids, "removed": removed}),
+            output,
+            index=False,
+            storage_options=self.output_storage_options,
+            **self.write_kwargs,
+        )
+        timings["pairwise_write_time"] = time.perf_counter() - started
+        self._log_metrics(timings)
+        return FileGroupTask(
+            data=[output], dataset_name=task.dataset_name, _metadata=task._metadata, _stage_perf=task._stage_perf
+        )
+
 
 @dataclass
 class PairwiseStage(CompositeStage[EmptyTask, FileGroupTask]):
@@ -466,10 +574,15 @@ class PairwiseStage(CompositeStage[EmptyTask, FileGroupTask]):
     sim_metric: Literal["cosine", "l2"] = "cosine"
     random_seed: int = 42
     compute_dtype: PairwiseComputeDtype = "float32"
+    weighted_pruning: WeightedPruningConfig | None = None
 
     def __post_init__(self):
         """Initialize parent class after dataclass initialization."""
         super().__init__()
+        if self.ranking_strategy is None and self.weighted_pruning is not None:
+            # Stable removal order across file layouts; pass a custom ranking to
+            # reproduce a source corpus's original order. which_to_keep is unused.
+            self.ranking_strategy = RankingStrategy(metadata_cols=[self.id_field])
         if self.ranking_strategy is None:
             if self.which_to_keep == "random":
                 self.ranking_strategy = RankingStrategy(
@@ -510,6 +623,7 @@ class PairwiseStage(CompositeStage[EmptyTask, FileGroupTask]):
                 verbose=self.verbose,
                 ranking_strategy=self.ranking_strategy,
                 compute_dtype=self.compute_dtype,
+                weighted_pruning=self.weighted_pruning,
                 read_kwargs=self.read_kwargs,
                 write_kwargs=self.write_kwargs,
             ),

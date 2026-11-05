@@ -69,6 +69,197 @@ results = workflow.run()
 # Clean dataset saved to ./results/deduplicated/
 ```
 
+## Sequential weighted pruning
+
+The default remains ranked maximum-similarity thresholding. To opt into
+order-dependent weighted pruning on precomputed embeddings:
+
+```python
+from nemo_curator.stages.deduplication.semantic.workflow import SemanticDeduplicationWorkflow
+from nemo_curator.stages.deduplication.semantic.weighted import WeightedPruningConfig
+
+workflow = SemanticDeduplicationWorkflow(
+    input_path="embeddings/",
+    output_path="weighted_results/",
+    n_clusters=500,
+    weighted_pruning=WeightedPruningConfig(
+        rules=((0.98, 10), (0.95, 7), (0.92, 3)),
+        drop_score=10,
+        shard_size=50_000,  # None compares the whole cluster
+    ),
+    kmeans_embedding_output_dtype="float32",
+    pairwise_compute_dtype="float32",
+)
+results = workflow.run()
+```
+
+The same `weighted_pruning` argument is supported by `PairwiseStage` and
+`TextSemanticDeduplicationWorkflow`. When enabled:
+
+- Each pair receives the weight of its highest matching **strict** cosine
+  threshold, not the sum of all matching bands.
+- Documents are visited in ascending ID order by default. A custom
+  `ranking_strategy` specifies **removal priority**, unlike the default
+  threshold mode's preservation priority. `which_to_keep` is not used.
+- A document is removed when its current weighted-neighbor sum reaches
+  `drop_score`. Removed documents stop contributing to later decisions.
+- `eps` is ignored. Pairwise files contain `id, removed`; the workflow still
+  produces the usual duplicate-ID Parquet files for document removal.
+- Seeded random sharding excludes cross-shard comparisons. Row order, precision,
+  and shard membership must match when comparing implementations. FP32 is
+  recommended for parity testing; the workflow's usual FP16 defaults are not
+  automatically changed.
+
+Two tiled similarity passes bound GPU workspace by cluster/shard size times
+`pairwise_batch_size`. The algorithm remains quadratic in comparisons; it is
+not an approximate nearest-neighbor replacement. Sequential decisions use a
+CUDA block, with GPU updates between blocks and no per-document host transfers. Cluster embeddings still
+need to fit GPU memory by default.
+
+For oversized clusters, use `WeightedPruningConfig(spill_embeddings=True,
+scratch_path="/local/ssd")`. This opt-in path reads projected Parquet chunks into
+a temporary disk-backed array and transfers one seeded shard at a time. It
+preserves the same ranking, balanced shard membership, and pruning kernel.
+`shard_size` must be finite. IDs and ranking metadata still fit on the GPU;
+the embedding array needs roughly N×D×element-size bytes of local scratch.
+The OS may cache mapped pages in host RAM, so this is not a hard host-RSS limit.
+`read_memory_bytes` targets 256 MiB of decoded Parquet data by default; decoder
+page granularity can exceed the target. Use a disk-backed scratch directory,
+not a RAM filesystem; when unset, Python's temporary-directory policy applies.
+This path accepts `storage_options` but rejects other `read_kwargs` rather than
+silently changing filtered or sliced input. The math-18 example accepts the same
+`weighted_pruning` configuration.
+
+### Generic quality/diversity curation
+
+The library stages do not require math labels or source-specific taxonomy:
+
+- `SemanticDuplicateFilterStage` applies per-cluster weighted removal masks to
+  projected Parquet columns using chunked GPU reads and cuDF filtering.
+- `ClusterDiversityStage(group_fields=())` emits corpus-wide sampling shards;
+  a tuple of column names adds caller-defined grouping. Member compactness is
+  reduced on GPU. Centroid separation uses an O(KD) identity, not all-pairs storage.
+- `QualityDiversitySamplingStage` accepts `quality_field`, `diversity_field`,
+  optional `gate_field`, `group_fields`, and exact per-group `budgets`. GPU
+  normalization, ranking, and capped allocation produce compact `total_copies`.
+  Quality scores need only be finite; no prescribed 0–5 scale is required.
+- `RepeatParquetStage` decodes, gathers repeated rows, and writes on GPU in
+  bounded batches. Optional `counts_path` late-joins compact counts to original
+  text by ID, avoiding a text shuffle. Its sorted ID/count table must fit each
+  worker GPU; text and embeddings are not retained in that lookup table.
+
+Keep embeddings only through reclustering; carry quality metadata through the
+scoring/sampling stages and attach original text at the end. Sampling groups
+must fit GPU memory when extracted; increasing shard count changes the ranking
+population, so it is an algorithmic choice, not a transparent memory fix.
+The phased example `examples/text/benchmark_semantic_downstream.py` illustrates
+this composition without `ms`, `rd`, `cr`, or `math_topic`.
+
+Physical repetition is optional: retain compact `total_copies` when the training
+reader can honor multiplicities. Materialized copies are adjacent, not globally
+shuffled; shuffle them before training. Their unique identity is `(id, copy_index)`,
+not `id` alone. Use fast storage for materialization: GPU-bounded expansion does
+not avoid the cost of reading original text and writing repeated text.
+
+### Math-18 compatibility recipe
+
+See `examples/text/semdedup_math18.py` for a composed pipeline:
+
+1. Weighted dedup and existing duplicate removal.
+2. A second `KMeansStage` on survivors, with `cache_path` set to save centroids.
+   Set `write_embeddings=False` here to avoid rewriting vectors that the following
+   stages do not use; the default remains `True` for ordinary SemDedup.
+   Its partitioned output already performs cluster relocation; no additional
+   Spark-style join/relocation stage is necessary.
+3. `ClusterDiversityStage`: mean member-to-centroid cosine distance times mean
+   distance to other centroids. It reuses KMeans' distance column and computes
+   centroid separation in O(KD), without a K-by-K matrix. All members receive
+   their cluster's score.
+4. `plan_sampling_budgets`: small pre-dedup topic counts and survivor topic/shard
+   counts determine exact integer budgets. Impossible budgets raise an error.
+5. `FusionSamplingStage`: existing GPU shuffle groups by topic/shard; cuDF/CuPy
+   combine quality, correctness-gated diversity, percentile rank, and capped
+   integer copy allocation. Defaults target 2.5 copies per survivor, cap 8.
+6. `RepeatParquetStage`: streams count files through cuDF/CuPy repeat/gather
+   and writes each expanded GPU batch directly.
+   It preserves both the original ID and `copy_index`. Do not deduplicate away
+   the intentional copies. `repeat_batch_rows` controls input batch rows in the
+   example (default 1,024); each expansion has at most `max_repeat` times that
+   many rows. It does not load the whole file or expanded corpus into memory.
+
+Input must have unique IDs, embeddings, and successfully parsed math quality
+fields (`ms`, `rd`, `cr`, each 0–5), plus `math_topic`. The example expects a uniform
+Parquet schema and retains all survivor metadata by default; `metadata_fields`
+can restrict optional carried fields. Text, topic, and quality labels are always
+retained. Both samplers replace their generated `total_copies` and quality score
+`q` columns if already present; repeat expansion similarly replaces `copy_index`.
+Other metadata is retained. Quality arithmetic follows Forge's term-by-term evaluation rather than
+a dot product, which can alter discrete-score ties. Embeddings are excluded from sampling and
+repeat output. Embedding generation, math annotation, tokenization and packing
+are outside this example.
+
+This is a math-18-style recipe, not bit-for-bit reproduction of a Forge run:
+`run_math18` defaults to `spherical=True`, normalizing centers after **every**
+native Lloyd update in both clustering passes. Set `spherical=False` to use
+Euclidean fitting on normalized embeddings. `KMeansStage` and
+`SemanticDeduplicationWorkflow` expose the same flag; the text wrapper calls it
+`kmeans_spherical`. These lower-level interfaces require `init="random"`
+(`kmeans_init` on the wrapper) or explicit centers, and `n_init=1`.
+In spherical mode, `tol` is the maximum Euclidean displacement of a center.
+Explicit initial centers are normalized. Empty centers retain their direction;
+a zero mean retains its previous direction, or uses the first coordinate axis
+if it occurs on the first random-initialized update. Existing Euclidean defaults
+remain unchanged outside this math-18 example. The mode reuses cuML kernels and RAFT communication; it does
+not change process-wide precision settings. TF32 and floating-point reductions
+can affect assignments, and fixed seeds do not guarantee bitwise repeatability.
+
+Forge calls `flash_kmeans.kmeans_largeN_Cosine_distributed`. Its exact build is
+not pinned in the repository, so spherical mode is an algorithmic analogue,
+not a verified reproduction of that build's initialization, stopping rule or
+empty-cluster handling. Normalizing only final centers would not reproduce
+cosine updates during fitting.
+
+This recipe also uses deterministic ID ordering/tie-breaking rather than
+Forge's file order. Sampling shards default to GPU CRC32, matching Spark's UTF-8
+CRC32 when the original Forge string hash is used as `id_field`. Numeric
+surrogate IDs are encoded as decimal strings and do not reproduce original-hash
+shards. `sampling_hash="xxhash32"` retains the earlier prototype's shard mapping.
+The math-18 example defaults to Forge's mix_930 topic multipliers; pass
+`topic_multipliers={}` to use natural proportions, or a mapping to replace the
+recipe. The general-purpose budget planner still defaults to natural proportions.
+Both sampling backends expose `quality_weights` (ms/rd/cr), `gate_threshold`,
+`temperature`, `diversity_weight`, and `max_repeat`; the example forwards the same
+settings to either backend and to repeat expansion. The source pool and pre-dedup counts must refer
+to the same quality-filtered snapshot.
+
+KMeans' default automatic fit sizing may fit a subset of Parquet files; it still
+assigns all documents. Record the fit sample policy when comparing cluster
+assignments or diversity with a full-data Forge run.
+
+`ClusterDiversityStage.read_memory_bytes` controls chunked GPU Parquet decoding
+(default 256 MiB), so a complete cluster or input file need not fit on the GPU.
+The decoder's page granularity and working allocations can exceed this target.
+
+Size GPU shuffle partitions to fit memory on extraction; spilling during
+shuffle does not make a complete group arbitrarily large. Changing sampling
+shards changes normalization/ranking groups and therefore sampling results.
+For oversized groups, the example accepts `sampling_memory_limit="4GB"`:
+this uses optional DuckDB (`import duckdb`) for external sorting on local/shared
+disk, preserving complete topic/shard groups and exact budgets. It keeps text
+out of sorting intermediates and joins it back when writing counts. Scratch
+disk must accommodate numeric intermediates and spill; the configured limit
+controls DuckDB's buffer manager, not total process RSS. This path is single-node,
+not a distributed GPU sampler, and currently uses standard math-18 field names.
+
+GPU count files use a row limit; disk-sampler files use a 64 MB file target with
+a 16 MB row-group byte target to limit buffering of wide text payloads.
+These are targets, not hard limits on decoded text or total memory. The streaming
+repeat writer limits expanded rows, not bytes: long documents and Parquet pages
+can still require substantial memory. It refuses to overwrite existing output
+files; a failed task may leave partial files for inspection. Multi-node throughput,
+restart behavior and corpus-scale quality need validation on representative
+data before production deployment.
+
 ## Configuration
 
 Configure semantic deduplication using these key parameters:

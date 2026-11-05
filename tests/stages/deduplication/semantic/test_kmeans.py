@@ -46,6 +46,121 @@ EMBEDDING_DIM = 1024
 RANDOM_STATE = 42
 
 
+@pytest.mark.gpu
+def test_spherical_native_updates_match_reference(tmp_path: Path) -> None:
+    rng = np.random.default_rng(713)
+    vectors = rng.normal(size=(1000, 8))
+    vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+    initial = vectors[:8].copy()
+    expected = initial.copy()
+    for _ in range(10):
+        labels = (vectors @ expected.T).argmax(axis=1)
+        sums = np.zeros_like(expected)
+        np.add.at(sums, labels, vectors)
+        norms = np.linalg.norm(sums, axis=1, keepdims=True)
+        expected = np.where(norms > 0, sums / np.maximum(norms, 1e-30), expected)
+    stage = KMeansReadFitWriteStage(
+        id_field="id",
+        embedding_field="embeddings",
+        output_path=str(tmp_path),
+        filetype="parquet",
+        n_clusters=8,
+        init=initial,
+        spherical=True,
+        max_iter=10,
+        tol=1e-12,
+    )
+    # FP64 isolates the algorithm from TF32 rounding without changing process-wide settings.
+    stage.kmeans = cuml.cluster.KMeans(n_clusters=8, init=initial, max_iter=10, n_init=1, output_type="cupy")
+    stage._fit_embeddings(cp.asarray(vectors))
+    np.testing.assert_allclose(cp.asnumpy(stage.kmeans.cluster_centers_), expected, atol=1e-10)
+    np.testing.assert_array_equal(
+        cp.asnumpy(stage.kmeans.predict(cp.asarray(vectors))), (vectors @ expected.T).argmax(axis=1)
+    )
+    assert stage.kmeans.max_iter == 10
+    np.testing.assert_array_equal(stage.kmeans.init, initial)
+
+
+@pytest.mark.gpu
+def test_spherical_cancelling_mean_retains_direction(tmp_path: Path) -> None:
+    stage = KMeansReadFitWriteStage(
+        id_field="id",
+        embedding_field="embeddings",
+        output_path=str(tmp_path),
+        filetype="parquet",
+        n_clusters=1,
+        init=np.array([[0.0, 1.0]]),
+        spherical=True,
+        max_iter=5,
+    )
+    stage.kmeans = cuml.cluster.KMeans(n_clusters=1, init=stage.init, max_iter=5, n_init=1, output_type="cupy")
+    stage._fit_embeddings(cp.asarray([[1.0, 0.0], [-1.0, 0.0]], dtype=cp.float64))
+    np.testing.assert_array_equal(cp.asnumpy(stage.kmeans.cluster_centers_), [[0.0, 1.0]])
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("kwargs", [{"init": "k-means||"}, {"n_init": 2}, {"tol": 0}, {"max_iter": 0}])
+def test_spherical_rejects_unsupported_configuration(tmp_path: Path, kwargs: dict) -> None:
+    options = {"init": "random", **kwargs}
+    with pytest.raises(ValueError, match="spherical=True requires"):
+        KMeansStage(
+            n_clusters=2,
+            id_field="id",
+            embedding_field="embeddings",
+            input_path=str(tmp_path),
+            output_path=str(tmp_path / "out"),
+            spherical=True,
+            **options,
+        )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(("filetype", "fraction"), [("parquet", 1.0), ("jsonl", None), ("jsonl", 1.0)])
+def test_spherical_distributed_pipeline(tmp_path: Path, filetype: str, fraction: float | None) -> None:
+    rng = np.random.default_rng(37)
+    labels = np.arange(512) % 4
+    vectors = (np.eye(4)[labels] + rng.normal(scale=0.03, size=(512, 4))).astype(np.float32)
+    vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+    expected = np.stack([vectors[labels == i].mean(axis=0) for i in range(4)])
+    expected /= np.linalg.norm(expected, axis=1, keepdims=True)
+    source = tmp_path / "input"
+    source.mkdir()
+    for i, rows in enumerate(np.array_split(np.arange(512), 4)):
+        frame = pd.DataFrame({"id": rows, "embeddings": list(vectors[rows])})
+        if filetype == "parquet":
+            frame.to_parquet(source / f"part-{i}.parquet", index=False)
+        else:
+            frame.to_json(source / f"part-{i}.jsonl", orient="records", lines=True)
+    output, cache = tmp_path / "output", tmp_path / "cache"
+    pipeline = Pipeline(
+        name="spherical_reference",
+        stages=[
+            KMeansStage(
+                n_clusters=4,
+                id_field="id",
+                embedding_field="embeddings",
+                input_path=str(source),
+                output_path=str(output),
+                input_filetype=filetype,
+                fit_data_fraction=fraction,
+                spherical=True,
+                init=np.eye(4, dtype=np.float32),
+                max_iter=10,
+                tol=1e-6,
+                cache_path=str(cache),
+            )
+        ],
+    )
+    pipeline.run(RayActorPoolExecutor())
+    centers = np.load(cache / "kmeans_centroids.npy")
+    np.testing.assert_allclose(centers, expected, atol=1e-6)
+    result = cudf.read_parquet(str(output)).sort_values("id")
+    np.testing.assert_array_equal(result["centroid"].astype("int32").to_numpy(), labels)
+    np.testing.assert_allclose(
+        result["cosine_dist_to_cent"].to_numpy(), 1 - (vectors * centers[labels]).sum(axis=1), atol=1e-6
+    )
+
+
 def create_clustered_dataset(  # noqa: PLR0913
     tmp_path: Path,
     n_clusters: int = N_CLUSTERS,
@@ -509,29 +624,34 @@ class TestKMeansReadFitWriteStage:
         cp.testing.assert_allclose(embeddings, expected_normalized, rtol=1e-5, atol=1e-5)
 
     @pytest.mark.parametrize("embedding_output_dtype", ["float16", "float32"])
+    @pytest.mark.parametrize("write_embeddings", [True, False])
     def test_write_output_frame_uses_configured_embedding_dtype(
         self,
         make_stage: "KMeansReadFitWriteStage",
         embedding_output_dtype: str,
+        write_embeddings: bool,
     ) -> None:
-        stage = make_stage(embedding_output_dtype=embedding_output_dtype)
+        stage = make_stage(embedding_output_dtype=embedding_output_dtype, write_embeddings=write_embeddings)
         embeddings = cp.asarray([[1.0, 0.0], [0.6, 0.8]], dtype=cp.float32)
 
         stage._write_output_frame(
             "output.parquet",
-            cudf.DataFrame({"id": [1, 2]}),
+            cudf.DataFrame({"id": [1, 2], "embeddings": [[1.0, 0.0], [0.6, 0.8]]}),
             embeddings,
             cp.asarray([0, 1], dtype=cp.int32),
             stage.kmeans.cluster_centers_,
         )
 
         output = cudf.read_parquet(stage.output_path)
+        cp.testing.assert_allclose(output["l2_dist_to_cent"].values, [0.0, (0.6**2 + 0.2**2) ** 0.5])
+        if not write_embeddings:
+            assert "embeddings" not in output
+            return
         stored_embeddings = get_array_from_df(output, "embeddings")
         stored_dtype = cp.uint16 if embedding_output_dtype == "float16" else cp.float32
         assert stored_embeddings.dtype == stored_dtype
         decoded_embeddings = stored_embeddings.view(cp.float16) if stored_dtype == cp.uint16 else stored_embeddings
         cp.testing.assert_allclose(decoded_embeddings, embeddings, rtol=1e-3, atol=1e-3)
-        cp.testing.assert_allclose(output["l2_dist_to_cent"].values, [0.0, (0.6**2 + 0.2**2) ** 0.5])
 
     @pytest.mark.parametrize("bad_fraction", [0.0, -0.001, 1.001])
     def test_fit_data_fraction_validation(self, tmp_path: Path, bad_fraction: float) -> None:
