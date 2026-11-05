@@ -41,6 +41,7 @@ class IdentifyDuplicatesStage(ProcessingStage[FileGroupTask, FileGroupTask]):
     verbose: bool = False
     read_kwargs: dict[str, Any] | None = None
     write_kwargs: dict[str, Any] | None = None
+    use_removal_mask: bool = False
 
     def __post_init__(self):
         """Initialize parent class after dataclass initialization."""
@@ -97,7 +98,9 @@ class IdentifyDuplicatesStage(ProcessingStage[FileGroupTask, FileGroupTask]):
                     f,
                     storage_options=self.input_storage_options,
                     **self.read_kwargs,
-                    filters=[("cosine_sim_score", ">=", 1.0 - self.eps)],
+                    filters=[("removed", "==", True)]
+                    if self.use_removal_mask
+                    else [("cosine_sim_score", ">=", 1.0 - self.eps)],
                     columns=["id"],
                     engine="pyarrow",
                 )

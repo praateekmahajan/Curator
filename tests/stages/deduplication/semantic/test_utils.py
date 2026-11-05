@@ -25,6 +25,30 @@ import pytest
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("files_per_read", [1, 2, 64])
+def test_chunked_multifile_projection_preserves_order(tmp_path: Path, files_per_read: int) -> None:
+    import cudf
+
+    from nemo_curator.stages.deduplication.semantic.utils import read_parquet_chunks
+
+    files = []
+    for index in range(3):
+        path = tmp_path / f"part-{index}.parquet"
+        cudf.DataFrame({"id": range(index * 7, (index + 1) * 7), "embedding": [[float(index), 1.0]] * 7}).to_parquet(
+            path, index=False
+        )
+        files.append(str(path))
+    files.reverse()
+    expected = cudf.read_parquet(files)
+    actual = cudf.concat(
+        list(read_parquet_chunks(files, ["id", "embedding"], 4096, files_per_read=files_per_read)), ignore_index=True
+    )
+    assert actual.to_arrow().equals(expected.reset_index(drop=True).to_arrow())
+    with pytest.raises(ValueError, match="files_per_read must be positive"):
+        list(read_parquet_chunks(files, ["id"], 4096, files_per_read=0))
+
+
+@pytest.mark.gpu
 def test_get_array_from_df() -> None:
     import cudf
     import cupy as cp

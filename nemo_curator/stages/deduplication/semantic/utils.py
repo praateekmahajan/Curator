@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -29,6 +30,41 @@ CUDF_COLUMN_SIZE_LIMIT = 2_000_000_000
 # Footer scans open one file handle or object stream per input. Batching prevents large datasets
 # from exhausting file descriptors or creating an unbounded number of concurrent remote reads.
 _FOOTER_BATCH_SIZE = 64
+
+
+def read_parquet_chunks(
+    files: list[str],
+    columns: list[str] | None,
+    memory_bytes: int,
+    storage_options: dict[str, Any] | None = None,
+    *,
+    files_per_read: int = 1,
+) -> Iterator["cudf.DataFrame"]:
+    """Project bounded GPU chunks in file order; pages can exceed the byte target.
+
+    Multi-file reads require uniform Parquet schemas. The default retains the
+    ability to project common columns from files with different extra columns.
+    Remote filesystem adapters may additionally prefetch whole files to host.
+    """
+    import cudf
+    import pylibcudf as plc
+    from cudf.utils import ioutils
+
+    if files_per_read <= 0:
+        msg = "files_per_read must be positive"
+        raise ValueError(msg)
+    for start in range(0, len(files), files_per_read):
+        sources = ioutils.get_reader_filepath_or_buffer(
+            files[start : start + files_per_read], storage_options=storage_options
+        )
+        options = plc.io.parquet.ParquetReaderOptions.builder(plc.io.SourceInfo(sources)).build()
+        if columns is not None:
+            options.set_column_names(columns)
+        reader = plc.io.parquet.ChunkedParquetReader(
+            options, chunk_read_limit=memory_bytes, pass_read_limit=memory_bytes
+        )
+        while reader.has_next():
+            yield cudf.DataFrame.from_pylibcudf(reader.read_chunk())
 
 
 @dataclass(frozen=True)

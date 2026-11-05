@@ -73,6 +73,42 @@ def create_data_with_duplicates(input_dir: Path) -> pd.DataFrame:
 
 
 @pytest.mark.gpu
+def test_weighted_without_eps(tmp_path: Path) -> None:
+    from nemo_curator.stages.deduplication.semantic.weighted import WeightedPruningConfig
+
+    workflow = TextSemanticDeduplicationWorkflow(
+        input_path="/unused",
+        output_path=str(tmp_path),
+        id_field="id",
+        eps=None,
+        weighted_pruning=WeightedPruningConfig(),
+    )
+    assert workflow.duplicates_path == str(tmp_path / "duplicates")
+    assert workflow.deduplicated_output_path == str(tmp_path / "deduplicated")
+
+
+@pytest.mark.gpu
+def test_text_workflow_forwards_spherical_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workflow = TextSemanticDeduplicationWorkflow(
+        input_path="/unused",
+        output_path=str(tmp_path),
+        id_field="id",
+        kmeans_spherical=True,
+        kmeans_init="random",
+        kmeans_n_init=1,
+    )
+
+    def capture_run(inner, **kwargs) -> str:  # noqa: ANN001, ARG001
+        assert inner.spherical is True
+        assert inner.init == "random"
+        assert inner.n_init == 1
+        return "forwarded"
+
+    monkeypatch.setattr(semantic.SemanticDeduplicationWorkflow, "run", capture_run)
+    assert workflow._run_semantic_deduplication(None, None) == "forwarded"
+
+
+@pytest.mark.gpu
 @pytest.mark.parametrize(
     ("input_filetype", "expected_extensions"),
     [

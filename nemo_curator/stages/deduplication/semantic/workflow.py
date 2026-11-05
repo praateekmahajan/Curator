@@ -40,12 +40,14 @@ from nemo_curator.stages.deduplication.semantic.kmeans import (
     KMeansEmbeddingOutputDtype,
     KMeansStage,
     validate_embedding_output_dtype,
+    validate_spherical_config,
 )
 from nemo_curator.stages.deduplication.semantic.pairwise import (
     PairwiseComputeDtype,
     PairwiseStage,
 )
 from nemo_curator.stages.deduplication.semantic.ranking import RankingStrategy
+from nemo_curator.stages.deduplication.semantic.weighted import WeightedPruningConfig
 from nemo_curator.utils.file_utils import create_or_overwrite_dir
 
 # Minimum recommended n_clusters to avoid OOM for large datasets
@@ -109,6 +111,8 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
         # Pairwise precision (appended for positional compatibility)
         pairwise_compute_dtype: PairwiseComputeDtype = "float16",
         kmeans_embedding_output_dtype: KMeansEmbeddingOutputDtype = "float16",
+        weighted_pruning: WeightedPruningConfig | None = None,
+        spherical: bool = False,
     ):
         """
         Initialize the semantic deduplication workflow.
@@ -133,6 +137,8 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
             random_state: Random seed for K-means
             init: K-means initialization method
             n_init: Number of K-means initializations
+            spherical: Normalize centers after each Lloyd update; requires init='random' or
+                explicit centers and n_init=1. tol then measures maximum center displacement.
             oversampling_factor: K-means++ oversampling factor
             max_samples_per_batch: Max samples per batch for K-means
             distance_metric: Distance metric for similarity ("cosine" or "l2")
@@ -146,6 +152,9 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
             ranking_strategy: Custom ranking strategy (overrides which_to_keep)
             pairwise_compute_dtype: Multiplication precision for Pairwise, or ``"auto"`` to retain decoded precision.
             pairwise_batch_size: Positive batch size for the bounded Pairwise workspace.
+            weighted_pruning: Sequential weighted pruning instead of thresholding.
+                Ignores eps/which_to_keep; default removal order is ascending ID.
+                Use FP32 storage and compute for Forge-like threshold decisions.
 
             # Duplicate identification parameters (optional)
             eps: Epsilon value for duplicate identification
@@ -182,6 +191,8 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
         self.random_state = random_state
         self.init = init
         self.n_init = n_init
+        self.spherical = spherical
+        validate_spherical_config(spherical, init, n_init, max_iter, tol)
         self.oversampling_factor = oversampling_factor
         self.max_samples_per_batch = max_samples_per_batch
         self.fit_data_fraction = fit_data_fraction
@@ -197,6 +208,7 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
             raise ValueError(msg)
         self.pairwise_compute_dtype = pairwise_compute_dtype
         self.pairwise_batch_size = pairwise_batch_size
+        self.weighted_pruning = weighted_pruning
 
         # Duplicate identification parameters
         self.eps = eps
@@ -261,7 +273,7 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
             create_or_overwrite_dir(self.output_path, storage_options=storage_options)
             create_or_overwrite_dir(self.kmeans_output_path, storage_options=storage_options)
             create_or_overwrite_dir(self.pairwise_output_path, storage_options=storage_options)
-            if self.eps is not None:
+            if self.eps is not None or self.weighted_pruning is not None:
                 create_or_overwrite_dir(self.duplicates_output_path, storage_options=storage_options)
 
     def _run_kmeans_stage(self, kmeans_executor: RayActorPoolExecutor) -> list[Any]:
@@ -290,6 +302,7 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
             random_state=self.random_state,
             init=self.init,
             n_init=self.n_init,
+            spherical=self.spherical,
             oversampling_factor=self.oversampling_factor,
             max_samples_per_batch=self.max_samples_per_batch,
             fit_data_fraction=self.fit_data_fraction,
@@ -320,6 +333,7 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
             ranking_strategy=self.ranking_strategy,
             compute_dtype=self.pairwise_compute_dtype,
             pairwise_batch_size=self.pairwise_batch_size,
+            weighted_pruning=self.weighted_pruning,
             verbose=self.verbose,
             which_to_keep=self.which_to_keep,
             sim_metric=self.distance_metric,
@@ -330,10 +344,11 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
         pipeline.add_stage(pairwise_stage)
 
         # Stage 2: Optional duplicate identification stage
-        if self.eps is not None:
+        if self.eps is not None or self.weighted_pruning is not None:
             identify_duplicates_stage = IdentifyDuplicatesStage(
                 output_path=self.duplicates_output_path,
-                eps=self.eps,
+                eps=self.eps if self.eps is not None else 0.0,
+                use_removal_mask=self.weighted_pruning is not None,
                 _num_row_groups_hint=self._duplicates_num_row_groups_hint,
                 verbose=self.verbose,
                 read_kwargs=self.cache_kwargs,
@@ -367,6 +382,7 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
         logger.info(f"KMeans embedding output dtype: {self.kmeans_embedding_output_dtype}")
         logger.info(f"Pairwise compute dtype: {self.pairwise_compute_dtype}")
         logger.info(f"Pairwise batch size: {self.pairwise_batch_size}")
+        logger.info(f"Weighted pruning: {self.weighted_pruning}")
         logger.info(f"Random state: {self.random_state}")
         logger.info("=" * 60)
 
@@ -422,7 +438,7 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
 
             # Count duplicates if identified
             num_duplicates_identified = 0
-            if self.eps is not None and pairwise_results:
+            if (self.eps is not None or self.weighted_pruning is not None) and pairwise_results:
                 for task in pairwise_results:
                     if hasattr(task, "_metadata") and "num_removed" in task._metadata:
                         num_duplicates_identified += task._metadata["num_removed"]
@@ -438,8 +454,9 @@ class SemanticDeduplicationWorkflow(WorkflowBase):
             logger.info(f"Pairwise time: {pairwise_time:.2f} seconds")
             if num_duplicates_identified > 0:
                 logger.success(f"Total documents identified as duplicates: {num_duplicates_identified:,}")
-                logger.info(f"Similarity threshold used: {1.0 - self.eps:.3f} (eps={self.eps})")
-            elif self.eps is not None:
+                if self.weighted_pruning is None:
+                    logger.info(f"Similarity threshold used: {1.0 - self.eps:.3f} (eps={self.eps})")
+            elif self.eps is not None and self.weighted_pruning is None:
                 logger.info(
                     f"No duplicates identified with similarity threshold of {1.0 - self.eps:.3f} (eps={self.eps})"
                 )
